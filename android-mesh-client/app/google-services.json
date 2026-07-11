@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "484845497549",
+    "project_id": "hw-mesh-client",
+    "storage_bucket": "hw-mesh-client.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:484845497549:android:a0fc5d1480b66dfab6cd84",
+        "android_client_info": {
+          "package_name": "com.mesh.client"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAH_U0fmkY7LRPaAuhT07ZyQi2fc4FEYJg"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

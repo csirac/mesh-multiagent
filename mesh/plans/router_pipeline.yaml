@@ -1,0 +1,249 @@
+# Router Pipeline — Typed decomposition of the monolithic router LLM call
+#
+# Replaces the single 40K+ token router prompt with a 5-stage pipeline:
+#   1. extract_context    — deterministic signal parsing
+#   2. select_context     — memory retrieval + history regex search
+#   3. classify_action    — deep LLM, iterative (tool use allowed)
+#   4. synthesize         — deep LLM, generates user-facing response
+#   5. validate           — deterministic output validation
+#
+# Stage 3 is the intelligence hub: it classifies into respond/dispatch/
+# tool_call/sleep, and on tool_call it re-enters with the result.
+
+name: router_pipeline
+description: >
+  Pipeline decomposition of the mesh agent router. Extracts structured
+  context from the trigger message, retrieves scoped memories and
+  conversation history snippets, classifies the required action via an
+  iterative deep-LLM stage with tool access, synthesizes the user-facing
+  response, and validates the output for common failure modes.
+
+config:
+  handler_module: router_pipeline
+  defaults:
+    history_snippet_lines: 5
+    max_memory_results: 10
+    max_history_snippets: 15
+
+steps:
+  # =====================================================================
+  #  Stage 1: Extract Context (deterministic)
+  # =====================================================================
+  - name: extract_context
+    op: Extract
+    type: RawMessage -> StructuredContext
+    input: [task]
+    deterministic: true
+    handler: extract_context
+    output_schema:
+      sender: string
+      sender_type: string
+      channel: string
+      is_channel: boolean
+      mentions: array
+      topic_keywords: array
+      intent_type: string
+      urgency: boolean
+      timestamp: string
+      content_preview: string
+
+  # =====================================================================
+  #  Stage 2: Select Context (deterministic + embedding + regex)
+  # =====================================================================
+  - name: select_context
+    op: Extract
+    type: StructuredContext -> ContextBundle
+    input: [extract_context, task]
+    deterministic: true
+    handler: select_context
+    output_schema:
+      memories: array
+      history_snippets: array
+      rolling_window: array
+      current_time: string
+      personality: string
+      agent_tools: string
+      project_context: string
+      todo_context: string
+      project_maps: array
+      relevant_memories: string
+      agent_name: string
+      nickname: string
+      node_id: string
+
+  # =====================================================================
+  #  Stage 3: Classify Action (deep LLM, iterative)
+  #
+  #  The core decision-maker. Has access to read-only tools for
+  #  grounding (agent_status, notes_search, file_read, etc.).
+  #  On tool_call, the pipeline re-enters this stage with results.
+  #  Terminal outputs: respond / dispatch / sleep.
+  #  On dispatch, emits a detailed task spec inline.
+  # =====================================================================
+  - name: classify_action
+    op: Classify
+    type: ContextBundle -> ActionDecision
+    input: [extract_context, select_context]
+    backend: deep
+    agentic: true
+    # Standard router tool list — mirrors ROUTER_TOOL_NAMES in mesh/router_v2.py.
+    # Read-only diagnostic tools for grounding classification decisions.
+    tools:
+      - current_time
+      - mesh_status
+      - agent_status
+      - mesh_list
+      - channel_list
+      - channel_members
+      - worker_status
+      - file_read
+      - notes_search
+      - notes_get
+      - notes_list
+      - notes_read
+      - memory_search
+      - memory_get
+      - memory_list
+      - history_search
+      - remember
+      - map_list
+      - map_get
+      - exa_search
+      - exa_fetch_full
+      - extract_url
+      - literature_search
+      - literature_fulltext
+      - arxiv_search
+      - arxiv_get
+      - arxiv_fulltext
+      - pubmed_search
+      - pubmed_get
+      - pubmed_fulltext
+      - gmail_search_emails
+      - gmail_get_email
+      - gmail_list_from_date
+      - calendar_list_on_date
+      - plaid_accounts
+      - plaid_transactions
+      - synthetic_quota
+      - claude_code_usage
+      - get_working_directory
+      - tool_help
+    budget:
+      max_iterations: 5
+      max_output_tokens: 4096
+    prompt: ${prompts.router_pipeline.classify_action}
+    output_schema:
+      action: string
+      reasoning: string
+      task_spec: string
+      tool_plan: string
+      tool_calls: array
+
+  # =====================================================================
+  #  Stage 4: Synthesize Response (deep LLM, agentic for tool_call)
+  #
+  #  Always fires. Generates the user-facing message text.
+  #  For respond: full response (no tool use).
+  #  For dispatch: brief acknowledgment (no tool use).
+  #  For tool_call: execute tools per the classifier's tool_plan,
+  #    then synthesize response incorporating results.
+  #  For sleep: short internal note (may be suppressed by caller).
+  # =====================================================================
+  - name: synthesize_response
+    op: Synthesize
+    type: ActionDecision + Context -> ResponseText
+    input: [extract_context, select_context, classify_action, task]
+    allow_empty_input: true
+    backend: deep
+    agentic: true
+    # Full router tool list — synthesize can both inspect and act
+    # (send_message, schedule_wake, notes_add, map_edit, etc.).
+    tools:
+      - current_time
+      - mesh_status
+      - agent_status
+      - mesh_list
+      - channel_list
+      - channel_members
+      - worker_launch
+      - worker_status
+      - file_read
+      - bash_exec
+      - get_working_directory
+      - set_working_directory
+      - notes_search
+      - notes_get
+      - notes_list
+      - notes_read
+      - notes_add
+      - notes_edit
+      - notes_delete
+      - memory_search
+      - memory_get
+      - memory_list
+      - memory_add
+      - history_search
+      - remember
+      - map_list
+      - map_get
+      - map_edit
+      - map_create
+      - set_project_context
+      - send_message
+      - schedule_wake
+      - schedule_list
+      - schedule_cancel
+      - exa_search
+      - exa_fetch_full
+      - extract_url
+      - literature_search
+      - literature_fulltext
+      - arxiv_search
+      - arxiv_get
+      - arxiv_fulltext
+      - pubmed_search
+      - pubmed_get
+      - pubmed_fulltext
+      - gmail_search_emails
+      - gmail_get_email
+      - gmail_list_from_date
+      - gmail_send_message
+      - gmail_reply_to
+      - gmail_create_draft
+      - gmail_draft_reply
+      - calendar_list_on_date
+      - calendar_create_event
+      - calendar_delete_event
+      - plaid_accounts
+      - plaid_transactions
+      - account_get_current
+      - account_list
+      - account_set_current
+      - synthetic_quota
+      - claude_code_usage
+      - tool_help
+    prompt: ${prompts.router_pipeline.synthesize_response}
+    budget:
+      max_iterations: 5
+      max_output_tokens: 8192
+    output_schema:
+      response_text: string
+      tools_executed: array
+
+  # =====================================================================
+  #  Stage 5: Validate (deterministic)
+  # =====================================================================
+  - name: validate_response
+    op: Extract
+    type: ResponseText -> ValidatedResponse
+    input: [synthesize_response, classify_action]
+    allow_empty_input: true
+    deterministic: true
+    handler: validate_response
+    output_schema:
+      valid: boolean
+      response_text: string
+      action: string
+      task_spec: string
+      issues: array

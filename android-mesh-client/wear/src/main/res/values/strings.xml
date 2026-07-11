@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Mesh</string>
+    <string name="no_messages">No messages</string>
+    <string name="loading">Loading…</string>
+    <string name="reply">Reply</string>
+    <string name="quick_replies">Quick Replies</string>
+    <string name="ok">OK</string>
+    <string name="thanks">Thanks</string>
+    <string name="on_it">On it</string>
+    <string name="later">Later</string>
+    <string name="connecting">Connecting to phone…</string>
+    <string name="not_connected">Phone not connected</string>
+    <string name="channels">Channels</string>
+    <string name="messages">Messages</string>
+</resources>

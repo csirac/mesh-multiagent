@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# mesh-tool: Shell-based access to mesh tools.
+# Wrapper that activates the venv and runs the CLI module.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/.venv/bin/activate" 2>/dev/null
+source "$SCRIPT_DIR/env.bash" 2>/dev/null
+exec python -m mesh.cli.mesh_tool "$@"

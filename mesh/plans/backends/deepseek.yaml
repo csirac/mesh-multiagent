@@ -1,0 +1,16 @@
+# DeepSeek API backend
+
+light_backend:
+  model: deepseek-v4-flash
+  base_url: https://api.deepseek.com/v1
+  api_key: ${DEEPSEEK_API_KEY}
+  max_output_tokens: 131072
+  reasoning_effort: medium
+
+deep_backend:
+  model: deepseek-v4-pro
+  base_url: https://api.deepseek.com/v1
+  api_key: ${DEEPSEEK_API_KEY}
+  max_output_tokens: 131072
+  reasoning_effort: high
+  include_thoughts: true

@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# SQLite
+*.db
+*.sqlite
+*.sqlite3
+
+# Local config overrides
+mesh.local.yaml
+*.local.yaml
+
+# Benchmark output artifacts
+tests/live/evalplus_results/
+tests/live/livecodebench_results/
+mesh.yaml.bak
+
+# Android build artifacts
+android-mesh-client/app/build/
+android-mesh-client/wear/build/
+android-mesh-client/build/
+android-mesh-client/.gradle/
+*.apk
+*.aab
+
+# Secrets and credentials (use *.example templates for new setups)
+env.bash
+firebase-credentials.json
+anthropic-shim/shim.yaml
+
+# Root-level scratch files
+/*.pdf
+# /*.txt — disabled; requirements.txt must be tracked
+artifacts/
+
+# Benchmark result data (large, machine-specific)
+benchmark/results/
+
+# Token/credential backups
+*.backup*
+
+# Timestamped edit backups (rollback copies made before in-place edits)
+*.bak
+*.bak-*
+*~
+
+# Accidental tilde-expansion directory (a dir literally named "~")
+/~/
+
+# Tool cache/marker files
+.codex
+data-gym-cache/
+
+# Local data directories not for version control
+downloads/
+papers/
+swebench_repo/
+
+# Benchmark eval outputs
+benchmark/agent_eval/results/
+
+# LaTeX build products (track the .tex source only)
+docs/*.aux
+docs/*.out
+docs/*.toc
+docs/*.pdf

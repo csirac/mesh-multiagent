@@ -1,0 +1,31 @@
+{
+  "_comment": "INSTRUCTIONS: This is a placeholder file.",
+  "_instructions": [
+    "1. Go to Firebase Console: https://console.firebase.google.com/",
+    "2. Create a new project or select an existing one",
+    "3. Add an Android app with package name: com.mesh.client",
+    "4. Download the google-services.json file",
+    "5. Copy it to: app/google-services.json",
+    "6. Rebuild the app"
+  ],
+  "project_info": {
+    "project_number": "YOUR_PROJECT_NUMBER",
+    "project_id": "YOUR_PROJECT_ID",
+    "storage_bucket": "YOUR_PROJECT_ID.appspot.com"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "YOUR_APP_ID",
+        "android_client_info": {
+          "package_name": "com.mesh.client"
+        }
+      },
+      "api_key": [
+        {
+          "current_key": "YOUR_API_KEY"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,530 @@
+# Controller v0.2 Live Test Scenarios
+#
+# Each scenario defines:
+#   - id: Unique identifier
+#   - category: trivial, simple, moderate, complex, edge
+#   - input: The message sent to the agent
+#   - fixture_branch: Which fixture repo branch to use (default: main)
+#   - expected: Structural grading criteria
+#
+# Grading:
+#   PASS    - All constraints met
+#   PARTIAL - Completed but exceeded budgets or has warnings
+#   FAIL    - Missing required phases/tools, errors occurred
+
+defaults:
+  fixture_repo: "/home/git/test-fixtures.git"
+  fixture_branch: "main"
+  agent: "agent:assistant:v02"
+  timeout_seconds: 120
+
+scenarios:
+  # ============================================================================
+  # TRIVIAL - Direct response, no/minimal tool usage
+  # ============================================================================
+
+  - id: T1
+    category: trivial
+    input: "Hey, how are you?"
+    expected:
+      min_phases: []
+      max_phases: 3
+      no_errors: true
+      tools_required: []
+      tools_forbidden: []
+      response_contains: []
+      response_excludes: ["error", "failed", "exception"]
+      max_duration_seconds: 30
+      max_tokens: 3000
+      max_llm_calls: 3
+
+  - id: T2
+    category: trivial
+    input: "What time is it?"
+    expected:
+      min_phases: []
+      max_phases: 3
+      no_errors: true
+      tools_required: ["current_time"]
+      tools_forbidden: []
+      response_contains: []
+      response_excludes: ["error", "failed"]
+      max_duration_seconds: 30
+      max_tokens: 3000
+      max_llm_calls: 3
+
+  - id: T3
+    category: trivial
+    input: "Thanks!"
+    expected:
+      min_phases: []
+      max_phases: 3
+      no_errors: true
+      tools_required: []
+      tools_forbidden: []
+      response_contains: []
+      response_excludes: ["error", "failed"]
+      max_duration_seconds: 30
+      max_tokens: 2000
+      max_llm_calls: 2
+
+  - id: T4
+    category: trivial
+    input: "Echo 'hello world'"
+    expected:
+      min_phases: []
+      max_phases: 3
+      no_errors: true
+      tools_required: ["echo"]
+      tools_forbidden: []
+      response_contains: ["hello world"]
+      response_excludes: ["error"]
+      max_duration_seconds: 30
+      max_tokens: 3000
+      max_llm_calls: 3
+
+  # ============================================================================
+  # SIMPLE - Single tool execution, straightforward
+  # ============================================================================
+
+  - id: S1
+    category: simple
+    input: "What's my current working directory?"
+    expected:
+      min_phases: []
+      max_phases: 4
+      no_errors: true
+      tools_required: ["get_working_directory"]
+      tools_forbidden: []
+      response_contains: []
+      response_excludes: ["error", "failed"]
+      max_duration_seconds: 30
+      max_tokens: 4000
+      max_llm_calls: 4
+
+  - id: S2
+    category: simple
+    input: "Search the web for 'Claude AI'"
+    expected:
+      min_phases: []
+      max_phases: 4
+      no_errors: true
+      tools_required: ["exa_search"]
+      tools_forbidden: []
+      response_contains: []
+      response_excludes: ["error", "failed"]
+      max_duration_seconds: 45
+      max_tokens: 8000
+      max_llm_calls: 4
+
+  - id: S3
+    category: simple
+    input: "List my calendar for today"
+    expected:
+      min_phases: []
+      max_phases: 4
+      no_errors: true
+      tools_required: ["calendar_list_on_date"]
+      tools_forbidden: []
+      response_contains: []
+      response_excludes: ["error", "failed"]
+      max_duration_seconds: 30
+      max_tokens: 5000
+      max_llm_calls: 4
+
+  - id: S4
+    category: simple
+    input: "Read the file config.py"
+    fixture_branch: main
+    expected:
+      min_phases: []
+      max_phases: 4
+      no_errors: true
+      tools_required: ["file_read"]
+      tools_forbidden: []
+      response_contains: []
+      response_excludes: ["error", "failed"]
+      max_duration_seconds: 30
+      max_tokens: 5000
+      max_llm_calls: 4
+
+  # ============================================================================
+  # SIMPLE - Single-phase work, may read files but straightforward
+  # ============================================================================
+
+  - id: M1
+    category: simple
+    input: "Find all Python files and count them"
+    fixture_branch: main
+    expected:
+      min_phases: []
+      max_phases: 6
+      no_errors: true
+      tools_required: []  # Could use bash_exec, file_read, or glob
+      tools_forbidden: []
+      response_contains: []  # Should mention a count
+      response_excludes: ["error", "failed"]
+      max_duration_seconds: 60
+      max_tokens: 15000
+      max_llm_calls: 6
+
+  - id: M2
+    category: simple
+    input: "Explain the structure of this project"
+    fixture_branch: main
+    expected:
+      min_phases: []
+      max_phases: 6
+      no_errors: true
+      tools_required: ["file_read"]
+      tools_forbidden: []
+      response_contains: []
+      response_excludes: ["error", "failed"]
+      max_duration_seconds: 90
+      max_tokens: 20000
+      max_llm_calls: 8
+
+  - id: M3
+    category: simple
+    input: "Add a docstring to the main function in main.py"
+    fixture_branch: main
+    expected:
+      min_phases: ["PLAN"]
+      max_phases: 7
+      no_errors: true
+      tools_required: ["file_read"]  # Must read before editing
+      tools_forbidden: []
+      response_contains: []
+      response_excludes: ["error", "failed"]
+      max_duration_seconds: 90
+      max_tokens: 20000
+      max_llm_calls: 8
+
+  - id: M4
+    category: simple
+    input: "List all functions defined in utils.py"
+    fixture_branch: main
+    expected:
+      min_phases: []
+      max_phases: 5
+      no_errors: true
+      tools_required: ["file_read"]
+      tools_forbidden: []
+      response_contains: []
+      response_excludes: ["error", "failed"]
+      max_duration_seconds: 60
+      max_tokens: 12000
+      max_llm_calls: 6
+
+  # ============================================================================
+  # MODERATE - Multi-step, needs planning, touches multiple files
+  # ============================================================================
+
+  - id: C1
+    category: moderate
+    input: "Refactor utils.py to add type hints to all functions"
+    fixture_branch: main
+    expected:
+      min_phases: ["PLAN", "VALIDATE"]
+      max_phases: 8
+      no_errors: true
+      tools_required: ["file_read"]
+      tools_forbidden: []
+      response_contains: []
+      response_excludes: ["error", "failed"]
+      max_duration_seconds: 180
+      max_tokens: 50000
+      max_llm_calls: 12
+
+  - id: C2
+    category: moderate
+    input: "Add a new multiply function to utils.py with tests"
+    fixture_branch: main
+    expected:
+      min_phases: ["PLAN"]
+      max_phases: 8
+      no_errors: true
+      tools_required: ["file_read"]
+      tools_forbidden: []
+      response_contains: []
+      response_excludes: ["error", "failed"]
+      max_duration_seconds: 180
+      max_tokens: 50000
+      max_llm_calls: 12
+
+  - id: C3
+    category: moderate
+    input: "Find and fix any bugs in the calculator code"
+    fixture_branch: main
+    expected:
+      min_phases: ["PLAN"]
+      max_phases: 10
+      no_errors: true
+      tools_required: ["file_read"]
+      tools_forbidden: []
+      response_contains: []
+      response_excludes: []  # May legitimately mention "bug" or "error"
+      max_duration_seconds: 180
+      max_tokens: 60000
+      max_llm_calls: 15
+
+  # ============================================================================
+  # MODERATE - Rec-Fishing Pipeline (multi-file, realistic codebase)
+  # ============================================================================
+
+  - id: RF1
+    category: moderate
+    input: |
+      The preprocessing pipeline is producing incorrect trip counts. Users report
+      seeing fewer trips than expected (should be ~5 trips, getting 2-3). Debug
+      the issue and fix it.
+    fixture_branch: demo-bugged
+    expected:
+      min_phases: ["PLAN"]
+      max_phases: 10
+      no_errors: true
+      tools_required: ["file_read", "file_edit"]
+      tools_forbidden: []
+      response_contains: []
+      response_excludes: []
+      max_duration_seconds: 300
+      max_tokens: 80000
+      max_llm_calls: 15
+
+  - id: RF2
+    category: moderate
+    input: |
+      Add a new column 'avg_speed_mps' to the trips summary table. It should be
+      the mean of implied_speed_mps for all pings in the trip (excluding nulls).
+      Modify build_trips_table() in stage1/segmentation.py.
+    fixture_branch: demo-project
+    expected:
+      min_phases: ["PLAN"]
+      max_phases: 8
+      no_errors: true
+      tools_required: ["file_read", "file_edit"]
+      tools_forbidden: []
+      response_contains: ["avg_speed_mps"]
+      response_excludes: []
+      max_duration_seconds: 180
+      max_tokens: 50000
+      max_llm_calls: 10
+
+  - id: RF3
+    category: simple
+    input: |
+      Explain the preprocessing pipeline from input pings to output trips. What
+      are the major steps and what does each one do? Which files contain the
+      core logic?
+    fixture_branch: demo-project
+    expected:
+      min_phases: []
+      max_phases: 6
+      no_errors: true
+      tools_required: ["file_read"]
+      tools_forbidden: ["file_edit", "file_create"]
+      response_contains: ["segmentation", "kinematics"]
+      response_excludes: []
+      max_duration_seconds: 120
+      max_tokens: 30000
+      max_llm_calls: 8
+
+  - id: RF4
+    category: simple
+    input: "When I try to import the stage1 module, I get an error. Diagnose and fix it."
+    fixture_branch: demo-import-error
+    expected:
+      min_phases: []
+      max_phases: 7
+      no_errors: true
+      tools_required: ["bash_exec", "file_edit"]
+      tools_forbidden: []
+      response_contains: []
+      response_excludes: []
+      max_duration_seconds: 120
+      max_tokens: 30000
+      max_llm_calls: 8
+
+  - id: RF5
+    category: simple
+    input: |
+      Read stage1/kinematics.py and tell me what the haversine_expr function does.
+      Keep your explanation brief (2-3 sentences).
+    fixture_branch: demo-project
+    timeout_seconds: 120
+    expected:
+      min_phases: []
+      max_phases: 5
+      no_errors: true
+      tools_required: ["file_read"]
+      tools_forbidden: ["file_edit"]
+      response_contains: ["distance", "haversine"]
+      response_excludes: []
+      max_duration_seconds: 60
+      max_tokens: 10000
+      max_llm_calls: 5
+
+  - id: RF6
+    category: simple
+    input: "Review the kinematics.py file for any bugs or issues. Report what you find."
+    fixture_branch: demo-project
+    expected:
+      min_phases: []
+      max_phases: 5
+      no_errors: true
+      tools_required: ["file_read"]
+      tools_forbidden: ["file_edit"]
+      response_contains: []
+      response_excludes: []
+      max_duration_seconds: 60
+      max_tokens: 15000
+      max_llm_calls: 5
+
+  # ============================================================================
+  # COMPLEX - Multi-phase, architectural changes, extensive validation
+  # ============================================================================
+
+  - id: X1
+    category: complex
+    input: |
+      Implement a caching layer for the trip segmentation results. Requirements:
+      1. Cache computed trips to disk (JSON or parquet)
+      2. Add a --cache-dir argument to the CLI
+      3. Skip recomputation if cache exists and input file hasn't changed
+      4. Add a --force flag to bypass cache
+      Update all relevant files and ensure the pipeline still works.
+    fixture_branch: demo-project
+    expected:
+      min_phases: ["PLAN", "VALIDATE"]
+      max_phases: 15
+      no_errors: true
+      tools_required: ["file_read", "file_edit"]
+      tools_forbidden: []
+      response_contains: ["cache"]
+      response_excludes: []
+      max_duration_seconds: 600
+      max_tokens: 150000
+      max_llm_calls: 25
+
+  - id: X2
+    category: complex
+    input: |
+      The trip segmentation algorithm needs to be more configurable. Refactor to:
+      1. Extract all magic numbers into a TripConfig dataclass
+      2. Load config from a YAML file (trip_config.yaml)
+      3. Add validation for config values
+      4. Update all functions that use these parameters
+      5. Create a sample trip_config.yaml with documented defaults
+    fixture_branch: demo-project
+    expected:
+      min_phases: ["PLAN", "VALIDATE"]
+      max_phases: 15
+      no_errors: true
+      tools_required: ["file_read", "file_edit", "file_create"]
+      tools_forbidden: []
+      response_contains: ["TripConfig", "yaml"]
+      response_excludes: []
+      max_duration_seconds: 600
+      max_tokens: 150000
+      max_llm_calls: 25
+
+  - id: X3
+    category: complex
+    input: |
+      Add comprehensive logging to the preprocessing pipeline:
+      1. Create a logger module with configurable log levels
+      2. Add structured logging (JSON format) for all major operations
+      3. Log timing information for each pipeline stage
+      4. Add a --verbose flag to the CLI
+      5. Ensure logs include trip IDs for traceability
+    fixture_branch: demo-project
+    expected:
+      min_phases: ["PLAN", "VALIDATE"]
+      max_phases: 15
+      no_errors: true
+      tools_required: ["file_read", "file_edit"]
+      tools_forbidden: []
+      response_contains: ["logging", "logger"]
+      response_excludes: []
+      max_duration_seconds: 600
+      max_tokens: 150000
+      max_llm_calls: 25
+
+  # ============================================================================
+  # EDGE CASES - Error handling, ambiguity, graceful degradation
+  # ============================================================================
+
+  - id: E1
+    category: edge
+    input: "What should I do?"
+    expected:
+      min_phases: []
+      max_phases: 4
+      no_errors: true
+      tools_required: []
+      tools_forbidden: []
+      response_contains: []  # Should ask clarifying questions
+      response_excludes: []
+      max_duration_seconds: 30
+      max_tokens: 4000
+      max_llm_calls: 4
+
+  - id: E2
+    category: edge
+    input: "Read /nonexistent/file.txt"
+    expected:
+      min_phases: []
+      max_phases: 5
+      no_errors: false  # Error is expected but should be handled gracefully
+      tools_required: []
+      tools_forbidden: []
+      response_contains: []
+      response_excludes: ["crash", "exception", "traceback"]
+      max_duration_seconds: 30
+      max_tokens: 5000
+      max_llm_calls: 4
+
+  - id: E3
+    category: edge
+    input: ""
+    expected:
+      min_phases: []
+      max_phases: 3
+      no_errors: true
+      tools_required: []
+      tools_forbidden: []
+      response_contains: []
+      response_excludes: ["error", "failed"]
+      max_duration_seconds: 30
+      max_tokens: 3000
+      max_llm_calls: 3
+
+  - id: E4
+    category: edge
+    input: "Do X, Y, and Z"
+    expected:
+      min_phases: []
+      max_phases: 5
+      no_errors: true
+      tools_required: []
+      tools_forbidden: []
+      response_contains: []  # Should clarify what X, Y, Z are
+      response_excludes: []
+      max_duration_seconds: 45
+      max_tokens: 5000
+      max_llm_calls: 5
+
+  - id: E5
+    category: edge
+    input: "Edit /missing/file.py to add logging"
+    expected:
+      min_phases: []
+      max_phases: 5
+      no_errors: false  # Error expected but handled
+      tools_required: []
+      tools_forbidden: []
+      response_contains: []  # Should report file not found
+      response_excludes: ["crash", "traceback"]
+      max_duration_seconds: 45
+      max_tokens: 6000
+      max_llm_calls: 5

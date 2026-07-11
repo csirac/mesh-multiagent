@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Mesh Client</string>
+
+    <!-- Navigation -->
+    <string name="nav_chat">Chat</string>
+    <string name="nav_conversations">Messages</string>
+    <string name="nav_roster">Agents</string>
+    <string name="nav_settings">Settings</string>
+
+    <!-- Conversations -->
+    <string name="conversations_title">Messages</string>
+    <string name="conversations_empty">No conversations yet</string>
+    <string name="conversations_empty_hint">Start a chat from the Agents tab</string>
+    <string name="loading">Loading…</string>
+
+    <!-- Chat -->
+    <string name="chat_hint">Type a message…</string>
+    <string name="chat_send">Send</string>
+    <string name="chat_no_target">No target selected</string>
+    <string name="chat_target_label">To: %s</string>
+
+    <!-- Roster -->
+    <string name="roster_title">Connected Agents</string>
+    <string name="roster_empty">No agents connected</string>
+    <string name="roster_user">User</string>
+    <string name="roster_agent">Agent</string>
+
+    <!-- Settings -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_server">Server</string>
+    <string name="settings_host">Host</string>
+    <string name="settings_port">Port</string>
+    <string name="settings_auth_token">Auth Token</string>
+    <string name="settings_nickname">Nickname</string>
+    <string name="settings_save">Save</string>
+    <string name="settings_connect">Connect</string>
+    <string name="settings_disconnect">Disconnect</string>
+
+    <!-- Connection -->
+    <string name="connection_connected">Connected</string>
+    <string name="connection_disconnected">Disconnected</string>
+    <string name="connection_connecting">Connecting…</string>
+    <string name="connection_error">Connection error</string>
+
+    <!-- Notifications -->
+    <string name="notification_channel_messages">Messages</string>
+    <string name="notification_channel_messages_desc">Incoming messages from agents</string>
+    <string name="notification_channel_service">Connection</string>
+    <string name="notification_channel_service_desc">Mesh connection status</string>
+    <string name="notification_channel_confirm">Confirmations</string>
+    <string name="notification_channel_confirm_desc">Tool confirmation requests</string>
+
+    <!-- Confirmation -->
+    <string name="confirm_title">Confirmation Required</string>
+    <string name="confirm_approve">Approve</string>
+    <string name="confirm_reject">Reject</string>
+    <string name="confirm_tool">Tool: %s</string>
+    <string name="confirm_from_label">From: %s</string>
+
+    <!-- Status -->
+    <string name="status_button">Status</string>
+    <string name="status_title">Agent Status: %s</string>
+    <string name="status_dismiss">Dismiss</string>
+    <string name="status_loading">Loading status…</string>
+    <string name="status_no_messages">No messages in context</string>
+    <string name="status_summary_label">Earlier summary</string>
+    <string name="status_context_label">Recent context (%d entries)</string>
+
+    <!-- Channels -->
+    <string name="nav_channels">Channels</string>
+    <string name="channels_title">Channels</string>
+    <string name="channels_empty">No channels yet</string>
+    <string name="channels_empty_hint">Create a channel to get started</string>
+    <string name="channels_create">Create Channel</string>
+    <string name="channels_create_title">New Channel</string>
+    <string name="channels_create_name">Channel name</string>
+    <string name="channels_create_description">Description (optional)</string>
+    <string name="channels_create_button">Create</string>
+    <string name="channels_cancel">Cancel</string>
+    <string name="channels_members">%d members</string>
+    <string name="channels_join">Join</string>
+    <string name="channels_leave">Leave</string>
+    <string name="channels_delete">Delete</string>
+    <string name="channels_joined">Joined</string>
+    <string name="channels_invite">Add Member</string>
+    <string name="channels_invite_title">Add Member to #%s</string>
+    <string name="channels_invite_hint">Node ID (e.g., agent:coder:alice)</string>
+    <string name="channels_invite_button">Add</string>
+    <string name="channels_view_members">View Members</string>
+    <string name="channels_members_title">Members of #%s</string>
+    <string name="channels_members_empty">No members</string>
+    <string name="channels_members_online">Online</string>
+    <string name="channels_members_offline">Offline</string>
+
+    <!-- Usage -->
+    <string name="usage_title">Claude Usage</string>
+    <string name="usage_button">Usage</string>
+    <string name="usage_refresh">Refresh Usage</string>
+    <string name="usage_loading">Loading…</string>
+    <string name="usage_not_connected">Not connected to mesh</string>
+
+    <!-- Workspace -->
+    <string name="workspace_title">Workspace</string>
+    <string name="workspace_button">Workspace</string>
+    <string name="workspace_hint">Write notes here…</string>
+    <string name="workspace_save">Save</string>
+    <string name="workspace_clear">Clear</string>
+    <string name="workspace_back">Back</string>
+    <string name="workspace_last_saved">Last saved: %s</string>
+</resources>

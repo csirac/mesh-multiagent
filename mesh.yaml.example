@@ -1,0 +1,92 @@
+# Mesh — Minimal Configuration Example
+#
+# Copy this file to mesh.yaml and adjust for your setup:
+#   cp mesh.yaml.example mesh.yaml
+#
+# For the quickstart walkthrough, see the README.
+# For the full architecture reference, see docs/mesh_technical_report.pdf.
+
+router:
+  host: 127.0.0.1
+  port: 7700
+  ws_port: 8765
+  storage_path: ~/.mesh/storage/messages.db
+  # auth_token: ${MESH_AUTH_TOKEN}   # Uncomment to read token from env.bash
+
+# ─── LLM Backends ──────────────────────────────────────────────────────────
+#
+# Define one or more backends. Each agent references a backend by name.
+# API keys come from environment variables (see env.bash.example).
+
+llm_backends:
+  # Simple OpenAI backend — works with any OpenAI-compatible API
+  default:
+    backend_type: openai
+    default_model: gpt-4o
+    # api_key is read from $OPENAI_API_KEY automatically
+
+  # ── Additional backend examples (uncomment to use) ──
+
+  # # DeepSeek via their native API
+  # deepseek-direct:
+  #   backend_type: openai
+  #   api_key: ${DEEPSEEK_API_KEY}
+  #   base_url: https://api.deepseek.com/v1
+  #   default_model: deepseek-v4-pro
+
+  # # Claude Code backend (requires the `claude` CLI installed and authed)
+  # claude-code-opus:
+  #   backend_type: claude-code
+  #   cc_binary: ""          # Empty = auto-detect from PATH
+  #   cc_effort: high        # low | medium | high | xhigh | max
+
+  # # Local model via vLLM or Ollama (OpenAI-compatible)
+  # local-model:
+  #   backend_type: openai
+  #   base_url: http://localhost:8000/v1
+  #   default_model: your-model-name
+  #   api_key: "not-needed"  # Most local servers don't require a key
+
+# ─── Agents ────────────────────────────────────────────────────────────────
+#
+# Each agent needs a unique node ID (agent:<type>:<nickname> or agent:<type>:)
+# and a reference to an llm_backend defined above.
+#
+# Agent types correspond to system prompt files in mesh/prompts/:
+#   researcher.md, assistant.md, sysadmin.md, coder.md
+
+agents:
+  agent:researcher:
+    nickname: alice
+    llm_backend: default
+    system_prompt_file: researcher.md
+
+  # ── Additional agent examples (uncomment to use) ──
+
+  # agent:sysadmin:
+  #   nickname: bob
+  #   llm_backend: claude-code-opus
+  #   system_prompt_file: sysadmin.md
+
+  # agent:assistant:
+  #   nickname: eve
+  #   llm_backend: default
+  #   system_prompt_file: assistant.md
+
+# ─── Optional Features ─────────────────────────────────────────────────────
+#
+# Memory system: per-agent episodic memory with embeddings and diversity selection.
+# Uncomment and add to an agent config to enable:
+#
+#   memory_enabled: true
+#   memory_active_size: 50
+#   memory_pool_max_entries: 1000
+#   memory_embedding_model: text-embedding-3-small
+#
+# Firebase push notifications (Android client):
+# Requires firebase-credentials.json — see firebase-credentials.example.json.
+#
+#   fcm_credentials_file: /path/to/firebase-credentials.json
+#
+# Benchmark harness (mesh-harness backend):
+# Used for automated coding evaluations. See docs/ for details.
