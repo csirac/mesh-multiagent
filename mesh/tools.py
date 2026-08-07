@@ -13,9 +13,39 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Awaitable, TYPE_CHECKING
+from typing import Any, Callable, Awaitable, Iterable, TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .isolation import IsolationPolicy
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_capabilities(
+    name: str, explicit: "Iterable[Any] | None"
+) -> frozenset:
+    """Normalize a tool's isolation capabilities.
+
+    Imported lazily so ``mesh.tools`` — which the whole package pulls in very
+    early — keeps its current import graph.
+    """
+    from .isolation import ToolCapability
+
+    if explicit is not None:
+        parsed = {ToolCapability.parse(item) for item in explicit}
+        if parsed:
+            return frozenset(parsed)
+
+    from .tool_capabilities import capabilities_for
+
+    return capabilities_for(name)
+
+
+def _default_capabilities() -> frozenset:
+    """Capability default for directly constructed tool definitions."""
+    from .isolation import ToolCapability
+
+    return frozenset({ToolCapability.LOCAL})
 
 
 @dataclass
@@ -36,6 +66,11 @@ class ToolDefinition:
     parameters: list[ToolParameter] = field(default_factory=list)
     handler: Callable[..., Awaitable[Any]] | Callable[..., Any] | None = None
     requires_confirmation: bool = False  # If True, requires user confirmation before execution
+    #: Isolation capabilities this tool needs (``mesh.isolation.ToolCapability``).
+    #: Resolved at registration time from ``mesh.tool_capabilities`` unless the
+    #: caller passes an explicit set.  Never empty: an unclassified tool gets
+    #: ``{LOCAL}``, the safe default.
+    capabilities: frozenset = field(default_factory=_default_capabilities)
 
     def format_for_prompt(self) -> str:
         """Format this tool for inclusion in the LLM prompt."""
@@ -259,14 +294,22 @@ class ToolRegistry:
         parameters: list[ToolParameter] | None = None,
         handler: Callable[..., Awaitable[Any]] | Callable[..., Any] | None = None,
         requires_confirmation: bool = False,
+        capabilities: "Iterable[Any] | None" = None,
     ) -> ToolDefinition:
-        """Register a tool."""
+        """Register a tool.
+
+        ``capabilities`` is normally omitted: the classification comes from the
+        catalog in ``mesh.tool_capabilities`` so it stays auditable in one
+        place.  An explicit value wins, which lets an out-of-tree tool declare
+        itself without editing the catalog.
+        """
         tool = ToolDefinition(
             name=name,
             description=description,
             parameters=parameters or [],
             handler=handler,
             requires_confirmation=requires_confirmation,
+            capabilities=_resolve_capabilities(name, capabilities),
         )
         self._tools[name] = tool
         logger.debug(f"Registered tool: {name} (requires_confirmation={requires_confirmation})")
@@ -278,20 +321,35 @@ class ToolRegistry:
         description: str,
         parameters: list[ToolParameter] | None = None,
         requires_confirmation: bool = False,
+        capabilities: "Iterable[Any] | None" = None,
     ):
         """Decorator to register a function as a tool handler."""
         def decorator(fn: Callable) -> Callable:
-            self.register(name, description, parameters, fn, requires_confirmation)
+            self.register(
+                name, description, parameters, fn, requires_confirmation,
+                capabilities=capabilities,
+            )
             return fn
         return decorator
+
+    def capabilities_of(self, name: str) -> frozenset:
+        """Capabilities recorded for ``name``, or the safe default."""
+        tool = self._tools.get(name)
+        if tool is not None and tool.capabilities:
+            return tool.capabilities
+        return _resolve_capabilities(name, None)
 
     def get(self, name: str) -> ToolDefinition | None:
         """Get a tool by name."""
         return self._tools.get(name)
 
-    def get_subset(self, names: list[str]) -> dict[str, ToolDefinition]:
-        """Get a subset of tools by name."""
-        return {name: self._tools[name] for name in names if name in self._tools}
+    def get_subset(
+        self,
+        names: list[str],
+        policy: "IsolationPolicy | None" = None,
+    ) -> dict[str, ToolDefinition]:
+        """Get a subset of tools by name, honouring an enabled isolation policy."""
+        return {t.name: t for t in self._select(list(names), policy)}
 
     def list_names(self) -> list[str]:
         """List all registered tool names."""
@@ -316,24 +374,51 @@ class ToolRegistry:
             lines.append("")
         return "\n".join(lines)
 
-    def get_openai_tools(self, tool_names: list[str] | None = None) -> list[dict]:
-        """
-        Get tools formatted for OpenAI Chat Completions API function calling.
+    def _select(
+        self,
+        tool_names: list[str] | None,
+        policy: "IsolationPolicy | None" = None,
+    ) -> list[ToolDefinition]:
+        """Resolve a name list to definitions, dropping isolation-denied tools.
 
-        Args:
-            tool_names: List of tool names to include. If None, includes all tools.
-
-        Returns:
-            List of tool definitions in OpenAI Chat Completions function calling format.
+        ``policy=None`` or a disabled policy returns exactly what these methods
+        returned before Phase 2A: no filtering, no capability lookup.
         """
         if tool_names is None:
             tools = list(self._tools.values())
         else:
             tools = [self._tools[n] for n in tool_names if n in self._tools]
 
-        return [tool.to_openai_function() for tool in tools]
+        if policy is None or not policy.enabled:
+            return tools
 
-    def get_openai_responses_tools(self, tool_names: list[str] | None = None) -> list[dict]:
+        from .tool_capabilities import authorize
+
+        return [t for t in tools if authorize(policy, t.name, self).allowed]
+
+    def get_openai_tools(
+        self,
+        tool_names: list[str] | None = None,
+        policy: "IsolationPolicy | None" = None,
+    ) -> list[dict]:
+        """
+        Get tools formatted for OpenAI Chat Completions API function calling.
+
+        Args:
+            tool_names: List of tool names to include. If None, includes all tools.
+            policy: Optional isolation policy. When enabled, tools the policy
+                would refuse to execute are not offered to the model.
+
+        Returns:
+            List of tool definitions in OpenAI Chat Completions function calling format.
+        """
+        return [tool.to_openai_function() for tool in self._select(tool_names, policy)]
+
+    def get_openai_responses_tools(
+        self,
+        tool_names: list[str] | None = None,
+        policy: "IsolationPolicy | None" = None,
+    ) -> list[dict]:
         """
         Get tools formatted for OpenAI Responses API function calling.
 
@@ -346,14 +431,16 @@ class ToolRegistry:
         Returns:
             List of tool definitions in OpenAI Responses API function calling format.
         """
-        if tool_names is None:
-            tools = list(self._tools.values())
-        else:
-            tools = [self._tools[n] for n in tool_names if n in self._tools]
+        return [
+            tool.to_openai_responses_function()
+            for tool in self._select(tool_names, policy)
+        ]
 
-        return [tool.to_openai_responses_function() for tool in tools]
-
-    def get_anthropic_tools(self, tool_names: list[str] | None = None) -> list[dict]:
+    def get_anthropic_tools(
+        self,
+        tool_names: list[str] | None = None,
+        policy: "IsolationPolicy | None" = None,
+    ) -> list[dict]:
         """
         Get tools formatted for Anthropic Messages API tool use.
 
@@ -363,17 +450,13 @@ class ToolRegistry:
         Returns:
             List of tool definitions in Anthropic Messages API tool format.
         """
-        if tool_names is None:
-            tools = list(self._tools.values())
-        else:
-            tools = [self._tools[n] for n in tool_names if n in self._tools]
-
-        return [tool.to_anthropic_tool() for tool in tools]
+        return [tool.to_anthropic_tool() for tool in self._select(tool_names, policy)]
 
     def format_tools_prompt(
         self,
         tool_names: list[str] | None = None,
         backend: str = "xml",
+        policy: "IsolationPolicy | None" = None,
     ) -> str:
         """
         Generate the tool prompt section for the given tools.
@@ -394,10 +477,7 @@ class ToolRegistry:
         For OpenAI backend, only guidance is included (no tool list), since
         tools are passed via the native function calling API.
         """
-        if tool_names is None:
-            tools = list(self._tools.values())
-        else:
-            tools = [self._tools[n] for n in tool_names if n in self._tools]
+        tools = self._select(tool_names, policy)
 
         if not tools:
             return ""
@@ -489,9 +569,13 @@ def register_tool(
     parameters: list[ToolParameter] | None = None,
     handler: Callable[..., Awaitable[Any]] | Callable[..., Any] | None = None,
     requires_confirmation: bool = False,
+    capabilities: "Iterable[Any] | None" = None,
 ) -> ToolDefinition:
     """Convenience function to register a tool in the global registry."""
-    return _registry.register(name, description, parameters, handler, requires_confirmation)
+    return _registry.register(
+        name, description, parameters, handler, requires_confirmation,
+        capabilities=capabilities,
+    )
 
 
 def tool(
@@ -499,9 +583,17 @@ def tool(
     description: str,
     parameters: list[ToolParameter] | None = None,
     requires_confirmation: bool = False,
+    capabilities: "Iterable[Any] | None" = None,
 ):
-    """Decorator to register a function as a tool."""
-    return _registry.register_decorator(name, description, parameters, requires_confirmation)
+    """Decorator to register a function as a tool.
+
+    ``capabilities`` defaults to the ``mesh.tool_capabilities`` catalog entry
+    for ``name``; pass an explicit iterable only for out-of-catalog tools.
+    """
+    return _registry.register_decorator(
+        name, description, parameters, requires_confirmation,
+        capabilities=capabilities,
+    )
 
 
 # ============================================================================

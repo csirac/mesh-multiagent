@@ -12,11 +12,18 @@ A 55-page architecture report is available at [docs/technical-report/](docs/tech
 
 Mesh lets you stand up a network of AI agents that persist across sessions, communicate with each other and with you, and take real actions (run shell commands, read/write files, search the web). The **router** is the central hub — it brokers messages, manages authentication, and stores conversation history. **Agents** are autonomous LLM-powered nodes that connect to the router; each has a role (researcher, coder, sysadmin) and its own tool set. **Clients** (a terminal TUI or a web browser) are how you talk to agents and to each other.
 
-Every node has a **node ID** like `user:yourname` or `agent:sysadmin:bob`. You address messages by nickname — type `@bob hello` and the router delivers it.
+Every node has a **node ID** like `user:yourname` or `agent:sysadmin:operator`. You address messages by nickname — type `@operator hello` and the router delivers it.
 
-### Known limitations
+### Memory and autonomous work
 
-This July 11 snapshot predates the current runtime's entity, essay, and curation memory layer. The live `mesh/memory/` directory adds `ceiling_rules.py`, `curation.py`, `entities.py`, `entity_essays.py`, `essay_fold.py`, `formation_contract.py`, `ids.py`, `pending_additions.py`, and `write_audit.py`; the current runtime also includes the autonomous controller mode in `mesh/autonomous_runtime.py`. A fuller release is in preparation.
+Mesh v2 includes a four-tier text memory hierarchy: raw history, durable
+memories, curated standing digests, and entity essays. The entity registry,
+curation preflight, citation validation, write audit, and pending-addition
+ledger make updates reviewable and correctable. It also includes the
+project-dossier autonomous controller: bounded worker admission, immutable
+session reports, a daily budget ledger, active-mode pacing, and the TUI
+`/auto` controls. See [docs/governed-procedural-memory.md](docs/governed-procedural-memory.md)
+for the separately governed skill-card layer.
 
 ### Architecture
 
@@ -70,7 +77,7 @@ Edit `env.bash` — at minimum, set these two:
 
 ```bash
 export MESH_AUTH_TOKEN="<generate-with-openssl-rand-hex-32>"   # openssl rand -hex 32
-export OPENAI_API_KEY="sk-..."                                 # your API key
+export OPENAI_API_KEY="<your-api-key>"                          # your API key
 ```
 
 ```bash
@@ -81,7 +88,7 @@ cp mesh.yaml.example mesh.yaml
 source env.bash
 ```
 
-The example config (`mesh.yaml`) is ready to go: one OpenAI backend, one `researcher` agent named `alice`. The three fields you might change:
+The example config (`mesh.yaml`) is ready to go: it includes one OpenAI-compatible backend and an example `researcher` agent named `alice`. The quickstart below starts the built-in `echo` agent instead, so you can verify the mesh locally before supplying a real API key. The three fields you might change:
 
 | Field | Where | What to set |
 |-------|-------|-------------|
@@ -113,7 +120,7 @@ Router WebSocket started on 127.0.0.1:8765/ws
 **Terminal 2 — Agent:**
 
 ```bash
-python run_agent.py --agent researcher --nickname alice --auth-token "$MESH_AUTH_TOKEN"
+python run_agent.py --agent echo --nickname alice --auth-token "$MESH_AUTH_TOKEN"
 ```
 
 You should see:

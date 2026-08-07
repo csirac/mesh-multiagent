@@ -473,7 +473,7 @@ class CCSessionManager:
     def _cc_merge_hooks_into_home(self, home: str, events_file: str) -> bool:
         """Merge our session hooks into {home}/.claude/settings.json.
 
-        Hook-precedence fix: in the live Sobek run the hooks registered only
+        Hook-precedence fix: in the live worker run the hooks registered only
         via `--settings` never fired (the events log stayed 0 bytes), while
         the identical hooks fire when present in the HOME-resolved settings
         file. So write them where CC demonstrably reads them; `--settings`
@@ -939,7 +939,7 @@ class CCSessionManager:
         submitting, verifies it actually landed on the input line, then submits
         with Enter and verifies the submit took. echo verification is a GATE,
         not a log line: proceeding on an unverified echo is what produced the
-        false-idle → fabricated-results chain in the live Sobek run. Returns
+        false-idle → fabricated-results chain in the live worker run. Returns
         error JSON string or None on success."""
         import json as _json
         ready = await self._cc_await_ready(session)

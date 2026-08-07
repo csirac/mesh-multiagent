@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """
 Central router/broker for the mesh.
 
@@ -38,7 +37,11 @@ from .protocol import (
     make_history_response,
     make_scratchpad_response,
     make_todo_response,
+    make_conversation_notes_response,
     make_calendar_response,
+    make_autonomous_control,
+    make_autonomous_control_response,
+    parse_autonomous_control,
 )
 from dataclasses import asdict
 from .transport import Server, Connection, WebSocketConnection
@@ -117,10 +120,13 @@ class Router:
             await self._start_websocket_server()
             logger.info(f"Router WebSocket started on {self.config.host}:{self.config.ws_port}/ws")
 
-        # Start CC usage monitor
-        self._init_cc_usage_paths()
-        self._cc_usage_refresh_task = asyncio.create_task(self._cc_usage_refresh_loop())
-        logger.info("CC usage monitor started (15 min refresh)")
+        # Account-usage polling is an explicit operator opt-in.  A normal
+        # router, especially a fresh local installation, must not inspect
+        # credentials in a user's home directory or issue external requests.
+        if self.config.cc_usage_monitor_enabled:
+            self._init_cc_usage_paths()
+            self._cc_usage_refresh_task = asyncio.create_task(self._cc_usage_refresh_loop())
+            logger.info("CC usage monitor started (15 min refresh)")
 
     async def stop(self) -> None:
         """Stop the router."""
@@ -308,7 +314,7 @@ class Router:
         try:
             from .clients.plaid_client import PlaidClient
 
-            client = PlaidClient(user_id=os.environ.get("PLAID_USER_ID", "default"))
+            client = PlaidClient(user_id="owner")  # Default user
             result = client.exchange_public_token(
                 public_token=public_token,
                 institution_id=institution_id,
@@ -511,7 +517,7 @@ class Router:
         node_id = request.headers.get("X-Node-ID", "").strip()
         if not node_id:
             return self._attachment_error(request, 400, "X-Node-ID required")
-        ok, resolved_node = self._authenticate_token(token, node_id)
+        ok, resolved_node, _allowed_destinations = self._authenticate_token(token, node_id)
         if not ok or resolved_node != node_id:
             return self._attachment_error(request, 403, "invalid token for node")
 
@@ -614,7 +620,7 @@ class Router:
         node_id = request.headers.get("X-Node-ID", "").strip()
         if not node_id:
             return self._attachment_error(request, 400, "X-Node-ID required")
-        ok, resolved_node = self._authenticate_token(token, node_id)
+        ok, resolved_node, _allowed_destinations = self._authenticate_token(token, node_id)
         if not ok or resolved_node != node_id:
             return self._attachment_error(request, 401, "invalid token for node")
         att_id = request.match_info.get("att_id", "")
@@ -660,33 +666,40 @@ class Router:
         # Fall back to global token
         return self.config.auth_token
 
-    def _authenticate_token(self, token: str | None, claimed_node: str | None) -> tuple[bool, str | None]:
+    def _authenticate_token(
+        self,
+        token: str | None,
+        claimed_node: str | None,
+    ) -> tuple[bool, str | None, list[str] | None]:
         """Validate a bearer/auth token for a claimed node id."""
         claimed_node = claimed_node or ""
         if not self.config.auth_enabled:
-            return True, claimed_node
+            return True, claimed_node, None
 
         if self.config.auth_mode == "per_user":
             if not token:
-                return False, None
+                return False, None, None
             result = self._validate_per_user_token(token)
             if not result:
-                return False, None
-            _username, allowed_prefixes = result
+                return False, None, None
+            _username, allowed_prefixes, allowed_destinations = result
             if allowed_prefixes and not any(claimed_node.startswith(p) for p in allowed_prefixes):
-                return False, None
-            return True, claimed_node
+                return False, None, None
+            return True, claimed_node, allowed_destinations
 
         expected_token = self._get_expected_token(claimed_node)
         if not expected_token or token != expected_token:
-            return False, None
-        return True, claimed_node
+            return False, None, None
+        return True, claimed_node, None
 
-    def _validate_per_user_token(self, token: str) -> tuple[str, list[str] | None] | None:
+    def _validate_per_user_token(
+        self,
+        token: str,
+    ) -> tuple[str, list[str] | None, list[str] | None] | None:
         """
         Validate a token against the users table.
 
-        Returns (username, allowed_prefixes) if valid, None otherwise.
+        Returns (username, allowed_prefixes, allowed_destinations) if valid, None otherwise.
         """
         return self.store.validate_user_token(token)
 
@@ -793,12 +806,13 @@ class Router:
         # Verify authentication if enabled
         if self.config.auth_enabled:
             provided_token = content.get("auth_token")
-            ok, _resolved_node = self._authenticate_token(provided_token, node_id)
+            ok, _resolved_node, allowed_destinations = self._authenticate_token(provided_token, node_id)
             if not ok:
                 logger.warning(f"Invalid auth token for node {node_id}")
                 await self._send_auth_error(conn, node_id, "invalid auth token")
                 await conn.close()
                 return
+            conn.user_allowed_destinations = allowed_destinations
             logger.info(f"Node {node_id} authenticated successfully")
 
         # Extract optional metadata from registration
@@ -927,6 +941,29 @@ class Router:
     async def _route_message(self, msg: Message, source_conn: AnyConnection | None = None) -> None:
         """Route a message to its destination."""
         msg = self._canonicalize_message_attachments(msg)
+        allowed_destinations = getattr(source_conn, "user_allowed_destinations", None)
+        if allowed_destinations is not None and msg.to_node != "router":
+            if msg.to_node not in allowed_destinations:
+                allowed_list = ", ".join(allowed_destinations)
+                logger.warning(
+                    "Rejecting unauthorized route from %s to %s; allowed destinations: %s",
+                    msg.from_node,
+                    msg.to_node,
+                    allowed_list,
+                )
+                error_msg = Message(
+                    from_node="router",
+                    to_node=msg.from_node,
+                    type=MessageType.MESSAGE,
+                    content=(
+                        f"Message rejected: you are not authorized to message {msg.to_node}. "
+                        f"Your allowed destinations: {allowed_list}"
+                    ),
+                    in_reply_to=msg.id,
+                )
+                await self._send_to_node(msg.from_node, error_msg)
+                return
+
         # Handle control messages to router
         if msg.to_node == "router":
             await self._handle_control(msg)
@@ -1110,8 +1147,21 @@ class Router:
         elif action == ControlAction.TODO_MUTATE.value:
             await self._handle_todo_mutate(msg, content, from_node)
 
+        # Autonomous-fleet control
+        elif action == ControlAction.AUTONOMOUS_CONTROL.value:
+            await self._handle_autonomous_control(msg, content, from_node)
+
+        elif action == ControlAction.CONVERSATION_NOTES_GET.value:
+            await self._handle_conversation_notes_get(msg, content, from_node)
+
+        elif action == ControlAction.CONVERSATION_NOTES_SET.value:
+            await self._handle_conversation_notes_set(msg, content, from_node)
+
         elif action == ControlAction.CALENDAR_GET.value:
             await self._handle_calendar_get(msg, content, from_node)
+
+        elif action == ControlAction.USER_RESET_TOKEN.value:
+            await self._handle_user_reset_token(msg, content, from_node)
 
         else:
             logger.warning(f"Unknown control action: {action}")
@@ -1735,6 +1785,7 @@ class Router:
         """Handle HISTORY_SYNC control message."""
         conversation_id = content.get("conversation_id")
         since = content.get("since")
+        before = content.get("before")
         limit = content.get("limit", 500)
 
         # Clamp limit to a reasonable maximum
@@ -1742,17 +1793,42 @@ class Router:
 
         logger.info(
             f"History sync request from {from_node}: "
-            f"conversation={conversation_id}, since={since}, limit={limit}"
+            f"conversation={conversation_id}, since={since}, before={before}, "
+            f"limit={limit}"
         )
 
         # Get messages
         if conversation_id:
+            if not self._is_conversation_participant(from_node, conversation_id):
+                logger.warning(
+                    "HISTORY_SYNC rejected: %s not a participant in %s",
+                    from_node,
+                    conversation_id,
+                )
+                response = make_history_response(
+                    to_node=from_node,
+                    messages=[],
+                    read_receipts={},
+                    conversation_id=conversation_id,
+                    has_more=False,
+                )
+                response.content["accepted"] = False
+                response.content["error"] = "not a participant in conversation"
+                response.in_reply_to = msg.id
+                await self._send_to_node(from_node, response)
+                return
             messages = self.store.get_conversation_history(
-                conversation_id, since_timestamp=since, limit=limit
+                conversation_id,
+                since_timestamp=since,
+                before_timestamp=before,
+                limit=limit,
             )
         else:
             messages = self.store.get_all_history_for_node(
-                from_node, since_timestamp=since, limit=limit
+                from_node,
+                since_timestamp=since,
+                before_timestamp=before,
+                limit=limit,
             )
 
         # Convert messages to dicts for JSON serialization
@@ -1891,6 +1967,236 @@ class Router:
             in_reply_to=msg.id,
         )
         await self._send_to_node(from_node, response)
+
+    # =========================================================================
+    # Conversation Notes Sync
+    # =========================================================================
+
+    async def _send_conversation_notes_error(
+        self,
+        from_node: str,
+        msg: Message,
+        conversation_id: str | None,
+        error: str,
+    ) -> None:
+        response = make_conversation_notes_response(
+            to_node=from_node,
+            notes={},
+            accepted=False,
+            conversation_id=conversation_id,
+            error=error,
+            in_reply_to=msg.id,
+        )
+        await self._send_to_node(from_node, response)
+
+    async def _handle_conversation_notes_get(
+        self, msg: Message, content: dict, from_node: str
+    ) -> None:
+        """Handle CONVERSATION_NOTES_GET control message."""
+        conversation_id = content.get("conversation_id")
+        if not conversation_id:
+            await self._send_conversation_notes_error(
+                from_node, msg, None, "conversation_id required"
+            )
+            return
+        if not self._is_conversation_participant(from_node, conversation_id):
+            await self._send_conversation_notes_error(
+                from_node, msg, conversation_id, "not a participant in conversation"
+            )
+            return
+
+        note = self.store.get_conversation_notes(conversation_id)
+        response = make_conversation_notes_response(
+            to_node=from_node,
+            notes={conversation_id: note} if note else {},
+            conversation_id=conversation_id,
+            in_reply_to=msg.id,
+        )
+        await self._send_to_node(from_node, response)
+
+    async def _broadcast_conversation_notes_response(
+        self,
+        conversation_id: str,
+        note: dict,
+        source_msg: Message,
+    ) -> None:
+        """Broadcast fresh conversation notes to online participants."""
+        payload = {conversation_id: note}
+        for participant in self._conversation_participants(conversation_id):
+            response = make_conversation_notes_response(
+                to_node=participant,
+                notes=payload,
+                accepted=True,
+                conversation_id=conversation_id,
+                in_reply_to=source_msg.id if participant == source_msg.from_node else None,
+            )
+            await self._send_to_node(participant, response)
+
+    async def _handle_conversation_notes_set(
+        self, msg: Message, content: dict, from_node: str
+    ) -> None:
+        """Handle CONVERSATION_NOTES_SET control message."""
+        conversation_id = content.get("conversation_id")
+        if not conversation_id:
+            await self._send_conversation_notes_error(
+                from_node, msg, None, "conversation_id required"
+            )
+            return
+        if not self._is_conversation_participant(from_node, conversation_id):
+            logger.warning(
+                "CONVERSATION_NOTES_SET rejected: %s not a participant in %s",
+                from_node,
+                conversation_id,
+            )
+            await self._send_conversation_notes_error(
+                from_node, msg, conversation_id, "not a participant in conversation"
+            )
+            return
+
+        try:
+            note = self.store.set_conversation_notes(
+                conversation_id=conversation_id,
+                content=content.get("content", ""),
+                updated_by=from_node,
+            )
+        except Exception as e:
+            logger.exception("CONVERSATION_NOTES_SET failed")
+            await self._send_conversation_notes_error(
+                from_node, msg, conversation_id, str(e)
+            )
+            return
+
+        await self._broadcast_conversation_notes_response(conversation_id, note, msg)
+
+    # =========================================================================
+    # Autonomous-Fleet Control
+    #
+    # Same broker shape as the todo channel: the client asks the router, the
+    # router authorizes, and only then does the request reach an agent.  These
+    # ops mutate fleet state (they schedule real sessions and move real budget
+    # ceilings), so the ACL is deliberately narrow — one operator, and only
+    # agents that mesh.yaml has actually enrolled as autonomous controllers.
+    # =========================================================================
+
+    #: The only node allowed to drive the autonomous fleet.
+    AUTONOMOUS_CONTROL_OPERATOR = "user:operator"
+
+    def _enrolled_autonomous_agents(self) -> dict[str, dict]:
+        """Map ``node_id -> enrollment`` for every configured autonomous controller.
+
+        Read from mesh.yaml on each call, the same way LIST_AGENTS does: the
+        set changes only when Project Owner edits config, and these ops are interactive
+        and rare, so a stale cache would cost more than the file read.
+        """
+        from .config import load_config
+
+        enrolled: dict[str, dict] = {}
+        try:
+            config = load_config()
+        except Exception as e:
+            logger.warning(f"Failed to load config for AUTONOMOUS_CONTROL: {e}")
+            return enrolled
+
+        for node_id, node_config in config.nodes.items():
+            if not getattr(node_config, "autonomous_agent_mode_enabled", False):
+                continue
+            enrolled[node_id] = {
+                "node_id": node_id,
+                "nickname": getattr(node_config, "nickname", "") or "",
+                "projects": list(getattr(node_config, "autonomous_projects", []) or []),
+                "max_workers_per_session": getattr(
+                    node_config, "autonomous_max_workers_per_session", 2
+                ),
+            }
+        return enrolled
+
+    async def _send_autonomous_control_error(
+        self,
+        from_node: str,
+        msg: Message,
+        op: str,
+        agent: str,
+        error: str,
+    ) -> None:
+        response = make_autonomous_control_response(
+            to_node=from_node,
+            op=op,
+            agent=agent,
+            accepted=False,
+            error=error,
+            in_reply_to=msg.id,
+        )
+        await self._send_to_node(from_node, response)
+
+    async def _handle_autonomous_control(
+        self, msg: Message, content: dict, from_node: str
+    ) -> None:
+        """Handle AUTONOMOUS_CONTROL: authorize, then forward to the controller."""
+        raw = content.get("payload") if isinstance(content.get("payload"), dict) else content
+        raw_op = str((raw or {}).get("op", "")).strip().lower()
+        raw_agent = str((raw or {}).get("agent", "") or "").strip()
+
+        if from_node != self.AUTONOMOUS_CONTROL_OPERATOR:
+            logger.warning(
+                f"AUTONOMOUS_CONTROL rejected: {from_node} is not "
+                f"{self.AUTONOMOUS_CONTROL_OPERATOR}"
+            )
+            await self._send_autonomous_control_error(
+                from_node, msg, raw_op, raw_agent,
+                "not authorized: autonomous-fleet control is restricted to "
+                f"{self.AUTONOMOUS_CONTROL_OPERATOR}",
+            )
+            return
+
+        try:
+            payload = parse_autonomous_control(raw)
+        except ValueError as e:
+            await self._send_autonomous_control_error(
+                from_node, msg, raw_op, raw_agent, str(e)
+            )
+            return
+
+        op = payload["op"]
+        agent = payload["agent"]
+        enrolled = self._enrolled_autonomous_agents()
+
+        if not agent:
+            await self._send_autonomous_control_error(
+                from_node, msg, op, agent, "agent required"
+            )
+            return
+        if agent not in enrolled:
+            known = ", ".join(sorted(enrolled)) or "(none configured)"
+            await self._send_autonomous_control_error(
+                from_node, msg, op, agent,
+                f"{agent} is not an enrolled autonomous controller. Enrolled: {known}",
+            )
+            return
+        if not self._connections.get(agent):
+            await self._send_autonomous_control_error(
+                from_node, msg, op, agent,
+                f"{agent} is not connected — start the agent before controlling it",
+            )
+            return
+
+        forwarded = make_autonomous_control(
+            from_node="router",
+            to_node=agent,
+            op=op,
+            agent=agent,
+            project=payload["project"] or None,
+            wake_time=payload["wake_time"] or None,
+            prompt=payload["prompt"] or None,
+            count=payload["count"],
+            value=payload.get("value"),
+            wake_id=payload["wake_id"] or None,
+            requested_by=from_node,
+            message_id=msg.id,
+        )
+        await self._send_to_node(agent, forwarded)
+        logger.info(
+            f"AUTONOMOUS_CONTROL op={op} forwarded from {from_node} to {agent}"
+        )
 
     # =========================================================================
     # Conversation Todo Sync
@@ -2223,6 +2529,48 @@ class Router:
             in_reply_to=msg.id,
         )
         await self._send_to_node(from_node, response)
+
+    async def _handle_user_reset_token(
+        self, msg: Message, content: dict, from_node: str
+    ) -> None:
+        """Handle user token reset request (admin or self-service)."""
+
+        async def send_response(status: str, **fields: Any) -> None:
+            response = Message(
+                from_node="router",
+                to_node=from_node,
+                type=MessageType.CONTROL,
+                content={
+                    "action": ControlAction.ACK.value,
+                    "request_action": ControlAction.USER_RESET_TOKEN.value,
+                    "status": status,
+                    **fields,
+                },
+                in_reply_to=msg.id,
+            )
+            await self._send_to_node(from_node, response)
+
+        target_username = str(content.get("target_username") or "").strip()
+        if not target_username:
+            await send_response("error", error="Missing target_username")
+            return
+
+        is_admin = from_node == "user:operator"
+        is_self = from_node == f"user:{target_username}"
+        if not (is_admin or is_self):
+            await send_response(
+                "error",
+                error=f"Not authorized to reset token for {target_username}",
+            )
+            return
+
+        new_token = self.store.regenerate_user_token(target_username)
+        if new_token is None:
+            await send_response("error", error=f"User '{target_username}' not found")
+            return
+
+        logger.info("Token reset for user '%s' by %s", target_username, from_node)
+        await send_response("ok", username=target_username, new_token=new_token)
 
     # =========================================================================
     # Agent Management

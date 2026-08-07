@@ -9,5 +9,6 @@ Framework documentation for mesh.
 | [controller.md](controller.md) | Task controller framework — FSM v0 and phase-flow v0.2 controllers. |
 | [commands.md](commands.md) | TUI slash-command reference. |
 | [two-host-demo.md](two-host-demo.md) | Cross-network deployment guide — router on one machine, agents on others. |
+| [governed-procedural-memory.md](governed-procedural-memory.md) | Human-governed, versioned procedural skill cards. |
 
 For the quickstart walkthrough, see the top-level [README.md](../README.md).

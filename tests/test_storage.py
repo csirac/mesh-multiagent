@@ -463,7 +463,7 @@ class TestChannelList:
 class TestConversationTodos:
     def test_add_list_and_update_todos(self, store):
         """Todos are stored per conversation with status/version tracking."""
-        conv_id = MessageStore.compute_conversation_id("user:testuser", "agent:coder:sobek")
+        conv_id = MessageStore.compute_conversation_id("user:testuser", "agent:coder:worker")
         todo = store.add_todo(
             conv_id,
             "Draft plan",
@@ -482,7 +482,7 @@ class TestConversationTodos:
 
         accepted, updated = store.update_todo(
             todo["id"],
-            updated_by="agent:coder:sobek",
+            updated_by="agent:coder:worker",
             status="in_progress",
             section="medium-term",
             update_section=True,
@@ -516,7 +516,7 @@ class TestConversationTodos:
 
         accepted, current = store.update_todo(
             todo["id"],
-            updated_by="agent:coder:sobek",
+            updated_by="agent:coder:worker",
             status="done",
             expected_version=todo["version"] + 1,
         )

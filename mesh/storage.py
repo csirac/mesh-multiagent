@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """
 Message persistence for the mesh.
 
@@ -189,16 +188,28 @@ class MessageStore:
                     token_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     disabled INTEGER DEFAULT 0,
-                    allowed_prefixes TEXT DEFAULT NULL
+                    allowed_prefixes TEXT DEFAULT NULL,
+                    allowed_destinations TEXT DEFAULT NULL
                 )
             """)
-            # Migration: add allowed_prefixes column if missing
+            # Migration: add user restriction columns if missing
             cols = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
             if "allowed_prefixes" not in cols:
                 conn.execute("ALTER TABLE users ADD COLUMN allowed_prefixes TEXT DEFAULT NULL")
+            if "allowed_destinations" not in cols:
+                conn.execute("ALTER TABLE users ADD COLUMN allowed_destinations TEXT DEFAULT NULL")
             # Scratchpad notes (per-conversation)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS scratchpad_notes (
+                    conversation_id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL,
+                    updated_by TEXT NOT NULL
+                )
+            """)
+            # Per-conversation pinned context pointers
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS conversation_notes (
                     conversation_id TEXT PRIMARY KEY,
                     content TEXT NOT NULL DEFAULT '',
                     updated_at TEXT NOT NULL,
@@ -730,6 +741,7 @@ class MessageStore:
         self,
         conversation_id: str,
         since_timestamp: str | None = None,
+        before_timestamp: str | None = None,
         limit: int = 100,
     ) -> list[Message]:
         """
@@ -738,13 +750,28 @@ class MessageStore:
         Args:
             conversation_id: The conversation ID
             since_timestamp: Only return messages after this ISO timestamp
+            before_timestamp: Only return messages before this ISO timestamp
             limit: Maximum number of messages to return
 
         Returns:
             List of messages, oldest first (but fetches most recent N messages)
         """
         with self._connect() as conn:
-            if since_timestamp:
+            if before_timestamp:
+                # Backward pagination: fetch the newest messages older than
+                # before_timestamp, then return them chronologically.
+                rows = conn.execute(
+                    """
+                    SELECT * FROM (
+                        SELECT * FROM message_archive
+                        WHERE conversation_id = ? AND timestamp < ?
+                        ORDER BY timestamp DESC
+                        LIMIT ?
+                    ) ORDER BY timestamp ASC
+                    """,
+                    (conversation_id, before_timestamp, limit),
+                ).fetchall()
+            elif since_timestamp:
                 # When since_timestamp is provided, get messages after that time (oldest first)
                 rows = conn.execute(
                     """
@@ -776,6 +803,7 @@ class MessageStore:
         self,
         node_id: str,
         since_timestamp: str | None = None,
+        before_timestamp: str | None = None,
         limit: int = 500,
     ) -> list[Message]:
         """
@@ -784,13 +812,40 @@ class MessageStore:
         Args:
             node_id: The node ID to get history for
             since_timestamp: Only return messages after this ISO timestamp
+            before_timestamp: Only return messages before this ISO timestamp
             limit: Maximum number of messages to return
 
         Returns:
             List of messages, oldest first (but fetches most recent N messages)
         """
         with self._connect() as conn:
-            if since_timestamp:
+            if before_timestamp:
+                # Backward pagination across all conversations visible to node_id.
+                rows = conn.execute(
+                    """
+                    SELECT * FROM (
+                        SELECT * FROM message_archive
+                        WHERE (from_node = ? OR to_node = ? OR conversation_id LIKE ?
+                               OR conversation_id IN (
+                                   SELECT 'channel:' || channel_name
+                                   FROM channel_members
+                                   WHERE node_id = ?
+                               ))
+                          AND timestamp < ?
+                        ORDER BY timestamp DESC
+                        LIMIT ?
+                    ) ORDER BY timestamp ASC
+                    """,
+                    (
+                        node_id,
+                        node_id,
+                        f"%{node_id}%",
+                        node_id,
+                        before_timestamp,
+                        limit,
+                    ),
+                ).fetchall()
+            elif since_timestamp:
                 # When since_timestamp is provided, get messages after that time (oldest first)
                 rows = conn.execute(
                     """
@@ -1265,23 +1320,24 @@ class MessageStore:
             except sqlite3.IntegrityError:
                 raise ValueError(f"User '{username}' already exists")
 
-    def validate_user_token(self, token: str) -> tuple[str, list[str] | None] | None:
+    def validate_user_token(self, token: str) -> tuple[str, list[str] | None, list[str] | None] | None:
         """
-        Validate a token and return the associated username and allowed prefixes.
+        Validate a token and return the associated username and restrictions.
 
         Args:
             token: The plaintext token to validate
 
         Returns:
-            (username, allowed_prefixes) if valid and not disabled, None otherwise.
+            (username, allowed_prefixes, allowed_destinations) if valid and not disabled, None otherwise.
             allowed_prefixes is a list of strings or None (no restriction).
+            allowed_destinations is a list of destination node IDs or None (no restriction).
         """
         token_hash = self._hash_token(token.strip())
 
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT username, allowed_prefixes FROM users
+                SELECT username, allowed_prefixes, allowed_destinations FROM users
                 WHERE token_hash = ? AND disabled = 0
                 """,
                 (token_hash,),
@@ -1289,10 +1345,14 @@ class MessageStore:
             if not row:
                 return None
             prefixes = None
+            destinations = None
             if row["allowed_prefixes"]:
                 import json
                 prefixes = json.loads(row["allowed_prefixes"])
-            return (row["username"], prefixes)
+            if row["allowed_destinations"]:
+                import json
+                destinations = json.loads(row["allowed_destinations"])
+            return (row["username"], prefixes, destinations)
 
     def list_users(self) -> list[dict]:
         """
@@ -1304,7 +1364,7 @@ class MessageStore:
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, username, created_at, disabled, allowed_prefixes
+                SELECT id, username, created_at, disabled, allowed_prefixes, allowed_destinations
                 FROM users
                 ORDER BY created_at
                 """
@@ -1317,6 +1377,7 @@ class MessageStore:
                     "created_at": row["created_at"],
                     "disabled": bool(row["disabled"]),
                     "allowed_prefixes": _json.loads(row["allowed_prefixes"]) if row["allowed_prefixes"] else None,
+                    "allowed_destinations": _json.loads(row["allowed_destinations"]) if row["allowed_destinations"] else None,
                 }
                 for row in rows
             ]
@@ -1343,6 +1404,31 @@ class MessageStore:
             conn.commit()
             if cursor.rowcount > 0:
                 logger.info(f"Set allowed_prefixes for {username}: {prefixes}")
+                return True
+            return False
+
+    def set_allowed_destinations(self, username: str, destinations: list[str] | None) -> bool:
+        """
+        Set destination node IDs a user's token is allowed to message.
+
+        Args:
+            username: The username
+            destinations: List of allowed destination node IDs
+                          or None to remove restrictions
+
+        Returns:
+            True if user was updated, False if user not found
+        """
+        import json
+        value = json.dumps(destinations) if destinations is not None else None
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE users SET allowed_destinations = ? WHERE username = ?",
+                (value, username),
+            )
+            conn.commit()
+            if cursor.rowcount > 0:
+                logger.info(f"Set allowed_destinations for {username}: {destinations}")
                 return True
             return False
 
@@ -1556,6 +1642,60 @@ class MessageStore:
             }
             logger.debug(f"Scratchpad set for {conversation_id} by {updated_by}")
             return (True, current)
+
+    # =========================================================================
+    # Conversation Notes
+    # =========================================================================
+
+    def get_conversation_notes(self, conversation_id: str) -> dict | None:
+        """Get pinned notes for a conversation."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT content, updated_at, updated_by
+                FROM conversation_notes
+                WHERE conversation_id = ?
+                """,
+                (conversation_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "content": row["content"],
+            "updated_at": row["updated_at"],
+            "updated_by": row["updated_by"],
+        }
+
+    def set_conversation_notes(
+        self,
+        conversation_id: str,
+        content: str,
+        updated_by: str,
+    ) -> dict:
+        """Set pinned notes for a conversation."""
+        from .protocol import now_iso
+
+        clean_content = str(content or "").strip()
+        now = now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO conversation_notes
+                (conversation_id, content, updated_at, updated_by)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(conversation_id) DO UPDATE SET
+                    content = excluded.content,
+                    updated_at = excluded.updated_at,
+                    updated_by = excluded.updated_by
+                """,
+                (conversation_id, clean_content, now, updated_by),
+            )
+            conn.commit()
+        return {
+            "content": clean_content,
+            "updated_at": now,
+            "updated_by": updated_by,
+        }
 
     # =========================================================================
     # Conversation Todos

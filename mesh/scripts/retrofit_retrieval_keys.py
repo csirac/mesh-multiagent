@@ -165,7 +165,7 @@ def main():
         description="Retrofit retrieval keys for existing memory entries"
     )
     parser.add_argument("--nickname", required=True,
-                        help="Agent nickname (e.g., bob, claude-sobek)")
+                        help="Agent nickname (e.g., operator, claude-coder)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would be processed without making changes")
     parser.add_argument("--backend", type=str, default=None,

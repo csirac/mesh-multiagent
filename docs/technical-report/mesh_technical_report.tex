@@ -36,7 +36,7 @@
 
 \title{Mesh Agent System:\\Architecture, Control, and Memory\\[0.5em]
 \large Technical Report}
-\author{Alan Kuhnle}
+\author{Project Owner}
 \date{May 2026}
 
 \begin{document}
@@ -159,7 +159,7 @@ Create an \code{env.bash} file exporting the API keys referenced by
 
 \begin{lstlisting}[language=bash]
 # env.bash — DO NOT commit this file
-export OPENAI_API_KEY="sk-..."
+export OPENAI_API_KEY="<your-api-key>"
 export MESH_AUTH_TOKEN="$(openssl rand -hex 32)"
 \end{lstlisting}
 
@@ -525,7 +525,7 @@ Representative examples:
 \code{openai-reasoning-*}   & openai     & o4-mini / o3         & Reasoning tasks \\
 \code{claude-code-opus}     & claude-code & opus                & Most agents \\
 \code{deepseek-direct}      & openai     & deepseek-v4-pro      & Memory formation \\
-\code{vega-qwen36}          & openai     & local-27b            & Local executor (Qwen3.6-27B) \\
+\code{local-qwen36}         & openai     & local-27b            & Local executor (Qwen3.6-27B) \\
 \code{codex-5.5}            & codex      & gpt-5.5              & Codex agents \\
 \code{mesh-harness-qwen36-pe} & mesh-harness & Qwen3.6-27B + DS-pro & Plan-and-execute \\
 \bottomrule

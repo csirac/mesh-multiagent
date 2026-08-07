@@ -99,7 +99,142 @@ def _detect_hallucinated_tools(
     return hallucinated
 
 
-READ_ONLY_TOOLS = {"file_read", "list_dir", "grep", "find_files"}
+READ_ONLY_TOOLS = {"file_read", "list_dir", "grep", "find_files", "get_context"}
+
+
+class _WorkDeadlineExpired(asyncio.TimeoutError):
+    """Normal tool/LLM work exhausted its child-owned deadline."""
+
+    def __init__(
+        self,
+        message: str = "work deadline reached",
+        *,
+        partial_results: list[tuple[str, str, bool]] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.partial_results = partial_results or []
+
+
+async def _run_before_deadline(factory: Any, deadline_at: float | None) -> Any:
+    """Run one normal-work awaitable without consuming synthesis grace."""
+    if deadline_at is None:
+        return await factory()
+    remaining = deadline_at - time.monotonic()
+    if remaining <= 0:
+        raise _WorkDeadlineExpired()
+
+    operation = asyncio.ensure_future(factory())
+    try:
+        done, _pending = await asyncio.wait(
+            {operation},
+            timeout=remaining,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    except BaseException:
+        operation.cancel()
+        await asyncio.gather(operation, return_exceptions=True)
+        raise
+
+    if operation in done:
+        # Preserve exceptions raised by the operation itself. In particular, an
+        # agent-socket or tool-local TimeoutError is not the harness work
+        # deadline and must flow through the normal retry/error path.
+        return operation.result()
+
+    operation.cancel()
+    await asyncio.gather(operation, return_exceptions=True)
+    raise _WorkDeadlineExpired()
+
+
+def _synthesis_reason(
+    *,
+    estimated_tokens: int,
+    synthesis_threshold: int,
+    deadline_at: float | None,
+    iteration: int,
+    max_iterations: int,
+) -> str | None:
+    """Return the terminal reason whose next call must be tool-free."""
+    if estimated_tokens >= synthesis_threshold:
+        return "context"
+    if deadline_at is not None and time.monotonic() >= deadline_at:
+        return "deadline"
+    if iteration >= max_iterations:
+        return "max_iterations"
+    return None
+
+
+def _forced_synthesis_message(reason: str, *, max_iterations: int) -> str:
+    """Build the shared one-turn, no-tools terminal instruction."""
+    if reason == "context":
+        lead = "**YOUR CONTEXT BUDGET IS EXHAUSTED.**"
+    elif reason == "deadline":
+        lead = "**YOUR WORK DEADLINE HAS BEEN REACHED.**"
+    elif reason == "max_iterations":
+        lead = f"**YOUR TOOL-LOOP LIMIT ({max_iterations} ITERATIONS) HAS BEEN REACHED.**"
+    else:
+        lead = "**NORMAL TOOL WORK HAS ENDED.**"
+    return (
+        f"{lead} Produce your FINAL response now using only the work already completed. "
+        "No further tool calls are available. Synthesize the most useful answer you can, "
+        "state what was completed, and explicitly identify anything unresolved."
+    )
+
+
+def _report_forced_synthesis(
+    reason: str,
+    *,
+    iteration: int,
+    estimated_tokens: int,
+    synthesis_threshold: int,
+    max_iterations: int,
+) -> None:
+    """Emit a non-fatal diagnostic for an intentional synthesis transition."""
+    if reason == "context":
+        detail = (
+            f"Context budget exhausted ({estimated_tokens} >= "
+            f"{synthesis_threshold} tokens)"
+        )
+    elif reason == "deadline":
+        detail = "Work deadline reached"
+    else:
+        detail = f"Tool-loop limit reached ({max_iterations} iterations)"
+    protocol.emit_error(
+        f"{detail}. Forcing one no-tools synthesis call at iteration {iteration}.",
+        iteration,
+        fatal=False,
+    )
+
+
+def _deadline_tool_arguments(
+    call: ToolCall,
+    deadline_at: float | None,
+) -> dict[str, Any]:
+    """Cap one-shot shell work so its subprocess dies with the work interval."""
+    arguments = dict(call.arguments)
+    if (
+        call.name == "shell"
+        and deadline_at is not None
+        and not arguments.get("session_id")
+    ):
+        remaining = max(0.1, deadline_at - time.monotonic())
+        try:
+            configured = float(arguments.get("timeout", 120))
+        except (TypeError, ValueError):
+            configured = 120.0
+        arguments["timeout"] = min(configured, remaining)
+    return arguments
+
+
+def _cleanup_deadline_tool_resources() -> None:
+    """Stop persistent harness shells before the tool-free synthesis turn."""
+    try:
+        from .tools.unified_exec import _cleanup_all_sessions
+
+        _cleanup_all_sessions()
+    except Exception:
+        logger.exception("Failed to clean up persistent shell sessions at work deadline")
+
 
 DEFAULT_CHECKPOINT_PROMPT = (
     "CHECKPOINT: Answer both questions.\n"
@@ -498,11 +633,18 @@ def _truncate_extreme_result(result: str, soft_limit: int = DEFAULT_SOFT_LIMIT) 
 async def _call_agent_socket(socket_path: str, name: str, arguments: dict) -> str:
     """Route a tool call to the parent agent_node via Unix domain socket."""
     connector = aiohttp.UnixConnector(path=socket_path)
+    payload: dict[str, Any] = {"name": name, "arguments": arguments}
+    capability = os.environ.get("MESH_EXECUTION_CAPABILITY", "")
+    if capability:
+        payload["capability"] = capability
+    worker_id = os.environ.get("MESH_WORKER_ID", "")
+    if worker_id:
+        payload["worker_id"] = worker_id
     try:
         async with aiohttp.ClientSession(connector=connector) as session:
             async with session.post(
                 "http://localhost/tool",
-                json={"name": name, "arguments": arguments},
+                json=payload,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 data = await resp.json()
@@ -519,13 +661,29 @@ async def _execute_tool_calls(
     effective_tool_names: list[str] | None = None,
     force_synthesis: bool = False,
     read_tools_stripped: bool = False,
+    deadline_at: float | None = None,
 ) -> list[tuple[str, str, bool]]:
     """Execute tool calls and return list of (name, result_str, success)."""
     _allowed = set(effective_tool_names) if effective_tool_names is not None else None
     results: list[tuple[str, str, bool]] = []
-    for call in tool_calls:
+    for call_index, call in enumerate(tool_calls):
         call_id = getattr(call, "call_id", None) or uuid.uuid4().hex[:8]
         protocol.emit_tool_call(call.name, call.arguments, call_id)
+        invocation_arguments = _deadline_tool_arguments(call, deadline_at)
+
+        if deadline_at is not None and time.monotonic() >= deadline_at:
+            pending = tool_calls[call_index:]
+            for pending_call in pending:
+                pending_id = getattr(pending_call, "call_id", None) or uuid.uuid4().hex[:8]
+                err = (
+                    f"Tool '{pending_call.name}' was not run because the work deadline "
+                    "was reached; final synthesis will use earlier completed results."
+                )
+                protocol.emit_tool_result(
+                    pending_call.name, err, pending_id, success=False
+                )
+                results.append((pending_call.name, err, False))
+            raise _WorkDeadlineExpired(partial_results=results)
 
         if _allowed is not None and call.name not in _allowed:
             if force_synthesis:
@@ -540,6 +698,14 @@ async def _execute_tool_calls(
                     f"You appear to be stuck in a degenerate read-only loop, "
                     f"so read tools are disabled until you make a write. "
                     f"Use file_edit, apply_patch, or shell to make progress."
+                )
+            elif call.name == "send_report":
+                err = (
+                    "DISALLOWED: 'send_report' is not available in this worker. "
+                    "The parent agent handles report delivery. Provide your complete "
+                    "final report as normal final response text now, then stop. "
+                    "Do not retry via 'mesh-tool send_report' from the shell either "
+                    "— report delivery is the parent's job on this path."
                 )
             else:
                 err = (
@@ -557,13 +723,20 @@ async def _execute_tool_calls(
         # Try local harness tool first, then delegate to agent socket
         tool_def = registry.get(call.name)
 
-        if tool_def is not None and tool_def.handler is not None:
+        if (
+            tool_def is not None
+            and tool_def.handler is not None
+            and call.name not in AGENT_LOCAL_TOOLS
+        ):
             pass  # fall through to local execution below
         elif agent_socket_path:
             # Delegate to parent agent_node via socket (mesh tools, agent-local tools)
             try:
-                result_str = await _call_agent_socket(
-                    agent_socket_path, call.name, call.arguments,
+                result_str = await _run_before_deadline(
+                    lambda: _call_agent_socket(
+                        agent_socket_path, call.name, invocation_arguments,
+                    ),
+                    deadline_at,
                 )
                 if max_result_chars and len(result_str) > max_result_chars:
                     err = (
@@ -578,6 +751,28 @@ async def _execute_tool_calls(
                 else:
                     protocol.emit_tool_result(call.name, result_str[:2000], call_id, success=True)
                     results.append((call.name, result_str, True))
+            except _WorkDeadlineExpired as exc:
+                err = (
+                    f"Tool '{call.name}' was interrupted when the work deadline "
+                    "was reached; final synthesis will use earlier completed results."
+                )
+                protocol.emit_tool_result(call.name, err, call_id, success=False)
+                results.append((call.name, err, False))
+                for pending_call in tool_calls[call_index + 1:]:
+                    pending_id = (
+                        getattr(pending_call, "call_id", None)
+                        or uuid.uuid4().hex[:8]
+                    )
+                    pending_err = (
+                        f"Tool '{pending_call.name}' was not run because the work "
+                        "deadline was reached."
+                    )
+                    protocol.emit_tool_result(
+                        pending_call.name, pending_err, pending_id, success=False
+                    )
+                    results.append((pending_call.name, pending_err, False))
+                exc.partial_results = results
+                raise
             except Exception as e:
                 err = f"Error calling agent socket for '{call.name}': {e}"
                 logger.error(err)
@@ -593,9 +788,15 @@ async def _execute_tool_calls(
 
         try:
             if asyncio.iscoroutinefunction(tool_def.handler):
-                result = await tool_def.handler(**call.arguments)
+                result = await _run_before_deadline(
+                    lambda: tool_def.handler(**invocation_arguments),
+                    deadline_at,
+                )
             else:
-                result = await asyncio.to_thread(tool_def.handler, **call.arguments)
+                result = await _run_before_deadline(
+                    lambda: asyncio.to_thread(tool_def.handler, **invocation_arguments),
+                    deadline_at,
+                )
             result_str = str(result)
             if max_result_chars and len(result_str) > max_result_chars:
                 err = (
@@ -611,6 +812,28 @@ async def _execute_tool_calls(
                 protocol.emit_tool_result(call.name, result_str[:2000], call_id, success=True)
                 results.append((call.name, result_str, True))
         except PhaseCompleteSignal:
+            raise
+        except _WorkDeadlineExpired as exc:
+            err = (
+                f"Tool '{call.name}' was interrupted when the work deadline was "
+                "reached; final synthesis will use earlier completed results."
+            )
+            protocol.emit_tool_result(call.name, err, call_id, success=False)
+            results.append((call.name, err, False))
+            for pending_call in tool_calls[call_index + 1:]:
+                pending_id = (
+                    getattr(pending_call, "call_id", None)
+                    or uuid.uuid4().hex[:8]
+                )
+                pending_err = (
+                    f"Tool '{pending_call.name}' was not run because the work "
+                    "deadline was reached."
+                )
+                protocol.emit_tool_result(
+                    pending_call.name, pending_err, pending_id, success=False
+                )
+                results.append((pending_call.name, pending_err, False))
+            exc.partial_results = results
             raise
         except TypeError as e:
             err = f"Error: Invalid arguments for '{call.name}': {e}"
@@ -647,6 +870,7 @@ async def run_loop(
     assessor_llm_client: LLMClient | None = None,
     cc_watchdog: "Any | None" = None,
     codex_assessor_config: dict[str, str] | None = None,
+    deadline_secs: float | None = None,
 ) -> str:
     """Run the auto-tool loop until completion.
 
@@ -674,24 +898,17 @@ async def run_loop(
             calls. Threaded through to _run_plan_and_execute_loop.
         cc_watchdog: Optional CCWatchdog instance for CC executor sessions.
             Monitors streaming tool activity and kills on degenerate loops.
+        deadline_secs: Optional child-owned work interval. Normal LLM and tool
+            work stops when it expires; one final no-tools synthesis call then
+            runs outside this interval under the caller's absolute timeout.
 
     Returns:
         The final assistant text response.
     """
     if controller_mode == "plan_and_execute":
-        return await _run_plan_and_execute_loop(
-            llm_client=llm_client,
-            history=history,
-            system_prompt=system_prompt,
-            tool_registry=tool_registry,
-            tool_names=tool_names,
-            node_id=node_id,
-            soft_limit=soft_limit,
-            mcp_config=mcp_config,
-            instructions=instructions,
-            agent_socket_path=agent_socket_path,
-            assessor_llm_client=assessor_llm_client,
-            codex_assessor_config=codex_assessor_config,
+        raise ValueError(
+            "The 'plan_and_execute' controller mode has been removed. "
+            "Use the PEV harness (mesh/pev_harness.py) instead."
         )
 
     if controller_mode == "decompose":
@@ -738,6 +955,7 @@ async def run_loop(
             checkpoint_llm_client=checkpoint_llm_client,
             checkpoint_periodic_interval=checkpoint_periodic_interval,
             checkpoint_periodic_start=checkpoint_periodic_start,
+            deadline_secs=deadline_secs,
         )
 
     thread_id = uuid.uuid4().hex[:12]
@@ -760,6 +978,11 @@ async def run_loop(
     is_cc = backend in ("claude-code", "zai")
     final_text = ""
     _loop_start = time.monotonic()
+    deadline_at = (
+        _loop_start + float(deadline_secs)
+        if deadline_secs is not None and float(deadline_secs) > 0
+        else None
+    )
     _last_heartbeat = _loop_start
     synthesis_threshold = int(soft_limit * FORCED_SYNTHESIS_FRACTION)
 
@@ -785,9 +1008,16 @@ async def run_loop(
             _last_heartbeat = _now
         protocol.emit_turn_started(iteration)
 
-        # --- Budget awareness + forced synthesis ---
+        # --- Budget/deadline/iteration awareness + forced synthesis ---
         estimated_tokens = estimate_history_tokens(history)
-        force_synthesis = estimated_tokens >= synthesis_threshold
+        terminal_reason = _synthesis_reason(
+            estimated_tokens=estimated_tokens,
+            synthesis_threshold=synthesis_threshold,
+            deadline_at=deadline_at,
+            iteration=iteration,
+            max_iterations=max_iterations,
+        )
+        force_synthesis = terminal_reason is not None
 
         budget_line = (
             f"[Context: ~{estimated_tokens // 1000}K / {soft_limit // 1000}K tokens. "
@@ -795,23 +1025,27 @@ async def run_loop(
         )
 
         if force_synthesis:
-            forced_msg = (
-                "**YOUR CONTEXT BUDGET IS EXHAUSTED.** Produce your FINAL response now "
-                "using what you have gathered. No further tool calls are available — "
-                "write your complete answer."
+            if terminal_reason == "deadline":
+                _cleanup_deadline_tool_resources()
+            forced_msg = _forced_synthesis_message(
+                terminal_reason,
+                max_iterations=max_iterations,
             )
             effective_instructions = f"{forced_msg}\n\n{budget_line}"
             if instructions:
                 effective_instructions += f"\n\n{instructions}"
             effective_tool_names: list[str] | None = []
             logger.info(
-                "Forced synthesis triggered at iteration %d: estimated=%d tokens, threshold=%d",
-                iteration, estimated_tokens, synthesis_threshold,
+                "Forced synthesis triggered at iteration %d: reason=%s "
+                "estimated=%d tokens, threshold=%d",
+                iteration, terminal_reason, estimated_tokens, synthesis_threshold,
             )
-            protocol.emit_error(
-                f"Context budget exhausted ({estimated_tokens} >= {synthesis_threshold} tokens). "
-                f"Forcing final synthesis at iteration {iteration}.",
-                iteration, fatal=False,
+            _report_forced_synthesis(
+                terminal_reason,
+                iteration=iteration,
+                estimated_tokens=estimated_tokens,
+                synthesis_threshold=synthesis_threshold,
+                max_iterations=max_iterations,
             )
         else:
             effective_instructions = f"{budget_line}\n\n{instructions}" if instructions else budget_line
@@ -826,22 +1060,36 @@ async def run_loop(
         response = None
         tool_calls = []
         llm_ok = False
-        for attempt in range(1 + LLM_RETRIES):
+        work_deadline_hit = False
+        attempts = 1 if force_synthesis else 1 + LLM_RETRIES
+        for attempt in range(attempts):
             try:
-                response, tool_calls = await llm_client.complete_with_tools(
-                    history=history,
-                    node_id=node_id,
-                    system_prompt=system_prompt,
-                    tool_registry=tool_registry,
-                    tool_names=effective_tool_names,
-                    instructions=effective_instructions,
-                    mcp_config=mcp_config,
-                    cc_watchdog=cc_watchdog,
+                response, tool_calls = await _run_before_deadline(
+                    lambda: llm_client.complete_with_tools(
+                        history=history,
+                        node_id=node_id,
+                        system_prompt=system_prompt,
+                        tool_registry=tool_registry,
+                        tool_names=effective_tool_names,
+                        instructions=effective_instructions,
+                        mcp_config=mcp_config,
+                        cc_watchdog=cc_watchdog,
+                    ),
+                    None if force_synthesis else deadline_at,
                 )
                 llm_ok = True
                 break
+            except _WorkDeadlineExpired:
+                work_deadline_hit = True
+                protocol.emit_error(
+                    "Work deadline reached during an LLM call; cancelling normal "
+                    "work and reserving the next turn for no-tools synthesis.",
+                    iteration,
+                    fatal=False,
+                )
+                break
             except Exception as e:
-                if attempt < LLM_RETRIES and _is_transient(e):
+                if not force_synthesis and attempt < LLM_RETRIES and _is_transient(e):
                     delay = _backoff_for_attempt(attempt, e)
                     protocol.emit_error(
                         f"Transient LLM error (attempt {attempt + 1}/{1 + LLM_RETRIES}), "
@@ -850,11 +1098,20 @@ async def run_loop(
                     )
                     logger.warning(f"Transient LLM error at iteration {iteration}, "
                                    f"attempt {attempt + 1}: {e}")
-                    await asyncio.sleep(delay)
+                    try:
+                        await _run_before_deadline(
+                            lambda: asyncio.sleep(delay),
+                            deadline_at,
+                        )
+                    except _WorkDeadlineExpired:
+                        work_deadline_hit = True
+                        break
                 else:
                     protocol.emit_error(f"LLM call failed: {e}", iteration, fatal=True)
                     logger.exception(f"LLM call failed at iteration {iteration}")
                     break
+        if work_deadline_hit:
+            continue
         if not llm_ok:
             break
 
@@ -863,6 +1120,7 @@ async def run_loop(
             response
             and not tool_calls
             and effective_tool_names is not None
+            and not force_synthesis
         ):
             bad_tools = _detect_hallucinated_tools(response, effective_tool_names)
             if bad_tools:
@@ -898,16 +1156,28 @@ async def run_loop(
                         source="in_flight",
                     ))
                     try:
-                        response, tool_calls = await llm_client.complete_with_tools(
-                            history=history,
-                            node_id=node_id,
-                            system_prompt=system_prompt,
-                            tool_registry=tool_registry,
-                            tool_names=effective_tool_names,
-                            instructions=effective_instructions,
-                            mcp_config=mcp_config,
-                            cc_watchdog=cc_watchdog,
+                        response, tool_calls = await _run_before_deadline(
+                            lambda: llm_client.complete_with_tools(
+                                history=history,
+                                node_id=node_id,
+                                system_prompt=system_prompt,
+                                tool_registry=tool_registry,
+                                tool_names=effective_tool_names,
+                                instructions=effective_instructions,
+                                mcp_config=mcp_config,
+                                cc_watchdog=cc_watchdog,
+                            ),
+                            deadline_at,
                         )
+                    except _WorkDeadlineExpired:
+                        work_deadline_hit = True
+                        protocol.emit_error(
+                            "Work deadline reached during a tool-call correction; "
+                            "reserving the next turn for no-tools synthesis.",
+                            iteration,
+                            fatal=False,
+                        )
+                        break
                     except Exception:
                         logger.warning("Hallucinated tool retry LLM call failed, using last response")
                         break
@@ -916,6 +1186,9 @@ async def run_loop(
                     bad_tools = _detect_hallucinated_tools(response, effective_tool_names)
                     if not bad_tools:
                         break
+
+        if work_deadline_hit:
+            continue
 
         # Accumulate usage
         if llm_client._last_usage:
@@ -927,7 +1200,9 @@ async def run_loop(
             cumulative_usage["backend"] = u.get("backend", backend)
             cumulative_usage["model"] = u.get("model", model)
 
-        protocol.emit_assistant_message(response[:500] if response else "", iteration)
+        _reasoning = getattr(llm_client, "_last_reasoning_content", None)
+        protocol.emit_assistant_message(response[:500] if response else "", iteration,
+                                        reasoning_content=_reasoning)
 
         # Forced synthesis: tools were stripped, accept whatever the model produced
         if force_synthesis:
@@ -953,11 +1228,21 @@ async def run_loop(
                 tool_calls, tool_registry, agent_socket_path, max_result_chars,
                 effective_tool_names, force_synthesis=force_synthesis,
                 read_tools_stripped=_read_tools_stripped,
+                deadline_at=deadline_at,
             )
         except PhaseCompleteSignal as sig:
             logger.info("Phase complete signal received: %s", sig.summary[:200])
             final_text = sig.summary
             break
+        except _WorkDeadlineExpired as exc:
+            results = exc.partial_results
+            work_deadline_hit = True
+            protocol.emit_error(
+                "Work deadline reached during tool execution; completed tool "
+                "results were preserved for final synthesis.",
+                iteration,
+                fatal=False,
+            )
 
         # Format results for history
         result_parts: list[str] = []
@@ -1004,6 +1289,9 @@ async def run_loop(
             timestamp=now_ts,
             source="in_flight",
         ))
+
+        if work_deadline_hit:
+            continue
 
         # --- Update checkpoint degeneration trackers ---
         if checkpoint_enabled and tool_calls:
@@ -1069,28 +1357,42 @@ async def run_loop(
                 _ckpt_client = checkpoint_llm_client or llm_client
                 ckpt_response = None
                 ckpt_ok = False
+                checkpoint_deadline_hit = False
                 for ckpt_attempt in range(1 + LLM_RETRIES):
                     try:
-                        ckpt_response, _ = await _ckpt_client.complete_with_tools(
-                            history=ckpt_history,
-                            node_id=node_id,
-                            system_prompt=system_prompt,
-                            tool_registry=tool_registry,
-                            tool_names=[],
-                            instructions="",
-                            mcp_config=mcp_config,
+                        ckpt_response, _ = await _run_before_deadline(
+                            lambda: _ckpt_client.complete_with_tools(
+                                history=ckpt_history,
+                                node_id=node_id,
+                                system_prompt=system_prompt,
+                                tool_registry=tool_registry,
+                                tool_names=[],
+                                instructions="",
+                                mcp_config=mcp_config,
+                            ),
+                            deadline_at,
                         )
                         _ckpt_usage = getattr(_ckpt_client, "_last_usage", None)
                         if isinstance(_ckpt_usage, dict):
                             protocol.emit_usage(_ckpt_usage)
                         ckpt_ok = True
                         break
+                    except _WorkDeadlineExpired:
+                        checkpoint_deadline_hit = True
+                        break
                     except Exception as e:
                         if ckpt_attempt < LLM_RETRIES and _is_transient(e):
                             delay = _backoff_for_attempt(ckpt_attempt, e)
                             logger.warning("Checkpoint LLM error (attempt %d): %s, retrying in %.0fs",
                                            ckpt_attempt + 1, e, delay)
-                            await asyncio.sleep(delay)
+                            try:
+                                await _run_before_deadline(
+                                    lambda: asyncio.sleep(delay),
+                                    deadline_at,
+                                )
+                            except _WorkDeadlineExpired:
+                                checkpoint_deadline_hit = True
+                                break
                         else:
                             logger.warning("Checkpoint LLM call failed: %s — treating as NO", e)
                             break
@@ -1121,18 +1423,24 @@ async def run_loop(
                                 source="in_flight",
                             ))
                             try:
-                                ckpt_response, _ = await _ckpt_client.complete_with_tools(
-                                    history=ckpt_history,
-                                    node_id=node_id,
-                                    system_prompt=system_prompt,
-                                    tool_registry=tool_registry,
-                                    tool_names=[],
-                                    instructions="",
-                                    mcp_config=mcp_config,
+                                ckpt_response, _ = await _run_before_deadline(
+                                    lambda: _ckpt_client.complete_with_tools(
+                                        history=ckpt_history,
+                                        node_id=node_id,
+                                        system_prompt=system_prompt,
+                                        tool_registry=tool_registry,
+                                        tool_names=[],
+                                        instructions="",
+                                        mcp_config=mcp_config,
+                                    ),
+                                    deadline_at,
                                 )
                                 _ckpt_usage = getattr(_ckpt_client, "_last_usage", None)
                                 if isinstance(_ckpt_usage, dict):
                                     protocol.emit_usage(_ckpt_usage)
+                            except _WorkDeadlineExpired:
+                                checkpoint_deadline_hit = True
+                                break
                             except Exception:
                                 logger.warning("Checkpoint hallucination retry LLM call failed, using last response")
                                 break
@@ -1141,6 +1449,15 @@ async def run_loop(
                             ckpt_bad = _detect_hallucinated_tools(ckpt_response, [])
                             if not ckpt_bad:
                                 break
+
+                if checkpoint_deadline_hit:
+                    protocol.emit_error(
+                        "Work deadline reached during checkpoint evaluation; "
+                        "reserving the next turn for no-tools synthesis.",
+                        iteration,
+                        fatal=False,
+                    )
+                    continue
 
                 ckpt_text = (ckpt_response or "").strip() if ckpt_ok else ""
                 # Checkpoint Q&A is NOT appended to main history (side-channel)
@@ -1196,9 +1513,10 @@ async def run_loop(
                     _ckpt_read_only_streak = 0
 
     else:
-        # Hit max iterations
+        # Defensive fallback: the final configured iteration is reserved for
+        # synthesis, so a valid positive max_iterations should not reach here.
         protocol.emit_error(
-            f"Hit max iterations ({max_iterations}) without completing",
+            f"Loop exited without its reserved synthesis turn ({max_iterations})",
             max_iterations,
         )
         final_text = response.strip() if response else ""
@@ -1352,18 +1670,51 @@ async def _run_codex_assessor(
 
     prompt = f"{eval_ctx}\n\n---\n\n{controller_instructions}"
 
-    cmd = [
-        codex_binary, "exec",
-        "--model", codex_model,
-        "-s", "read-only",
-        "--ephemeral",
-        "--json",
-    ]
+    from ..isolation import (
+        WorkerIsolationScope,
+        assert_cwd_in_scope,
+        build_codex_isolation_args,
+        codex_home_dir,
+        scope_workspace_cwd,
+    )
+
+    scope = WorkerIsolationScope.from_env()
+    if scope.enabled:
+        assessor_cwd = assert_cwd_in_scope(
+            scope, cwd or scope_workspace_cwd(scope)
+        )
+        cmd = [
+            codex_binary, "exec",
+            "--model", codex_model,
+            "--ephemeral",
+            "--json",
+            "-C", assessor_cwd,
+            "--skip-git-repo-check",
+            *build_codex_isolation_args(scope, ["--sandbox", "read-only"]),
+        ]
+    else:
+        # Preserve the historical command exactly when no scope was inherited.
+        assessor_cwd = cwd
+        cmd = [
+            codex_binary, "exec",
+            "--model", codex_model,
+            "-s", "read-only",
+            "--ephemeral",
+            "--json",
+        ]
     if codex_effort:
         cmd.extend(["--config", f"reasoning_effort={codex_effort}"])
-    if cwd:
+    if not scope.enabled and cwd:
         cmd.extend(["-C", cwd])
     cmd.append("-")  # read prompt from stdin
+
+    subprocess_kwargs: dict[str, Any] = {}
+    if scope.enabled:
+        assessor_env = os.environ.copy()
+        assessor_env["HOME"] = codex_home_dir(scope, create=True)
+        assessor_env.pop("CODEX_HOME", None)
+        assessor_env.update(scope.to_env())
+        subprocess_kwargs.update({"cwd": assessor_cwd, "env": assessor_env})
 
     logger.info(
         "Codex assessor: model=%s effort=%s binary=%s",
@@ -1381,6 +1732,7 @@ async def _run_codex_assessor(
                     capture_output=True,
                     text=True,
                     timeout=timeout,
+                    **subprocess_kwargs,
                 ),
             ),
             timeout=timeout + 10,
@@ -1542,6 +1894,7 @@ async def run_native_loop(
     checkpoint_llm_client: LLMClient | None = None,
     checkpoint_periodic_interval: int = 8,
     checkpoint_periodic_start: int = 8,
+    deadline_secs: float | None = None,
 ) -> str:
     """Native multi-turn executor loop using OpenAI Chat Completions format.
 
@@ -1565,6 +1918,11 @@ async def run_native_loop(
     synthesis_threshold = int(soft_limit * FORCED_SYNTHESIS_FRACTION)
     final_text = ""
     _loop_start = time.monotonic()
+    deadline_at = (
+        _loop_start + float(deadline_secs)
+        if deadline_secs is not None and float(deadline_secs) > 0
+        else None
+    )
     _last_heartbeat = _loop_start
 
     # Checkpoint degeneration trackers
@@ -1590,7 +1948,14 @@ async def run_native_loop(
         protocol.emit_turn_started(iteration)
 
         estimated_tokens = estimate_native_tokens(messages)
-        force_synthesis = estimated_tokens >= synthesis_threshold
+        terminal_reason = _synthesis_reason(
+            estimated_tokens=estimated_tokens,
+            synthesis_threshold=synthesis_threshold,
+            deadline_at=deadline_at,
+            iteration=iteration,
+            max_iterations=max_iterations,
+        )
+        force_synthesis = terminal_reason is not None
 
         budget_line = (
             f"[Context: ~{estimated_tokens // 1000}K / {soft_limit // 1000}K tokens. "
@@ -1602,15 +1967,24 @@ async def run_native_loop(
         if force_synthesis:
             effective_tool_names = []
             effective_tools = None
-            forced_msg = (
-                "**YOUR CONTEXT BUDGET IS EXHAUSTED.** Produce your FINAL response now "
-                "using what you have gathered. No further tool calls are available — "
-                "write your complete answer."
+            if terminal_reason == "deadline":
+                _cleanup_deadline_tool_resources()
+            forced_msg = _forced_synthesis_message(
+                terminal_reason,
+                max_iterations=max_iterations,
             )
             messages.append({"role": "user", "content": f"{forced_msg}\n\n{budget_line}"})
             logger.info(
-                "Forced synthesis triggered at iteration %d: estimated=%d tokens, threshold=%d",
-                iteration, estimated_tokens, synthesis_threshold,
+                "Forced synthesis triggered at native iteration %d: reason=%s "
+                "estimated=%d tokens, threshold=%d",
+                iteration, terminal_reason, estimated_tokens, synthesis_threshold,
+            )
+            _report_forced_synthesis(
+                terminal_reason,
+                iteration=iteration,
+                estimated_tokens=estimated_tokens,
+                synthesis_threshold=synthesis_threshold,
+                max_iterations=max_iterations,
             )
         else:
             # Inject budget line (and instructions if provided) as a transient
@@ -1628,29 +2002,62 @@ async def run_native_loop(
         response_content = ""
         tool_calls: list[ToolCall] = []
         llm_ok = False
-        for attempt in range(1 + LLM_RETRIES):
+        work_deadline_hit = False
+        attempts = 1 if force_synthesis else 1 + LLM_RETRIES
+        for attempt in range(attempts):
             try:
-                content, tc_list, usage = await llm_client.complete_multi_turn(
-                    messages=messages,
-                    tools=effective_tools,
+                _mt = await _run_before_deadline(
+                    lambda: llm_client.complete_multi_turn(
+                        messages=messages,
+                        tools=effective_tools,
+                    ),
+                    None if force_synthesis else deadline_at,
                 )
-                response_content = content
-                tool_calls = tc_list
+                response_content = _mt.content
+                tool_calls = _mt.tool_calls
                 llm_ok = True
+                _native_reasoning = _mt.reasoning_content
+                break
+            except _WorkDeadlineExpired:
+                _native_reasoning = None
+                work_deadline_hit = True
+                protocol.emit_error(
+                    "Work deadline reached during a native LLM call; cancelling "
+                    "normal work and reserving the next turn for no-tools synthesis.",
+                    iteration,
+                    fatal=False,
+                )
                 break
             except Exception as e:
-                if attempt < LLM_RETRIES and _is_transient(e):
+                _native_reasoning = None
+                if not force_synthesis and attempt < LLM_RETRIES and _is_transient(e):
                     delay = _backoff_for_attempt(attempt, e)
                     protocol.emit_error(
                         f"Transient LLM error (attempt {attempt + 1}/{1 + LLM_RETRIES}), "
                         f"retrying in {delay:.0f}s: {e}",
                         iteration, fatal=False,
                     )
-                    await asyncio.sleep(delay)
+                    try:
+                        await _run_before_deadline(
+                            lambda: asyncio.sleep(delay),
+                            deadline_at,
+                        )
+                    except _WorkDeadlineExpired:
+                        work_deadline_hit = True
+                        break
                 else:
                     protocol.emit_error(f"LLM call failed: {e}", iteration, fatal=True)
                     logger.exception(f"Native loop LLM call failed at iteration {iteration}")
                     break
+        if work_deadline_hit:
+            if messages:
+                last_msg = messages[-1]
+                if (
+                    last_msg.get("role") == "user"
+                    and budget_line in (last_msg.get("content") or "")
+                ):
+                    messages.pop()
+            continue
         if not llm_ok:
             # Remove transient budget message on failure too
             if not force_synthesis and messages and messages[-1].get("role") == "user":
@@ -1674,7 +2081,8 @@ async def run_native_loop(
                 cumulative_usage[key] += u.get(key, 0)
             cumulative_usage["llm_calls"] += 1
 
-        protocol.emit_assistant_message(response_content[:500] if response_content else "", iteration)
+        protocol.emit_assistant_message(response_content[:500] if response_content else "", iteration,
+                                        reasoning_content=_native_reasoning)
 
         if force_synthesis:
             final_text = (response_content or "").strip()
@@ -1715,11 +2123,21 @@ async def run_native_loop(
                 tool_calls, tool_registry, agent_socket_path, max_result_chars,
                 effective_tool_names, force_synthesis=force_synthesis,
                 read_tools_stripped=_read_tools_stripped,
+                deadline_at=deadline_at,
             )
         except PhaseCompleteSignal as sig:
             logger.info("Phase complete signal received: %s", sig.summary[:200])
             final_text = sig.summary
             break
+        except _WorkDeadlineExpired as exc:
+            results = exc.partial_results
+            work_deadline_hit = True
+            protocol.emit_error(
+                "Work deadline reached during native tool execution; completed "
+                "tool results were preserved for final synthesis.",
+                iteration,
+                fatal=False,
+            )
 
         # Append native tool result messages (_execute_tool_calls already emits protocol events)
         for i, (name, result_str, _ok) in enumerate(results):
@@ -1730,6 +2148,9 @@ async def run_native_loop(
                 "tool_call_id": call_id,
                 "content": result_str,
             })
+
+        if work_deadline_hit:
+            continue
 
         # Checkpoint degeneration tracking
         if checkpoint_enabled and tool_calls:
@@ -1793,25 +2214,48 @@ async def run_native_loop(
                 _ckpt_client = checkpoint_llm_client or llm_client
                 ckpt_response = None
                 ckpt_ok = False
+                checkpoint_deadline_hit = False
                 for ckpt_attempt in range(1 + LLM_RETRIES):
                     try:
-                        ckpt_response, _ = await _ckpt_client.complete_with_tools(
-                            history=ckpt_history,
-                            node_id=node_id,
-                            system_prompt="You are a checkpoint evaluator.",
-                            tool_registry=tool_registry,
-                            tool_names=[],
-                            instructions="",
+                        ckpt_response, _ = await _run_before_deadline(
+                            lambda: _ckpt_client.complete_with_tools(
+                                history=ckpt_history,
+                                node_id=node_id,
+                                system_prompt="You are a checkpoint evaluator.",
+                                tool_registry=tool_registry,
+                                tool_names=[],
+                                instructions="",
+                            ),
+                            deadline_at,
                         )
                         ckpt_ok = True
+                        break
+                    except _WorkDeadlineExpired:
+                        checkpoint_deadline_hit = True
                         break
                     except Exception as e:
                         if ckpt_attempt < LLM_RETRIES and _is_transient(e):
                             delay = _backoff_for_attempt(ckpt_attempt, e)
-                            await asyncio.sleep(delay)
+                            try:
+                                await _run_before_deadline(
+                                    lambda: asyncio.sleep(delay),
+                                    deadline_at,
+                                )
+                            except _WorkDeadlineExpired:
+                                checkpoint_deadline_hit = True
+                                break
                         else:
                             logger.warning("Checkpoint LLM failed: %s — treating as NO", e)
                             break
+
+                if checkpoint_deadline_hit:
+                    protocol.emit_error(
+                        "Work deadline reached during native checkpoint evaluation; "
+                        "reserving the next turn for no-tools synthesis.",
+                        iteration,
+                        fatal=False,
+                    )
+                    continue
 
                 ckpt_text = (ckpt_response or "").strip() if ckpt_ok else ""
                 ckpt_lines = ckpt_text.split("\n") if ckpt_text else []
@@ -1846,7 +2290,12 @@ async def run_native_loop(
                     _ckpt_read_only_streak = 0
 
     else:
-        protocol.emit_error(f"Hit max iterations ({max_iterations})", max_iterations)
+        # Defensive fallback: the final configured iteration is reserved for
+        # synthesis, so a valid positive max_iterations should not reach here.
+        protocol.emit_error(
+            f"Native loop exited without its reserved synthesis turn ({max_iterations})",
+            max_iterations,
+        )
         final_text = response_content.strip() if response_content else ""
 
     protocol.emit_usage(cumulative_usage)

@@ -399,7 +399,7 @@ def execute_tool_calls(tool_calls: list[dict], timeout: int = 15) -> str:
 
     Returns XML like:
       <tool_results timestamp="2026-06-18T01:30:00">
-        <result tool="bash" command="pgrep -fa sobek" exit_code="0">
+        <result tool="bash" command="pgrep -fa worker" exit_code="0">
           output here
         </result>
       </tool_results>

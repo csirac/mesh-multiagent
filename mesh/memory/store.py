@@ -11,8 +11,10 @@ v2 additions:
 - project column on memories table: ties entries to project maps
 """
 
+import json
 import logging
 import os
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
@@ -23,8 +25,13 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 EMBEDDING_DTYPE = np.float32
+FORMATION_CONTRACT_META_KEY = "memory_formation_contract"
+AUTHORITATIVE_FORMATION_CONTRACT = "lowbar-extraction-v1"
 
 _SENTINEL = object()  # distinguishes "not passed" from None for optional embedding args
+_LEGACY_FOLD_EVENT_RE = re.compile(
+    r"\[fold-formed event:(\d{4}-\d{2}-\d{2})\]"
+)
 
 
 @dataclass
@@ -49,6 +56,8 @@ class MemoryEntry:
     retrieval_key_embedding: np.ndarray | None = None  # For task-similarity retrieval
     weight: float = 0.0  # Cached withholding cost
     digest_candidate: bool = True  # Phase 1: fold injection filter; False = DB-only row
+    event_date: str = ""  # Date the remembered event occurred (YYYY-MM-DD)
+    formation_source: str = "legacy-unknown"  # Auditable minting pathway
 
     @staticmethod
     def new_id() -> str:
@@ -67,10 +76,30 @@ def _deserialize_embedding(data: bytes | None, dim: int = 1536) -> np.ndarray | 
     return np.frombuffer(data, dtype=EMBEDDING_DTYPE).copy()
 
 
+def resolve_event_date(event_date: str | None, trigger_text: str | None) -> str:
+    """Return the real column value or the legacy fold trigger encoding."""
+    if event_date:
+        return str(event_date)
+    match = _LEGACY_FOLD_EVENT_RE.search(trigger_text or "")
+    return match.group(1) if match else ""
+
+
+def resolve_formation_source(
+    formation_source: str | None,
+    trigger_text: str | None,
+) -> str:
+    """Refine the migration default when legacy fold provenance is explicit."""
+    source = str(formation_source or "legacy-unknown")
+    if source == "legacy-unknown" and _LEGACY_FOLD_EVENT_RE.search(trigger_text or ""):
+        return "legacy-nightly-fold"
+    return source
+
+
 class MemoryStore:
     """SQLite-backed persistent memory store for a single agent."""
 
     def __init__(self, nickname: str, db_dir: str | None = None):
+        self.nickname = nickname
         if db_dir is None:
             from ..paths import MEMORY_DIR
             db_dir = str(MEMORY_DIR)
@@ -81,6 +110,8 @@ class MemoryStore:
 
     def _open(self) -> None:
         self._conn = sqlite3.connect(self._db_path)
+        self._conn.execute("PRAGMA busy_timeout = 5000")
+        self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._create_tables()
         logger.info(f"Memory store opened: {self._db_path}")
@@ -97,9 +128,14 @@ class MemoryStore:
                 retrieval_key TEXT NOT NULL DEFAULT '',
                 tags TEXT NOT NULL,
                 outcome TEXT NOT NULL,
-                reflection_embedding BLOB NOT NULL,
-                retrieval_key_embedding BLOB NOT NULL,
-                weight REAL NOT NULL DEFAULT 0.0
+                reflection_embedding BLOB,
+                retrieval_key_embedding BLOB,
+                weight REAL NOT NULL DEFAULT 0.0,
+                topic_label TEXT DEFAULT '',
+                project TEXT DEFAULT '',
+                digest_candidate INTEGER NOT NULL DEFAULT 1,
+                event_date TEXT NOT NULL DEFAULT '',
+                formation_source TEXT NOT NULL DEFAULT 'legacy-unknown'
             );
 
             CREATE TABLE IF NOT EXISTS meta (
@@ -147,36 +183,63 @@ class MemoryStore:
                 updated_at   TEXT    NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS memory_formation_log (
+                sequence     INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id    TEXT NOT NULL UNIQUE
+            );
+
             CREATE TABLE IF NOT EXISTS migrations_complete (
                 name         TEXT PRIMARY KEY,
                 completed_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS essays (
+                entity_key   TEXT PRIMARY KEY,
+                title        TEXT NOT NULL DEFAULT '',
+                body         TEXT NOT NULL DEFAULT '',
+                citations    TEXT NOT NULL DEFAULT '[]',
+                cross_refs   TEXT NOT NULL DEFAULT '[]',
+                patch_count  INTEGER NOT NULL DEFAULT 0,
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL,
+                curated_version INTEGER NOT NULL DEFAULT 0,
+                verified_hash TEXT NOT NULL DEFAULT '',
+                verified_at TEXT
+            );
+
         """)
         self._conn.commit()
         self._migrate()
 
     def _migrate(self) -> None:
         """Run schema migrations."""
-        cursor = self._conn.execute("PRAGMA table_info(memories)")
-        columns = {row[1] for row in cursor.fetchall()}
+        def memory_columns() -> set[str]:
+            cursor = self._conn.execute("PRAGMA table_info(memories)")
+            return {row[1] for row in cursor.fetchall()}
 
+        columns = memory_columns()
         if "trigger_embedding" in columns and "retrieval_key_embedding" not in columns:
             logger.info("Migrating: trigger_embedding -> retrieval_key_embedding")
             self._conn.execute(
                 "ALTER TABLE memories RENAME COLUMN trigger_embedding TO retrieval_key_embedding"
             )
-            if "retrieval_key" not in columns:
-                self._conn.execute(
-                    "ALTER TABLE memories ADD COLUMN retrieval_key TEXT NOT NULL DEFAULT ''"
-                )
             self._conn.commit()
+            columns = memory_columns()
 
+        if "retrieval_key" not in columns:
+            logger.info("Migrating: adding retrieval_key column")
+            self._conn.execute(
+                "ALTER TABLE memories ADD COLUMN retrieval_key TEXT NOT NULL DEFAULT ''"
+            )
+            self._conn.commit()
+            columns = memory_columns()
         if "topic_label" not in columns:
             logger.info("Migrating: adding topic_label column")
             self._conn.execute(
                 "ALTER TABLE memories ADD COLUMN topic_label TEXT DEFAULT ''"
             )
             self._conn.commit()
+            columns = memory_columns()
 
         if "project" not in columns:
             logger.info("Migrating: adding project column to memories")
@@ -184,6 +247,188 @@ class MemoryStore:
                 "ALTER TABLE memories ADD COLUMN project TEXT DEFAULT ''"
             )
             self._conn.commit()
+            columns = memory_columns()
+
+        if "digest_candidate" not in columns:
+            logger.info("Migrating: adding digest_candidate column to memories")
+            self._conn.execute(
+                "ALTER TABLE memories ADD COLUMN digest_candidate INTEGER NOT NULL DEFAULT 1"
+            )
+            self._conn.commit()
+            columns = memory_columns()
+
+        if "event_date" not in columns:
+            logger.info("Migrating: adding event_date column to memories")
+            self._conn.execute(
+                "ALTER TABLE memories ADD COLUMN event_date TEXT NOT NULL DEFAULT ''"
+            )
+            self._conn.commit()
+            columns = memory_columns()
+
+        if "formation_source" not in columns:
+            logger.info("Migrating: adding formation_source column to memories")
+            self._conn.execute(
+                "ALTER TABLE memories ADD COLUMN formation_source "
+                "TEXT NOT NULL DEFAULT 'legacy-unknown'"
+            )
+            self._conn.commit()
+            columns = memory_columns()
+
+        cursor_essays = self._conn.execute("PRAGMA table_info(essays)")
+        essay_columns = {row[1] for row in cursor_essays.fetchall()}
+        if "curated_version" not in essay_columns:
+            logger.info("Migrating: adding curated_version column to essays")
+            self._conn.execute(
+                "ALTER TABLE essays ADD COLUMN "
+                "curated_version INTEGER NOT NULL DEFAULT 0"
+            )
+            self._conn.commit()
+        if "verified_hash" not in essay_columns:
+            logger.info("Migrating: adding verified_hash column to essays")
+            self._conn.execute(
+                "ALTER TABLE essays ADD COLUMN "
+                "verified_hash TEXT NOT NULL DEFAULT ''"
+            )
+            self._conn.commit()
+        if "verified_at" not in essay_columns:
+            logger.info("Migrating: adding verified_at column to essays")
+            self._conn.execute(
+                "ALTER TABLE essays ADD COLUMN verified_at TEXT"
+            )
+            self._conn.commit()
+
+        # Increment 2a durable entity registry.  This migration is intentionally
+        # schema-only: legacy essays do not seed registry identities or aliases.
+        self._conn.executescript("""
+            CREATE TABLE IF NOT EXISTS entities (
+                entity_key       TEXT PRIMARY KEY,
+                entity_type      TEXT NOT NULL,
+                display_name     TEXT NOT NULL CHECK (trim(display_name) <> ''),
+                identity_note    TEXT NOT NULL DEFAULT '',
+                status           TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','active','retired')),
+                replacement_key  TEXT,
+                origin           TEXT NOT NULL,
+                evidence_version INTEGER NOT NULL DEFAULT 0
+                    CHECK (evidence_version >= 0),
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL,
+                activated_at     TEXT,
+                retired_at       TEXT,
+                CHECK (replacement_key IS NULL OR replacement_key <> entity_key),
+                FOREIGN KEY (replacement_key) REFERENCES entities(entity_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_entities_status_type
+                ON entities(status, entity_type, display_name);
+
+            CREATE TABLE IF NOT EXISTS entity_aliases (
+                entity_key       TEXT NOT NULL,
+                normalized_alias TEXT NOT NULL CHECK (normalized_alias <> ''),
+                display_alias    TEXT NOT NULL,
+                source           TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                PRIMARY KEY (entity_key, normalized_alias),
+                FOREIGN KEY (entity_key) REFERENCES entities(entity_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_entity_aliases_reverse
+                ON entity_aliases(normalized_alias, entity_key);
+
+            CREATE TABLE IF NOT EXISTS memory_entities (
+                memory_id         TEXT NOT NULL,
+                entity_key        TEXT NOT NULL,
+                window_key        TEXT,
+                assignment_source TEXT NOT NULL,
+                assigned_at       TEXT NOT NULL,
+                PRIMARY KEY (memory_id, entity_key),
+                FOREIGN KEY (memory_id) REFERENCES memories(id),
+                FOREIGN KEY (entity_key) REFERENCES entities(entity_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_entities_entity
+                ON memory_entities(entity_key, assigned_at);
+            CREATE INDEX IF NOT EXISTS idx_memory_entities_window
+                ON memory_entities(entity_key, window_key);
+
+            CREATE TABLE IF NOT EXISTS entity_group_members (
+                group_key  TEXT NOT NULL,
+                member_key TEXT NOT NULL,
+                role       TEXT NOT NULL DEFAULT '',
+                source     TEXT NOT NULL,
+                added_at   TEXT NOT NULL,
+                PRIMARY KEY (group_key, member_key),
+                CHECK (group_key <> member_key),
+                FOREIGN KEY (group_key) REFERENCES entities(entity_key),
+                FOREIGN KEY (member_key) REFERENCES entities(entity_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_entity_group_members_member
+                ON entity_group_members(member_key, group_key);
+
+            CREATE TABLE IF NOT EXISTS entity_events (
+                sequence          INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type        TEXT NOT NULL,
+                entity_key        TEXT,
+                memory_id         TEXT,
+                old_entity_key    TEXT,
+                new_entity_key    TEXT,
+                actor_node        TEXT NOT NULL,
+                source_message_id TEXT,
+                source_author     TEXT,
+                reason            TEXT NOT NULL DEFAULT '',
+                window_key        TEXT,
+                run_key           TEXT,
+                details_json      TEXT NOT NULL DEFAULT '{}',
+                created_at        TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_entity_events_entity
+                ON entity_events(entity_key, sequence);
+            CREATE INDEX IF NOT EXISTS idx_entity_events_memory
+                ON entity_events(memory_id, sequence);
+            CREATE INDEX IF NOT EXISTS idx_entity_events_old_key
+                ON entity_events(old_entity_key, sequence);
+            CREATE INDEX IF NOT EXISTS idx_entity_events_new_key
+                ON entity_events(new_entity_key, sequence);
+            -- Per-write-attempt audit (G-004).  ``curation_write_attempt``
+            -- rows are read two ways: by turn, to resolve which refused
+            -- artifacts later landed, and by (type, time) for a windowed
+            -- report.  Both are covering; neither existed before, so the
+            -- reporting query would otherwise scan the whole trail.
+            CREATE INDEX IF NOT EXISTS idx_entity_events_run
+                ON entity_events(run_key, sequence);
+            CREATE INDEX IF NOT EXISTS idx_entity_events_type_created
+                ON entity_events(event_type, created_at);
+
+            -- Durable pending-additions ledger (T-001 / G-001).  An
+            -- over-ceiling write is refused, never truncated; when the model
+            -- does not land it inside the turn the addition is written here
+            -- and offered back at the top of a later curation turn, so a
+            -- refusal is never a terminal drop.  See
+            -- ``mesh/memory/pending_additions.py``.
+            CREATE TABLE IF NOT EXISTS curation_pending_additions (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent            TEXT NOT NULL DEFAULT '',
+                target_artifact  TEXT NOT NULL,
+                tool             TEXT NOT NULL,
+                entity_key       TEXT NOT NULL DEFAULT '',
+                old_text         TEXT NOT NULL DEFAULT '',
+                new_text         TEXT NOT NULL,
+                replace_all      INTEGER NOT NULL DEFAULT 0,
+                reason           TEXT NOT NULL DEFAULT '',
+                measured_tokens  INTEGER,
+                budget_tokens    INTEGER,
+                origin_turn_id   TEXT NOT NULL DEFAULT '',
+                status           TEXT NOT NULL DEFAULT 'pending',
+                offers           INTEGER NOT NULL DEFAULT 0,
+                resolved_turn_id TEXT,
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL
+            );
+            -- The drain reads pending rows oldest-first; resolution reads
+            -- them by artifact.  Both are covering.
+            CREATE INDEX IF NOT EXISTS idx_curation_pending_status
+                ON curation_pending_additions(status, id);
+            CREATE INDEX IF NOT EXISTS idx_curation_pending_artifact
+                ON curation_pending_additions(target_artifact, status);
+        """)
+        self._conn.commit()
 
         # Memory v3: allow NULL reflection_embedding for parse-failure fallback
         # placeholders (§2.7.8). Detect via NOT NULL constraint and rebuild table
@@ -212,12 +457,16 @@ class MemoryStore:
                         retrieval_key_embedding BLOB,
                         weight REAL NOT NULL DEFAULT 0.0,
                         topic_label TEXT DEFAULT '',
-                        project TEXT DEFAULT ''
+                        project TEXT DEFAULT '',
+                        digest_candidate INTEGER NOT NULL DEFAULT 1,
+                        event_date TEXT NOT NULL DEFAULT '',
+                        formation_source TEXT NOT NULL DEFAULT 'legacy-unknown'
                     );
                     INSERT INTO memories_new SELECT
                         id, created_at, summary, reflection, trace, trigger_text,
                         retrieval_key, tags, outcome, reflection_embedding,
-                        retrieval_key_embedding, weight, topic_label, project
+                        retrieval_key_embedding, weight, topic_label, project,
+                        digest_candidate, event_date, formation_source
                     FROM memories;
                     DROP TABLE memories;
                     ALTER TABLE memories_new RENAME TO memories;
@@ -253,15 +502,6 @@ class MemoryStore:
             logger.info("Migrating: adding recurrence column to scheduled_wakes")
             self._conn.execute(
                 "ALTER TABLE scheduled_wakes ADD COLUMN recurrence TEXT"
-            )
-            self._conn.commit()
-
-        # Phase 1: digest_candidate column — lowbar formation tags rows as
-        # digest-worthy or DB-only; fold injection filter uses this.
-        if "digest_candidate" not in columns:
-            logger.info("Migrating: adding digest_candidate column to memories")
-            self._conn.execute(
-                "ALTER TABLE memories ADD COLUMN digest_candidate INTEGER NOT NULL DEFAULT 1"
             )
             self._conn.commit()
 
@@ -325,7 +565,7 @@ class MemoryStore:
             "SELECT id, created_at, summary, reflection, trace, trigger_text, "
             "retrieval_key, tags, outcome, reflection_embedding, "
             "retrieval_key_embedding, weight, topic_label, project, "
-            "digest_candidate "
+            "digest_candidate, event_date, formation_source "
             "FROM memories ORDER BY created_at"
         )
         entries = []
@@ -346,6 +586,8 @@ class MemoryStore:
                 topic_label=row[12] or "",
                 project=row[13] or "",
                 digest_candidate=bool(row[14]) if row[14] is not None else True,
+                event_date=resolve_event_date(row[15], row[5]),
+                formation_source=resolve_formation_source(row[16], row[5]),
             ))
         logger.info(f"Loaded {len(entries)} memory entries from {self._db_path}")
         return entries
@@ -353,12 +595,25 @@ class MemoryStore:
     def insert(self, entry: MemoryEntry) -> None:
         """Insert or replace a memory entry."""
         self._conn.execute(
-            "INSERT OR REPLACE INTO memories "
+            "INSERT INTO memories "
             "(id, created_at, summary, reflection, trace, trigger_text, "
             "retrieval_key, tags, outcome, reflection_embedding, "
             "retrieval_key_embedding, weight, topic_label, project, "
-            "digest_candidate) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "digest_candidate, event_date, formation_source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "created_at=excluded.created_at, summary=excluded.summary, "
+            "reflection=excluded.reflection, trace=excluded.trace, "
+            "trigger_text=excluded.trigger_text, "
+            "retrieval_key=excluded.retrieval_key, tags=excluded.tags, "
+            "outcome=excluded.outcome, "
+            "reflection_embedding=excluded.reflection_embedding, "
+            "retrieval_key_embedding=excluded.retrieval_key_embedding, "
+            "weight=excluded.weight, topic_label=excluded.topic_label, "
+            "project=excluded.project, "
+            "digest_candidate=excluded.digest_candidate, "
+            "event_date=excluded.event_date, "
+            "formation_source=excluded.formation_source",
             (
                 entry.id,
                 entry.created_at.isoformat(),
@@ -375,18 +630,66 @@ class MemoryStore:
                 entry.topic_label,
                 entry.project,
                 1 if entry.digest_candidate else 0,
+                entry.event_date,
+                entry.formation_source,
             ),
         )
         self._fts_upsert(entry.id, entry.summary, entry.reflection,
                          entry.retrieval_key)
+        self._log_authoritative_formation_entry(entry)
         self._conn.commit()
 
-    def delete(self, entry_id: str) -> bool:
-        """Delete a memory entry by ID. Returns True if found and deleted."""
-        self._fts_delete(entry_id)
-        cursor = self._conn.execute("DELETE FROM memories WHERE id = ?", (entry_id,))
-        self._conn.commit()
-        return cursor.rowcount > 0
+    def _log_authoritative_formation_entry(self, entry: MemoryEntry) -> None:
+        """Assign a deletion-safe fold sequence to authoritative live rows."""
+        if entry.formation_source != "live-extraction":
+            return
+        self._conn.execute(
+            "INSERT OR IGNORE INTO memory_formation_log (memory_id) VALUES (?)",
+            (entry.id,),
+        )
+
+    def delete(
+        self,
+        entry_id: str,
+        *,
+        actor_node: str | None = None,
+        source_message_id: str | None = None,
+        source_author: str | None = None,
+        reason: str = "memory deleted",
+    ) -> bool:
+        """Delete a memory and transactionally cascade its entity evidence."""
+        from .entities import EntityExecutionContext, EntityService
+
+        context = EntityExecutionContext(
+            actor_node=actor_node or f"memory:{self.nickname}",
+            source_message_id=source_message_id,
+            source_author=source_author,
+        )
+        service = EntityService(
+            self._conn, actor_node=context.actor_node
+        )
+        return service.delete_memory_transactional(
+            entry_id, context=context, reason=reason
+        )
+
+    def delete_many(
+        self,
+        entry_ids: list[str],
+        *,
+        actor_node: str | None = None,
+        reason: str = "memory pool pruning",
+    ) -> list[str]:
+        """Delete memories and all current entity links in one transaction."""
+        from .entities import EntityExecutionContext, EntityService
+
+        context = EntityExecutionContext(
+            actor_node=actor_node or f"memory:{self.nickname}"
+        )
+        return EntityService(
+            self._conn, actor_node=context.actor_node
+        ).delete_memories_transactional(
+            entry_ids, context=context, reason=reason
+        )
 
     def get(self, entry_id: str) -> MemoryEntry | None:
         """Get a single memory entry by ID."""
@@ -394,7 +697,7 @@ class MemoryStore:
             "SELECT id, created_at, summary, reflection, trace, trigger_text, "
             "retrieval_key, tags, outcome, reflection_embedding, "
             "retrieval_key_embedding, weight, topic_label, project, "
-            "digest_candidate "
+            "digest_candidate, event_date, formation_source "
             "FROM memories WHERE id = ?",
             (entry_id,),
         )
@@ -417,6 +720,8 @@ class MemoryStore:
             topic_label=row[12] or "",
             project=row[13] or "",
             digest_candidate=bool(row[14]) if row[14] is not None else True,
+            event_date=resolve_event_date(row[15], row[5]),
+            formation_source=resolve_formation_source(row[16], row[5]),
         )
 
     def list_all(self) -> list[MemoryEntry]:
@@ -752,6 +1057,243 @@ class MemoryStore:
         row = cursor.fetchone()
         return row[0] if row else None
 
+    # ── Interpretive Essays ─────────────────────────────────────
+
+    def get_essay(self, entity_key: str) -> dict | None:
+        """Get an essay by entity key. Returns dict or None."""
+        # Essay retrieval tools run through asyncio.to_thread(); use a fresh
+        # read-only connection so the SQLite handle is owned by the worker
+        # thread executing this call.
+        with sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True) as conn:
+            cursor = conn.execute(
+                "SELECT entity_key, title, body, citations, cross_refs, "
+                "patch_count, created_at, updated_at, curated_version, "
+                "verified_hash, verified_at "
+                "FROM essays WHERE entity_key = ?",
+                (entity_key,),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "entity_key": row[0],
+            "title": row[1],
+            "body": row[2],
+            "citations": json.loads(row[3]),
+            "cross_refs": json.loads(row[4]),
+            "patch_count": row[5],
+            "created_at": row[6],
+            "updated_at": row[7],
+            "curated_version": row[8],
+            "verified_hash": row[9],
+            "verified_at": row[10],
+        }
+
+    def list_essays(self) -> list[dict]:
+        """List all essays (without body content for brevity)."""
+        # See get_essay(): agent tool calls may execute on worker threads.
+        with sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True) as conn:
+            cursor = conn.execute(
+                "SELECT entity_key, title, patch_count, created_at, updated_at, "
+                "curated_version, verified_hash, verified_at "
+                "FROM essays ORDER BY entity_key"
+            )
+            return [
+                {
+                    "entity_key": row[0],
+                    "title": row[1],
+                    "patch_count": row[2],
+                    "created_at": row[3],
+                    "updated_at": row[4],
+                    "curated_version": row[5],
+                    "verified_hash": row[6],
+                    "verified_at": row[7],
+                }
+                for row in cursor.fetchall()
+            ]
+
+    def create_essay(
+        self,
+        entity_key: str,
+        body: str,
+        title: str = "",
+        citations: list[str] | None = None,
+        cross_refs: list[str] | None = None,
+    ) -> None:
+        """Create a new essay. Raises IntegrityError if key exists."""
+        now = datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            "INSERT INTO essays "
+            "(entity_key, title, body, citations, cross_refs, "
+            "patch_count, created_at, updated_at, curated_version, "
+            "verified_hash, verified_at) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?, ?, 0, '', NULL)",
+            (
+                entity_key,
+                title,
+                body,
+                json.dumps(citations or []),
+                json.dumps(cross_refs or []),
+                now,
+                now,
+            ),
+        )
+        self._conn.commit()
+
+    def update_essay(
+        self,
+        entity_key: str,
+        body: str,
+        title: str | None = None,
+        citations: list[str] | None = None,
+        cross_refs: list[str] | None = None,
+    ) -> bool:
+        """Replace an essay's body (and optionally title/citations/cross_refs).
+        Increments patch_count. Returns True if found."""
+        now = datetime.now(timezone.utc).isoformat()
+        existing = self.get_essay(entity_key)
+        if existing is None:
+            return False
+        new_title = title if title is not None else existing["title"]
+        new_citations = json.dumps(citations) if citations is not None else json.dumps(existing["citations"])
+        new_cross_refs = json.dumps(cross_refs) if cross_refs is not None else json.dumps(existing["cross_refs"])
+        self._conn.execute(
+            "UPDATE essays SET body = ?, title = ?, citations = ?, "
+            "cross_refs = ?, patch_count = patch_count + 1, updated_at = ?, "
+            "verified_hash = '', verified_at = NULL "
+            "WHERE entity_key = ?",
+            (body, new_title, new_citations, new_cross_refs, now, entity_key),
+        )
+        self._conn.commit()
+        return True
+
+    def update_essay_if_revision(
+        self,
+        entity_key: str,
+        expected_patch_count: int,
+        body: str,
+        title: str | None = None,
+        citations: list[str] | None = None,
+        cross_refs: list[str] | None = None,
+    ) -> tuple[bool, str]:
+        """Compare-and-swap variant of :meth:`update_essay`.
+
+        ``essay_edit`` reads the body, computes a replacement against that
+        snapshot, then writes.  Now that curation turns run concurrently with
+        message turns, another writer can land in that window; an unconditional
+        UPDATE would silently discard their patch.  Gating the write on the
+        ``patch_count`` observed at read time turns the lost update into a
+        visible conflict the caller can retry.
+
+        Returns ``(ok, message)``; ``ok=False`` means the row moved (or
+        vanished) and nothing was written.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        existing = self.get_essay(entity_key)
+        if existing is None:
+            return False, f"No essay found for key '{entity_key}'."
+        new_title = title if title is not None else existing["title"]
+        new_citations = json.dumps(
+            citations if citations is not None else existing["citations"]
+        )
+        new_cross_refs = json.dumps(
+            cross_refs if cross_refs is not None else existing["cross_refs"]
+        )
+        cursor = self._conn.execute(
+            "UPDATE essays SET body = ?, title = ?, citations = ?, "
+            "cross_refs = ?, patch_count = patch_count + 1, updated_at = ?, "
+            "verified_hash = '', verified_at = NULL "
+            "WHERE entity_key = ? AND patch_count = ?",
+            (
+                body, new_title, new_citations, new_cross_refs, now,
+                entity_key, int(expected_patch_count),
+            ),
+        )
+        self._conn.commit()
+        if cursor.rowcount == 0:
+            current = self.get_essay(entity_key) or {}
+            return False, (
+                f"Essay '{entity_key}' was modified concurrently "
+                f"(expected revision {expected_patch_count}, found "
+                f"{current.get('patch_count')}). "
+                "Re-read the essay and reapply the edit."
+            )
+        return True, ""
+
+    def delete_essay(self, entity_key: str) -> bool:
+        """Delete an essay by entity key. Returns True if found."""
+        cursor = self._conn.execute(
+            "DELETE FROM essays WHERE entity_key = ?",
+            (entity_key,),
+        )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
+    def essay_edit(
+        self,
+        entity_key: str,
+        old_text: str,
+        new_text: str,
+        replace_all: bool = False,
+    ) -> tuple[bool, str]:
+        """Exact string replacement in an essay's body.
+        Returns (success, message). Mirrors digest_edit semantics:
+        fails if old_text not found or matches multiple times (unless replace_all).
+        Increments patch_count on success."""
+        essay = self.get_essay(entity_key)
+        if essay is None:
+            return False, f"No essay found for key '{entity_key}'."
+        body = essay["body"]
+        count = body.count(old_text)
+        if count == 0:
+            return False, "old_text not found in essay body."
+        if not replace_all and count > 1:
+            return False, (
+                f"old_text matches {count} locations — "
+                f"provide a more specific string or set replace_all=true."
+            )
+        if replace_all:
+            new_body = body.replace(old_text, new_text)
+        else:
+            new_body = body.replace(old_text, new_text, 1)
+        now = datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            "UPDATE essays SET body = ?, patch_count = patch_count + 1, "
+            "updated_at = ?, verified_hash = '', verified_at = NULL "
+            "WHERE entity_key = ?",
+            (new_body, now, entity_key),
+        )
+        self._conn.commit()
+        n_replaced = count if replace_all else 1
+        return True, f"Essay updated ({n_replaced} replacement{'s' if n_replaced > 1 else ''})."
+
+    def update_essay_citations(
+        self,
+        entity_key: str,
+        citations: list[str],
+        cross_refs: list[str] | None = None,
+    ) -> bool:
+        """Update an essay's citations and optionally cross_refs.
+        Does NOT increment patch_count (metadata-only change).
+        Returns True if found."""
+        now = datetime.now(timezone.utc).isoformat()
+        if cross_refs is not None:
+            cursor = self._conn.execute(
+                "UPDATE essays SET citations = ?, cross_refs = ?, "
+                "updated_at = ?, verified_hash = '', verified_at = NULL "
+                "WHERE entity_key = ?",
+                (json.dumps(citations), json.dumps(cross_refs), now, entity_key),
+            )
+        else:
+            cursor = self._conn.execute(
+                "UPDATE essays SET citations = ?, updated_at = ?, "
+                "verified_hash = '', verified_at = NULL "
+                "WHERE entity_key = ?",
+                (json.dumps(citations), now, entity_key),
+            )
+        self._conn.commit()
+        return cursor.rowcount > 0
+
     # ── Conversation Summary ────────────────────────────────────
 
     def get_summary(self) -> dict | None:
@@ -818,28 +1360,65 @@ class MemoryStore:
         )
         self._conn.commit()
 
+    def activate_authoritative_formation_contract(self) -> None:
+        """Record that the live process loaded the shared extraction contract."""
+        self._conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (
+                FORMATION_CONTRACT_META_KEY,
+                AUTHORITATIVE_FORMATION_CONTRACT,
+            ),
+        )
+        self._conn.commit()
+
     def insert_entry_and_advance_cursor(
         self,
         entries: list[MemoryEntry],
         new_cursor: int,
         new_ts_utc: str,
+        entity_mutations: list[dict] | dict | None = None,
+        *,
+        entity_actor_node: str | None = None,
+        entity_resolution_enabled: bool = False,
+        entity_activation_window_threshold: int = 3,
+        entity_run_key: str | None = None,
     ) -> None:
         """Insert N entries and advance the formation cursor in a single transaction.
 
         Atomicity guarantees against torn state if the process dies between
         memory entry insert and cursor advance (Risk 10).
+
+        ``entity_mutations`` is optional and empty by default.  Its
+        ``window_key`` values are opaque stable identifiers for formation
+        windows; this store never parses their contents.  Entity resolution
+        runs in a savepoint so a resolver defect cannot discard minted
+        memories or prevent cursor advancement.
         """
         now = datetime.now(timezone.utc).isoformat()
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             for entry in entries:
                 self._conn.execute(
-                    "INSERT OR REPLACE INTO memories "
+                    "INSERT INTO memories "
                     "(id, created_at, summary, reflection, trace, trigger_text, "
                     "retrieval_key, tags, outcome, reflection_embedding, "
                     "retrieval_key_embedding, weight, topic_label, project, "
-                    "digest_candidate) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "digest_candidate, event_date, formation_source) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET "
+                    "created_at=excluded.created_at, summary=excluded.summary, "
+                    "reflection=excluded.reflection, trace=excluded.trace, "
+                    "trigger_text=excluded.trigger_text, "
+                    "retrieval_key=excluded.retrieval_key, tags=excluded.tags, "
+                    "outcome=excluded.outcome, "
+                    "reflection_embedding=excluded.reflection_embedding, "
+                    "retrieval_key_embedding=excluded.retrieval_key_embedding, "
+                    "weight=excluded.weight, topic_label=excluded.topic_label, "
+                    "project=excluded.project, "
+                    "digest_candidate=excluded.digest_candidate, "
+                    "event_date=excluded.event_date, "
+                    "formation_source=excluded.formation_source",
                     (
                         entry.id,
                         entry.created_at.isoformat(),
@@ -856,10 +1435,68 @@ class MemoryStore:
                         entry.topic_label,
                         entry.project,
                         1 if entry.digest_candidate else 0,
+                        entry.event_date,
+                        entry.formation_source,
                     ),
                 )
                 self._fts_upsert(entry.id, entry.summary, entry.reflection,
                                  entry.retrieval_key)
+                self._log_authoritative_formation_entry(entry)
+            if entity_mutations:
+                from .entities import (
+                    EntityExecutionContext,
+                    EntityService,
+                )
+
+                self._conn.execute("SAVEPOINT entity_resolution")
+                try:
+                    context = EntityExecutionContext(
+                        actor_node=(
+                            entity_actor_node or f"memory:{self.nickname}"
+                        )
+                    )
+                    EntityService(
+                        self._conn,
+                        actor_node=context.actor_node,
+                        activation_window_threshold=(
+                            entity_activation_window_threshold
+                        ),
+                        mutations_enabled=entity_resolution_enabled,
+                    ).apply_formation_mutations_in_transaction(
+                        entity_mutations,
+                        context=context,
+                        run_key=entity_run_key,
+                    )
+                    self._conn.execute("RELEASE SAVEPOINT entity_resolution")
+                except Exception as entity_error:
+                    self._conn.execute(
+                        "ROLLBACK TO SAVEPOINT entity_resolution"
+                    )
+                    self._conn.execute("RELEASE SAVEPOINT entity_resolution")
+                    logger.exception(
+                        "Entity resolution failed; committing memories and cursor"
+                    )
+                    try:
+                        EntityService(
+                            self._conn,
+                            actor_node=(
+                                entity_actor_node or f"memory:{self.nickname}"
+                            ),
+                            activation_window_threshold=(
+                                entity_activation_window_threshold
+                            ),
+                        )._record_event(
+                            "entity_resolution_failed",
+                            reason=str(entity_error),
+                            run_key=entity_run_key,
+                            details={
+                                "memory_ids": [entry.id for entry in entries]
+                            },
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not record entity resolution failure audit"
+                        )
             self._conn.execute(
                 "INSERT INTO formation_cursor (id, last_index, last_ts_utc, updated_at) "
                 "VALUES (1, ?, ?, ?) "
@@ -868,6 +1505,14 @@ class MemoryStore:
                 "last_ts_utc=excluded.last_ts_utc, "
                 "updated_at=excluded.updated_at",
                 (new_cursor, new_ts_utc, now),
+            )
+            self._conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (
+                    FORMATION_CONTRACT_META_KEY,
+                    AUTHORITATIVE_FORMATION_CONTRACT,
+                ),
             )
             self._conn.execute("COMMIT")
         except Exception:

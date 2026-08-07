@@ -75,7 +75,7 @@ class TestCallAgentSocket:
 
     def test_channel_list(self, socket_server):
         sock_path, calls = socket_server
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             _call_agent_socket(sock_path, "channel_list", {})
         )
         assert "general" in result
@@ -84,7 +84,7 @@ class TestCallAgentSocket:
 
     def test_send_message(self, socket_server):
         sock_path, calls = socket_server
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             _call_agent_socket(sock_path, "send_message", {"to": "dev", "content": "hello"})
         )
         assert "Message sent to dev" in result
@@ -92,7 +92,7 @@ class TestCallAgentSocket:
 
     def test_socket_not_found(self):
         with pytest.raises(Exception):
-            asyncio.get_event_loop().run_until_complete(
+            asyncio.run(
                 _call_agent_socket("/tmp/nonexistent_socket.sock", "test", {})
             )
 
@@ -105,7 +105,7 @@ class TestExecuteToolCallsRouting:
         registry = get_registry()
 
         tool_calls = [ToolCall(name="channel_list", arguments={}, raw_xml="")]
-        results = asyncio.get_event_loop().run_until_complete(
+        results = asyncio.run(
             _execute_tool_calls(tool_calls, registry, agent_socket_path=sock_path)
         )
         assert len(results) == 1
@@ -123,7 +123,7 @@ class TestExecuteToolCallsRouting:
         registry = get_registry()
 
         tool_calls = [ToolCall(name="shell", arguments={"command": "echo local-exec"}, raw_xml="")]
-        results = asyncio.get_event_loop().run_until_complete(
+        results = asyncio.run(
             _execute_tool_calls(tool_calls, registry, agent_socket_path=sock_path)
         )
         assert len(results) == 1
@@ -139,7 +139,7 @@ class TestExecuteToolCallsRouting:
         registry = get_registry()
 
         tool_calls = [ToolCall(name="channel_list", arguments={}, raw_xml="")]
-        results = asyncio.get_event_loop().run_until_complete(
+        results = asyncio.run(
             _execute_tool_calls(tool_calls, registry, agent_socket_path=None)
         )
         assert len(results) == 1

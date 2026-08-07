@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """
 Transport layer for mesh communication.
 
@@ -374,7 +373,7 @@ async def connect_ws(
         WebSocketClientConnection ready for send/receive
 
     Example:
-        conn = await connect_ws("wss://your-host.example.com/mesh/ws")
+        conn = await connect_ws("wss://mesh.example.com/mesh/ws")
         await conn.send(msg)
         response = await conn.receive()
     """

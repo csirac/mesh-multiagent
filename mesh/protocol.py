@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """
 Message protocol for agent mesh communication.
 
@@ -77,9 +76,17 @@ class ControlAction(str, Enum):
     TODO_GET = "todo_get"                    # Request todo list content
     TODO_MUTATE = "todo_mutate"              # Add/update/delete/reorder todos
     TODO_RESPONSE = "todo_response"          # Router response with todo data
+    # Per-conversation pinned notes sync
+    CONVERSATION_NOTES_GET = "conversation_notes_get"        # Request pinned notes
+    CONVERSATION_NOTES_SET = "conversation_notes_set"        # Set pinned notes
+    CONVERSATION_NOTES_RESPONSE = "conversation_notes_response"  # Router response
     # Calendar read-only sync
     CALENDAR_GET = "calendar_get"            # Request calendar events
+    USER_RESET_TOKEN = "user_reset_token"    # Regenerate a user's auth token
     CALENDAR_RESPONSE = "calendar_response"  # Router response with calendar events
+    # Autonomous-fleet control (user-driven, router-brokered)
+    AUTONOMOUS_CONTROL = "autonomous_control"                    # status/wake/cancel/budget
+    AUTONOMOUS_CONTROL_RESPONSE = "autonomous_control_response"  # Result back to requester
 
 
 def generate_message_id() -> str:
@@ -165,7 +172,7 @@ class Message:
 
     Every message has:
     - id: Unique identifier
-    - from_node: Sender node ID (e.g., "user:yourname", "agent:researcher")
+    - from_node: Sender node ID (e.g., "user:operator", "agent:researcher")
     - to_node: Recipient node ID or "router" for control messages
     - type: MessageType indicating the purpose
     - content: The actual payload (string for messages, dict for structured data)
@@ -376,14 +383,14 @@ def parse_node_id(node_id: str) -> tuple[str, str, str | None]:
         Tuple of (node_type, type_or_nickname, nickname_or_none)
 
     Examples:
-        parse_node_id("user:yourname") -> ("user", "yourname", None)
+        parse_node_id("user:operator") -> ("user", "operator", None)
         parse_node_id("agent:coder:alice") -> ("agent", "coder", "alice")
         parse_node_id("agent:coder") -> ("agent", "coder", None)
     """
     parts = node_id.split(":", 2)
 
     if len(parts) == 2:
-        # "user:yourname" or "agent:coder" (legacy)
+        # "user:operator" or "agent:coder" (legacy)
         return (parts[0], parts[1], None)
     elif len(parts) == 3:
         # "agent:coder:alice"
@@ -401,7 +408,7 @@ def get_display_name(node_id: str) -> str:
     For agents: returns the nickname (or type if no nickname)
 
     Examples:
-        get_display_name("user:yourname") -> "Alan"
+        get_display_name("user:operator") -> "Operator"
         get_display_name("agent:coder:alice") -> "Alice"
         get_display_name("agent:coder") -> "Coder"
     """
@@ -433,7 +440,7 @@ def build_user_node_id(nickname: str) -> str:
     Build a user node ID from nickname.
 
     Example:
-        build_user_node_id("yourname") -> "user:yourname"
+        build_user_node_id("operator") -> "user:operator"
     """
     return f"user:{nickname}"
 
@@ -611,7 +618,7 @@ def parse_channel_name(address: str) -> str | None:
 
     Example:
         parse_channel_name("channel:research") -> "research"
-        parse_channel_name("user:yourname") -> None
+        parse_channel_name("user:operator") -> None
     """
     if address.startswith("channel:"):
         return address[8:]  # len("channel:") == 8
@@ -821,6 +828,7 @@ def make_history_sync(
     from_node: str,
     conversation_id: str | None = None,
     since: str | None = None,
+    before: str | None = None,
     limit: int = 500,
 ) -> Message:
     """
@@ -830,6 +838,7 @@ def make_history_sync(
         from_node: The node requesting sync
         conversation_id: Optional specific conversation to sync
         since: ISO timestamp - only return messages after this time
+        before: ISO timestamp - only return messages before this time
         limit: Maximum number of messages to return
     """
     content: dict[str, Any] = {
@@ -840,6 +849,8 @@ def make_history_sync(
         content["conversation_id"] = conversation_id
     if since:
         content["since"] = since
+    if before:
+        content["before"] = before
 
     return Message(
         from_node=from_node,
@@ -991,6 +1002,28 @@ def make_reset_context(
         content={
             "action": ControlAction.RESET_CONTEXT.value,
             "reason": reason,
+        },
+    )
+
+
+def make_user_reset_token(
+    from_node: str,
+    target_username: str,
+) -> Message:
+    """
+    Request a token reset for a user.
+
+    Args:
+        from_node: The node requesting the reset (must be admin or self)
+        target_username: The username whose token should be reset
+    """
+    return Message(
+        from_node=from_node,
+        to_node="router",
+        type=MessageType.CONTROL,
+        content={
+            "action": ControlAction.USER_RESET_TOKEN.value,
+            "target_username": target_username,
         },
     )
 
@@ -1177,6 +1210,316 @@ def make_todo_response(
         content["conversation_id"] = conversation_id
     if server_state is not None:
         content["server_state"] = server_state
+    if error is not None:
+        content["error"] = error
+    return Message(
+        from_node="router",
+        to_node=to_node,
+        type=MessageType.CONTROL,
+        content=content,
+        in_reply_to=in_reply_to,
+    )
+
+
+# =============================================================================
+# Autonomous-fleet control
+#
+# A user-driven control channel over the autonomous-controller fleet, brokered
+# by the router in the same router-as-single-writer shape as TODO_MUTATE: the
+# client asks the router, the router authorizes and forwards, the target agent
+# executes deterministically and answers the original requester.
+#
+# The wake prompt is built by ``build_autonomous_wake_prompt`` on the agent
+# side, because only the agent knows its own dossier root (an isolated agent
+# redirects it) and its own per-session worker ceiling.
+# =============================================================================
+
+AUTONOMOUS_CONTROL_OPS = (
+    "status", "wake", "cancel", "budget", "budget-reset", "active", "report"
+)
+
+AUTONOMOUS_WAKE_HEADER = "[AUTONOMOUS PROJECT SESSION]"
+
+#: Bounds on ``/auto budget`` — a per-day worker ceiling outside this range is
+#: refused before anything touches a dossier.
+AUTONOMOUS_BUDGET_MIN = 1
+AUTONOMOUS_BUDGET_MAX = 50
+
+#: Accepted spellings for the boolean carried by ``/auto active``.  The client
+#: may send a real bool; a human types a word.  Anything else is refused rather
+#: than guessed — a mistyped flag must not silently arm a project.
+AUTONOMOUS_ACTIVE_TRUE = ("true", "on", "yes", "1", "enable", "enabled")
+AUTONOMOUS_ACTIVE_FALSE = ("false", "off", "no", "0", "disable", "disabled")
+
+
+def parse_active_value(raw: Any) -> bool:
+    """Coerce an ``op=active`` value to a bool, or raise :class:`ValueError`."""
+    if isinstance(raw, bool):
+        return raw
+    token = str(raw if raw is not None else "").strip().lower()
+    if token in AUTONOMOUS_ACTIVE_TRUE:
+        return True
+    if token in AUTONOMOUS_ACTIVE_FALSE:
+        return False
+    raise ValueError(
+        f"value must be one of {', '.join(AUTONOMOUS_ACTIVE_TRUE)} / "
+        f"{', '.join(AUTONOMOUS_ACTIVE_FALSE)}, got {raw!r}"
+    )
+
+
+def build_autonomous_wake_prompt(
+    project_key: str,
+    dossier_path: str,
+    max_workers_this_session: int,
+    report_to: str = "user:operator",
+    extra_instructions: str = "",
+) -> str:
+    """Render the canonical autonomous-session wake prompt.
+
+    Mirrors the production wakes on project:bluesky-rl and project:golden-age.
+    The header and the ``project_entity_key`` line are what
+    ``AgentNode._autonomous_session_metadata`` gates the operating mandate on,
+    so this rendering is the contract, not a cosmetic template.
+    """
+    prompt = (
+        f"{AUTONOMOUS_WAKE_HEADER}\n"
+        f"schema_version: 1\n"
+        f"project_entity_key: {project_key}\n"
+        f"project_dossier: {dossier_path}\n"
+        f"report_to: {report_to}\n"
+        f"max_workers_this_session: {int(max_workers_this_session)}\n"
+        f"\n"
+        f"Autonomous research session for {project_key}. The project dossier at "
+        f"the path above is authoritative: read it, review the Goals and Tasks, "
+        f"and advance the highest-value unblocked research work. Stay within the "
+        f"session and daily worker limits. The router charges exactly one "
+        f"admission per dispatch — never call dossier_spend_budget yourself. "
+        f"Report to {report_to} on completion."
+    )
+    extra = (extra_instructions or "").strip()
+    if extra:
+        prompt = f"{prompt}\n\n{extra}"
+    return prompt
+
+
+def make_autonomous_control(
+    from_node: str,
+    op: str,
+    agent: str = "",
+    to_node: str = "router",
+    project: str | None = None,
+    wake_time: str | None = None,
+    prompt: str | None = None,
+    count: int | None = None,
+    value: bool | str | None = None,
+    since: str | None = None,
+    wake_id: str | None = None,
+    requested_by: str | None = None,
+    message_id: str | None = None,
+) -> Message:
+    """Build an autonomous-fleet control request.
+
+    Clients address the router (``to_node="router"``); the router re-addresses
+    the same payload to the target agent, stamping ``requested_by`` and the
+    originating ``message_id`` so the agent can answer the real requester.
+    """
+    payload: dict[str, Any] = {"op": str(op or "").strip().lower(), "agent": agent}
+    if project is not None:
+        payload["project"] = project
+    if wake_time is not None:
+        payload["wake_time"] = wake_time
+    if prompt is not None:
+        payload["prompt"] = prompt
+    if count is not None:
+        payload["count"] = count
+    if value is not None:
+        payload["value"] = value
+    if since is not None:
+        payload["since"] = since
+    if wake_id is not None:
+        payload["wake_id"] = wake_id
+    if requested_by is not None:
+        payload["requested_by"] = requested_by
+    if message_id is not None:
+        payload["message_id"] = message_id
+    return Message(
+        from_node=from_node,
+        to_node=to_node,
+        type=MessageType.CONTROL,
+        content={
+            "action": ControlAction.AUTONOMOUS_CONTROL.value,
+            "payload": payload,
+        },
+    )
+
+
+def parse_autonomous_control(payload: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize an autonomous-control payload.
+
+    Accepts either the raw payload dict or a whole control-message ``content``
+    dict (it unwraps ``content["payload"]``). Raises :class:`ValueError` on a
+    malformed payload or an unknown op, which is what the router turns into a
+    structured error back to the sender.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("autonomous_control payload must be an object")
+    if "op" not in payload and isinstance(payload.get("payload"), dict):
+        payload = payload["payload"]
+    if not isinstance(payload, dict):
+        raise ValueError("autonomous_control payload must be an object")
+
+    op = str(payload.get("op", "")).strip().lower()
+    if op not in AUTONOMOUS_CONTROL_OPS:
+        raise ValueError(
+            f"unknown op {op or '(missing)'!r} — expected one of "
+            f"{', '.join(AUTONOMOUS_CONTROL_OPS)}"
+        )
+
+    parsed: dict[str, Any] = {
+        "op": op,
+        "agent": str(payload.get("agent", "") or "").strip(),
+        "project": str(payload.get("project", "") or "").strip(),
+        "since": str(payload.get("since", "") or "").strip(),
+        "wake_time": str(payload.get("wake_time", "") or "").strip(),
+        "prompt": payload.get("prompt") or "",
+        "wake_id": str(payload.get("wake_id", "") or "").strip(),
+        "requested_by": str(payload.get("requested_by", "") or "").strip(),
+        "message_id": str(payload.get("message_id", "") or "").strip(),
+    }
+
+    raw_count = payload.get("count")
+    if raw_count is None or raw_count == "":
+        parsed["count"] = None
+    else:
+        try:
+            parsed["count"] = int(raw_count)
+        except (TypeError, ValueError):
+            raise ValueError(f"count must be an integer, got {raw_count!r}")
+
+    if op == "wake" and not parsed["wake_time"]:
+        raise ValueError("wake_time required for op=wake")
+    if op == "cancel" and not parsed["wake_id"]:
+        raise ValueError("wake_id required for op=cancel")
+    if op == "report" and not parsed["project"]:
+        raise ValueError("project required for op=report")
+    if parsed["since"]:
+        try:
+            parsed_since = datetime.strptime(parsed["since"], "%Y-%m-%d")
+        except ValueError:
+            raise ValueError(
+                f"since must be YYYY-MM-DD, got {parsed['since']!r}"
+            )
+        if parsed_since.strftime("%Y-%m-%d") != parsed["since"]:
+            raise ValueError(
+                f"since must be YYYY-MM-DD, got {parsed['since']!r}"
+            )
+    if op == "budget":
+        if not parsed["project"]:
+            raise ValueError("project required for op=budget")
+        if parsed["count"] is None:
+            raise ValueError("count required for op=budget")
+    if op == "budget-reset" and not parsed["project"]:
+        raise ValueError("project required for op=budget-reset")
+
+    raw_value = payload.get("value")
+    parsed["value"] = None if raw_value is None or raw_value == "" else raw_value
+    if op == "active":
+        if not parsed["project"]:
+            raise ValueError("project required for op=active")
+        if parsed["value"] is None:
+            raise ValueError("value required for op=active")
+        # Normalize here so every downstream consumer sees a real bool and the
+        # refusal for a mistyped flag happens once, at the boundary.
+        parsed["value"] = parse_active_value(parsed["value"])
+
+    return parsed
+
+
+def make_autonomous_control_response(
+    to_node: str,
+    op: str,
+    agent: str = "",
+    accepted: bool = True,
+    result: dict[str, Any] | None = None,
+    error: str | None = None,
+    from_node: str = "router",
+    in_reply_to: str | None = None,
+) -> Message:
+    """Build the reply to an autonomous-fleet control request."""
+    content: dict[str, Any] = {
+        "action": ControlAction.AUTONOMOUS_CONTROL_RESPONSE.value,
+        "op": op,
+        "agent": agent,
+        "accepted": bool(accepted),
+    }
+    if result is not None:
+        content["result"] = result
+    if error is not None:
+        content["error"] = error
+    return Message(
+        from_node=from_node,
+        to_node=to_node,
+        type=MessageType.CONTROL,
+        content=content,
+        in_reply_to=in_reply_to,
+    )
+
+
+# =============================================================================
+# Per-conversation pinned notes sync
+# =============================================================================
+
+def make_conversation_notes_get(
+    from_node: str,
+    conversation_id: str,
+) -> Message:
+    """Request pinned notes for one conversation from the router."""
+    return Message(
+        from_node=from_node,
+        to_node="router",
+        type=MessageType.CONTROL,
+        content={
+            "action": ControlAction.CONVERSATION_NOTES_GET.value,
+            "conversation_id": conversation_id,
+        },
+    )
+
+
+def make_conversation_notes_set(
+    from_node: str,
+    conversation_id: str,
+    content_text: str,
+) -> Message:
+    """Set pinned notes for one conversation through the router."""
+    return Message(
+        from_node=from_node,
+        to_node="router",
+        type=MessageType.CONTROL,
+        content={
+            "action": ControlAction.CONVERSATION_NOTES_SET.value,
+            "conversation_id": conversation_id,
+            "content": content_text,
+        },
+    )
+
+
+def make_conversation_notes_response(
+    to_node: str,
+    notes: dict[str, Any],
+    accepted: bool | None = None,
+    conversation_id: str | None = None,
+    error: str | None = None,
+    in_reply_to: str | None = None,
+) -> Message:
+    """Router response with pinned notes keyed by conversation id."""
+    content: dict[str, Any] = {
+        "action": ControlAction.CONVERSATION_NOTES_RESPONSE.value,
+        "notes": notes,
+    }
+    if accepted is not None:
+        content["accepted"] = accepted
+    if conversation_id is not None:
+        content["conversation_id"] = conversation_id
     if error is not None:
         content["error"] = error
     return Message(

@@ -15,7 +15,7 @@ awareness but do not trigger you.
 - **Case-insensitive**: `@Bob`, `@bob`, `@BOB` all work.
 - **Your checked nicknames** typically include:
   - Your nickname (e.g., `@bob`)
-  - Your base nickname (e.g., `@claude` from "claude-sobek")
+  - Your base nickname (e.g., `@claude` from "claude-coder")
   - Your agent type (e.g., `@sysadmin`)
 - **Passive awareness**: Even when not @mentioned, channel messages are added
   to your context so you're aware of the conversation.

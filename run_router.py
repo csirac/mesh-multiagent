@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
 """
 Start the mesh router.
 
@@ -274,7 +273,7 @@ To enable per-user auth, set auth_mode: per_user in your config.
         "--set-prefixes",
         nargs="+",
         metavar=("USERNAME", "PREFIX"),
-        help="Set allowed identity prefixes for a user (e.g. --set-prefixes yourname 'user:')"
+        help="Set allowed identity prefixes for a user (e.g. --set-prefixes owner 'user:')"
     )
 
     args = parser.parse_args()

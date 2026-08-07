@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
 """
 Start an agent node.
 
@@ -97,9 +96,10 @@ async def main(
     # Conversation loading
     load_conversation: str | None = None,
     # Sandbox settings
-    sandboxed: bool = False,
+    # Tri-state: None means "flag not given, use the YAML value".
+    sandboxed: bool | None = None,
     allowed_dirs: list[str] | None = None,
-    allow_network: bool = True,
+    allow_network: bool | None = None,
     # Controller settings
     controller_mode: str | None = None,
     effort: str | None = None,
@@ -200,10 +200,28 @@ async def main(
             f"LLM configured: backend={llm_config.backend}, "
             f"model={llm_config.model}"
         )
-        # Sandbox: CLI flags override config, config overrides defaults
-        effective_sandboxed = sandboxed or node_config.sandboxed
-        effective_allowed_dirs = allowed_dirs if allowed_dirs else node_config.allowed_dirs
-        effective_allow_network = allow_network if not sandboxed else allow_network  # Only apply network flag if sandbox enabled
+        # Sandbox precedence is tri-state: ``None`` from the CLI means "the
+        # flag was not given", so the YAML value stands.  An explicit flag may
+        # only make the policy stricter — a run-time typo must not be the thing
+        # that grants network or drops sandboxing for a configured agent.
+        effective_sandboxed = bool(node_config.sandboxed)
+        if sandboxed is True:
+            effective_sandboxed = True
+
+        effective_allowed_dirs = (
+            allowed_dirs if allowed_dirs else node_config.allowed_dirs
+        )
+
+        effective_allow_network = bool(node_config.allow_network)
+        if allow_network is False:
+            # --no-network narrows, and it applies whether or not bwrap
+            # sandboxing itself is on.
+            effective_allow_network = False
+
+        isolation_policy = node_config.resolve_isolation_policy()
+        if allow_network is False:
+            isolation_policy = isolation_policy.narrow(allow_network=False)
+        logger.info(f"Isolation policy: {isolation_policy.describe()}")
 
         # Relevance router config (if enabled)
         relevance_router_config = None
@@ -212,13 +230,25 @@ async def main(
             relevance_router_config = RelevanceRouterConfig(
                 threshold=relevance_threshold,
                 bypass_direct=True,      # Direct messages always process (no LLM call)
-                bypass_mentions=True,    # @nickname mentions always process (skip LLM scoring)
+                # Force channel mentions through the scorer so it can separate
+                # direct requests from third-person references and agent acks.
+                bypass_mentions=False,
+                backend="openai",
+                model="Qwen/Qwen3.6-27B",
+                base_url="http://localhost:8002/v1",
+                api_key="",              # Local Qwen endpoint does not need Authorization
+                max_tokens=1024,
             )
             logger.info(f"Relevance router enabled: threshold={relevance_threshold}")
 
         agent = AgentNode(
             node_config,
             llm_config=llm_config,
+            worker_backend_configs={
+                name: backend_config_to_llm_config(backend_config)
+                for name, backend_config in config.llm_backends.items()
+            },
+            fixed_tool_configs=config.fixed_tools,
             description=description,
             history_file=history_file,
             persist=not fresh or bool(history_file),
@@ -234,6 +264,7 @@ async def main(
             sandboxed=effective_sandboxed,
             allowed_dirs=effective_allowed_dirs,
             allow_network=effective_allow_network,
+            isolation_policy=isolation_policy,
             # Relevance router
             relevance_router_config=relevance_router_config,
         )
@@ -255,6 +286,27 @@ async def main(
                     f"RouterV2 LLM backend '{node_config.router_v2_llm_backend}' "
                     f"not found in config. Available: {list(config.llm_backends.keys())}"
                 )
+
+        # Resolve the optional manual-override router independently from both
+        # the light router and worker. MeshConfig validates the named backend;
+        # keep this defensive check for programmatic/startup callers.
+        if node_config.router_deep_enabled:
+            deep_backend_name = node_config.router_deep_backend
+            deep_backend_config = config.llm_backends.get(deep_backend_name or "")
+            if not deep_backend_name or deep_backend_config is None:
+                raise ValueError(
+                    f"Router deep backend {deep_backend_name!r} is unavailable "
+                    f"for {node_id}"
+                )
+            agent._router_deep_llm_config = backend_config_to_llm_config(
+                deep_backend_config
+            )
+            logger.info(
+                "Router deep LLM configured: name=%s, backend=%s, model=%s",
+                deep_backend_name,
+                agent._router_deep_llm_config.backend,
+                agent._router_deep_llm_config.model,
+            )
 
         # Configure the native harness session backend if specified. Resolves
         # the named llm_backends block (e.g. mesh-harness-qwen36) into an
@@ -468,9 +520,14 @@ if __name__ == "__main__":
         help="List available conversations in mesh storage and exit"
     )
     # Sandbox settings
+    # Sandbox flags are tri-state: the default is None ("not specified"), so
+    # an omitted flag leaves the YAML policy alone instead of overriding it
+    # with a Boolean derived from absence.
     parser.add_argument(
         "--sandbox",
-        action="store_true",
+        action="store_const",
+        const=True,
+        default=None,
         help="Enable bwrap sandboxing (restricts file/bash access). On Ubuntu 24.04+, run: sudo ./scripts/setup_bwrap_apparmor.sh"
     )
     parser.add_argument(
@@ -481,8 +538,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--no-network",
-        action="store_true",
-        help="Block network access in sandbox"
+        action="store_const",
+        const=True,
+        default=None,
+        help="Block network access (narrows policy; omitting it keeps the YAML value)"
     )
     # Controller settings
     parser.add_argument(
@@ -578,7 +637,8 @@ if __name__ == "__main__":
         # Sandbox settings
         sandboxed=args.sandbox,
         allowed_dirs=args.allowed_dirs,
-        allow_network=not args.no_network,
+        # None when --no-network was not passed, so the YAML value wins.
+        allow_network=(False if args.no_network else None),
         # Controller settings
         controller_mode=args.controller,
         effort=args.effort,

@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """
 LLM client for the mesh.
 
@@ -22,10 +21,13 @@ import signal
 import sys
 import logging
 import pwd
+import shlex
 import shutil
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Protocol, TYPE_CHECKING
+from urllib.parse import urlparse
 
 if TYPE_CHECKING:
     from .tools import ToolRegistry, ToolCall
@@ -46,6 +48,25 @@ class CCToolEvent:
     data: dict | str
 
 
+@dataclass(frozen=True)
+class MultiTurnResult:
+    """Request-local result from a single complete_multi_turn call.
+
+    Immutable: every field is fixed at construction time and cannot be
+    overwritten by a concurrent curation turn sharing the same LLMClient.
+
+    The LLMClient still mirrors some of this onto ``_last_raw_message`` /
+    ``_last_reasoning_content`` / ``_last_usage`` for the complete_with_tools
+    path, but callers of complete_multi_turn must read it from here — those
+    instance fields are shared mutable state and race across await points.
+    """
+    content: str
+    tool_calls: list["ToolCall"]
+    usage: dict
+    raw_message: dict | None = None
+    reasoning_content: str | None = None
+
+
 class LLMStreamCallback(Protocol):
     """Protocol for streaming callbacks during LLM completion."""
 
@@ -62,6 +83,15 @@ import random
 import re
 
 logger = logging.getLogger(__name__)
+
+# Opaque execution attribution inherited by subprocess launch code through the
+# current asyncio task, never through process-global os.environ mutation.
+CURRENT_EXECUTION_CAPABILITY: ContextVar[str] = ContextVar(
+    "mesh_execution_capability", default="",
+)
+CURRENT_WORKER_ID: ContextVar[str] = ContextVar(
+    "mesh_execution_worker_id", default="",
+)
 
 # =============================================================================
 # Prompt Sanitization
@@ -123,6 +153,14 @@ BASE_RETRY_DELAY = 2.0
 # Maximum delay between retries (seconds)
 MAX_RETRY_DELAY = 60.0
 
+# Local OpenAI-compatible servers can have long prefills. A normal non-streaming HTTP request
+# cannot distinguish a long prefill from a request that has stopped making
+# progress, so use a generous first-token timeout and a much tighter
+# generation-progress timeout for that endpoint only.
+VLLM_HEALTH_TIMEOUT_SECONDS = 5.0
+VLLM_FIRST_TOKEN_TIMEOUT_SECONDS = 180.0
+VLLM_GENERATION_PROGRESS_TIMEOUT_SECONDS = 60.0
+
 
 class MalformedResponseError(Exception):
     """Raised when an LLM response is missing expected fields (e.g., choices, message).
@@ -131,6 +169,14 @@ class MalformedResponseError(Exception):
     truncated bodies under load, especially behind load balancers like OpenRouter.
     """
     pass
+
+
+class VLLMHealthError(ConnectionError):
+    """Raised when the local vLLM endpoint cannot pass a pre-call readiness probe."""
+
+
+class VLLMGenerationStallError(TimeoutError):
+    """Raised when a local vLLM stream stops producing generation progress."""
 
 
 class MeshHarnessCrashError(Exception):
@@ -169,11 +215,48 @@ class MeshHarnessCrashError(Exception):
         return f"{header}\n\n(no partial output captured)"
 
 
+class CodexExecutionError(Exception):
+    """Raised when Codex exits unsuccessfully without usable assistant text.
+
+    A non-zero Codex exit can still follow a complete assistant response.  That
+    response remains useful and is returned by ``_complete_codex``.  This error
+    is reserved for the otherwise-silent case so callers can distinguish an
+    infrastructure failure from an intentional empty model response.
+    """
+
+    def __init__(self, returncode: int, stderr: str):
+        self.returncode = returncode
+        self.stderr = stderr
+        stderr_preview = stderr.strip()[:500] if stderr else "(no stderr)"
+        super().__init__(
+            f"Codex subprocess exited {returncode} without usable output; "
+            f"stderr: {stderr_preview}"
+        )
+
+
 # Directory where mesh-harness crash records are persisted for diagnosis.
 # Resolved via mesh.paths (real home from /etc/passwd), not $HOME — $HOME is
 # a synthetic CC acct home when the process was launched from a CC session.
 from .paths import resolve_path as _resolve_mesh_path
+from .isolation import (
+    WorkerIsolationScope,
+    build_codex_isolation_args,
+    codex_home_dir,
+    scope_workspace_cwd,
+    strip_codex_broadening_args,
+)
 HARNESS_CRASH_LOG_DIR = _resolve_mesh_path("~/.mesh/harness-crashes")
+
+
+def _harness_crash_dir(state_paths=None) -> str:
+    """Where to persist a harness crash record.
+
+    ``state_paths`` scopes the directory for an isolated agent; omitting it
+    keeps the historical global location.
+    """
+    if state_paths is not None:
+        return str(state_paths.harness_crashes_dir)
+    return HARNESS_CRASH_LOG_DIR
 
 
 def _persist_harness_crash_log(
@@ -250,6 +333,9 @@ def _harness_agent_label(config) -> str:
 
 def _is_retryable_error(exc: Exception) -> bool:
     """Check if an exception is retryable."""
+    if isinstance(exc, (VLLMHealthError, VLLMGenerationStallError, TimeoutError)):
+        return True
+
     # Malformed provider responses (missing choices/message fields)
     if isinstance(exc, MalformedResponseError):
         return True
@@ -441,7 +527,8 @@ _SUBPROCESS_ENV_ALLOWLIST: frozenset[str] = frozenset({
     "EXA_API_KEY", "ZAI_API_KEY", "OPENROUTER_API_KEY",
     "SYNTHETIC_API_KEY", "GOOGLE_API_KEY",
     # Mesh
-    "MESH_AUTH_TOKEN", "MESH_NODE_ID", "MESH_SOCKET_PATH", "MESH_ATTACHMENT_SECRET",
+    "MESH_AUTH_TOKEN", "MESH_NODE_ID", "MESH_SOCKET_PATH",
+    "MESH_ATTACHMENT_SECRET", "MESH_EXECUTION_CAPABILITY", "MESH_WORKER_ID",
     # Notes server
     "RN_API_TOKEN", "RN_SERVER_BASE",
     # Python
@@ -461,6 +548,16 @@ def _build_subprocess_env() -> dict[str, str]:
     for key, value in os.environ.items():
         if key in _SUBPROCESS_ENV_ALLOWLIST or key.startswith(_SUBPROCESS_ENV_PREFIXES):
             env[key] = value
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env["PYTHONPATH"] = repo_root + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+    )
+    capability = CURRENT_EXECUTION_CAPABILITY.get()
+    if capability:
+        env["MESH_EXECUTION_CAPABILITY"] = capability
+    worker_id = CURRENT_WORKER_ID.get()
+    if worker_id:
+        env["MESH_WORKER_ID"] = worker_id
     return env
 
 
@@ -474,10 +571,18 @@ class LLMConfig:
     # Backend type
     backend: BackendType = "openai"
 
+    # Open/closed model classification carried over from the backends.yaml
+    # entry this config was built from: "open", "closed", or "" for
+    # unclassified.  Purely informational to the client itself; the dispatch
+    # layer reads it to enforce per-agent open-model-only policy, and treats
+    # anything other than "open" as closed.
+    access: str = ""
+
     # Common settings
     model: str = "gpt-4"
     max_tokens: int = 4096
     temperature: float = 0.7
+    synthesis_timeout: int = 180
 
     # OpenAI-compatible settings
     api_key: str = ""
@@ -529,8 +634,16 @@ class LLMConfig:
     # --system-prompt (durable under CC compaction).
     cc_worker_briefing: bool = False
 
+    # Phase 3: the isolation scope subprocess-backed launch paths must honour.
+    # ``None`` and the disabled scope are equivalent and leave every launch
+    # command, environment and cwd byte-identical to the legacy behaviour.
+    isolation_scope: "WorkerIsolationScope | None" = None
+
     # Codex CLI settings
     codex_binary: str = ""  # Path to codex binary; empty = shutil.which("codex")
+
+    # Operator-controlled environment overrides for Codex subprocesses.
+    codex_env: dict[str, str] | None = None
 
     # Codex subprocess idle timeout in seconds.  Codex can spend long stretches
     # in internal turns (large reasoning budget, multi-second LLM calls) without
@@ -544,6 +657,10 @@ class LLMConfig:
     codex_extra_args: list[str] = field(default_factory=list)
 
     # Mesh harness settings (python -m mesh.harness exec)
+    # Where harness crash records are written. Empty = the global
+    # ~/.mesh/harness-crashes root; an isolated agent injects its scoped
+    # StatePaths.harness_crashes_dir here.
+    harness_crash_log_dir: str = ""
     harness_python: str = ""  # Python binary; empty = sys.executable
     harness_backend: str = "anthropic"  # Sub-backend for the harness LLM calls
     harness_base_url: str = ""  # API base URL for harness sub-backend
@@ -587,11 +704,13 @@ class LLMConfig:
     thinking_level: ReasoningEffort | None = None
     thinking_budget: int | None = None
     include_thoughts: bool = False
+    chat_template_kwargs: dict[str, Any] | None = None
 
     # Auto-detect reasoning models based on model name patterns
     auto_detect_reasoning: bool = True
 
-    # Cookie-based auth (e.g., "tamu" for TAMU Cloudflare Access)
+    # Reserved for optional cookie-based auth providers. The public release
+    # ships no site-specific cookie adapter.
     cookie_source: str = ""
 
     def is_reasoning_model(self, model: str | None = None) -> bool:
@@ -660,6 +779,29 @@ class LLMConfig:
             return {"thinking_budget": self.thinking_budget}
 
         return None
+
+    def get_effective_chat_template_kwargs(self, model: str | None = None) -> dict[str, Any]:
+        """Get chat-template kwargs for OpenAI-compatible backends.
+
+        vLLM exposes model-specific chat-template controls through
+        `chat_template_kwargs`. Qwen3's template honors `enable_thinking` there;
+        older top-level `enable_thinking` / `thinking_budget` fields are accepted
+        by the server but do not affect template rendering.
+        """
+        kwargs = dict(self.chat_template_kwargs or {})
+
+        reasoning_effort = self.get_effective_reasoning_effort(model)
+        if reasoning_effort == "none":
+            kwargs.setdefault("enable_thinking", False)
+
+        if self.thinking_budget is not None:
+            if self.thinking_budget > 0:
+                kwargs.setdefault("enable_thinking", True)
+                kwargs.setdefault("thinking_budget", self.thinking_budget)
+            elif self.thinking_budget == 0:
+                kwargs.setdefault("enable_thinking", False)
+
+        return kwargs
 
     @classmethod
     def from_env(cls, backend: BackendType = "openai", prefix: str = "OPENAI") -> LLMConfig:
@@ -758,18 +900,268 @@ class LLMClient:
             self._client = httpx.AsyncClient(timeout=None)
         return self._client
 
+    def _is_local_vllm_endpoint(self, model: str | None = None) -> bool:
+        """Whether this client targets the managed local vLLM Qwen endpoint.
+
+        Keep the health probe and SSE watchdog scoped to the known local
+        service.  Other OpenAI-compatible providers have different streaming
+        semantics and already own their timeout policy.
+        """
+        del model  # Endpoint identity, not model spelling, is authoritative.
+        try:
+            parsed = urlparse(self.config.base_url)
+            host = (parsed.hostname or "").lower()
+            return host in {"127.0.0.1", "localhost", "::1"} and parsed.port == 8002
+        except ValueError:
+            return False
+
+    def _vllm_root_url(self) -> str:
+        """Return the vLLM server root from an OpenAI-compatible base URL."""
+        base = self.config.base_url.rstrip("/")
+        return base[:-3] if base.endswith("/v1") else base
+
+    def _is_real_local_vllm_client(self, client: Any, model: str | None = None) -> bool:
+        """Avoid requiring stream/get on lightweight test doubles."""
+        return self._is_local_vllm_endpoint(model) and isinstance(client, httpx.AsyncClient)
+
+    def _is_deepseek_reasoning_backend(self, model: str | None = None) -> bool:
+        """Whether this request targets a DeepSeek-compatible thinking model.
+
+        Self-hosted DeepSeek servers are commonly exposed through a neutral
+        loopback URL, so endpoint spelling alone is not a reliable identity
+        signal.  Match either the configured URL or the requested model name.
+        """
+        return "deepseek" in (
+            f"{self.config.base_url or ''} {model or self.config.model or ''}"
+        ).lower()
+
+    @staticmethod
+    def _local_vllm_headers(api_key: str) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        return headers
+
+    async def _probe_local_vllm(
+        self,
+        client: httpx.AsyncClient,
+        headers: dict[str, str],
+    ) -> None:
+        """Verify vLLM can answer a lightweight readiness request.
+
+        /health is the preferred vLLM probe.  Some compatible deployments do
+        not expose it, so a 404 falls back to the standard OpenAI model list.
+        All other failures are made explicit and retried by the caller.
+        """
+        root = self._vllm_root_url()
+        timeout = httpx.Timeout(VLLM_HEALTH_TIMEOUT_SECONDS, connect=VLLM_HEALTH_TIMEOUT_SECONDS)
+        try:
+            response = await client.get(f"{root}/health", headers=headers, timeout=timeout)
+            if response.status_code == 404:
+                response = await client.get(
+                    f"{self.config.base_url.rstrip('/')}/models",
+                    headers=headers,
+                    timeout=timeout,
+                )
+            response.raise_for_status()
+        except Exception as exc:
+            raise VLLMHealthError(
+                f"local vLLM readiness probe failed at {root}: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    async def ensure_backend_ready(self) -> None:
+        """Fail harness startup clearly when its local vLLM dependency is unavailable."""
+        client = self._ensure_client()
+        if not self._is_real_local_vllm_client(client, self.config.model):
+            return
+        headers = self._local_vllm_headers(self.config.api_key)
+        await self._retry_with_backoff(
+            lambda: self._probe_local_vllm(client, headers),
+            "local vLLM readiness probe",
+        )
+
+    async def _stream_local_vllm_chat_completion(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        headers: dict[str, str],
+        payload: dict[str, Any],
+        model: str,
+    ) -> dict[str, Any]:
+        """Stream a local vLLM completion and fail fast on generation stalls.
+
+        The result is normalized to the subset of a non-streaming OpenAI
+        response consumed by the callers below.  A long first-token window
+        accommodates cold long-context prefill; once output begins, no token
+        progress for ``VLLM_GENERATION_PROGRESS_TIMEOUT_SECONDS`` aborts the
+        request so the existing retry policy can recover it.
+        """
+        await self._probe_local_vllm(client, headers)
+
+        stream_payload = dict(payload)
+        stream_payload["stream"] = True
+        stream_options = dict(stream_payload.get("stream_options") or {})
+        stream_options["include_usage"] = True
+        stream_payload["stream_options"] = stream_options
+
+        timeout = httpx.Timeout(
+            connect=VLLM_HEALTH_TIMEOUT_SECONDS,
+            write=30.0,
+            pool=VLLM_HEALTH_TIMEOUT_SECONDS,
+            read=None,
+        )
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_calls: dict[int, dict[str, Any]] = {}
+        usage: dict[str, Any] = {}
+        saw_generation_progress = False
+        loop = asyncio.get_running_loop()
+        last_progress_at = loop.time()
+
+        try:
+            async with client.stream(
+                "POST", url, headers=headers, json=stream_payload, timeout=timeout
+            ) as response:
+                if response.status_code >= 400:
+                    body = (await response.aread()).decode("utf-8", errors="replace")
+                    if 400 <= response.status_code < 500:
+                        request_preview = json.dumps(
+                            stream_payload, default=str
+                        )[:500]
+                        logger.warning(
+                            "Local vLLM streaming request preview "
+                            "(model=%s messages=%d): body[:500]=%r",
+                            model,
+                            len(stream_payload.get("messages") or []),
+                            request_preview,
+                        )
+                    logger.warning(
+                        "Local vLLM streaming %d from %s (model=%s): body[:1000]=%r",
+                        response.status_code, url, model, body[:1000],
+                    )
+                    response.raise_for_status()
+
+                lines = response.aiter_lines()
+                while True:
+                    idle_limit = (
+                        VLLM_GENERATION_PROGRESS_TIMEOUT_SECONDS
+                        if saw_generation_progress
+                        else VLLM_FIRST_TOKEN_TIMEOUT_SECONDS
+                    )
+                    remaining = idle_limit - (loop.time() - last_progress_at)
+                    if remaining <= 0:
+                        raise VLLMGenerationStallError(
+                            f"local vLLM stream made no generation progress for {idle_limit:.0f}s "
+                            f"(model={model})"
+                        )
+                    try:
+                        line = await asyncio.wait_for(anext(lines), timeout=remaining)
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError as exc:
+                        raise VLLMGenerationStallError(
+                            f"local vLLM stream made no generation progress for {idle_limit:.0f}s "
+                            f"(model={model})"
+                        ) from exc
+
+                    if not line.startswith("data:"):
+                        continue
+                    data_text = line[5:].strip()
+                    if not data_text:
+                        continue
+                    if data_text == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data_text)
+                    except json.JSONDecodeError:
+                        logger.warning("Ignoring malformed local vLLM SSE chunk: %r", data_text[:500])
+                        continue
+
+                    if isinstance(chunk.get("usage"), dict):
+                        usage = chunk["usage"]
+                    choices = chunk.get("choices") or []
+                    for choice in choices:
+                        delta = choice.get("delta") or {}
+                        made_progress = False
+                        text = delta.get("content")
+                        if isinstance(text, str) and text:
+                            content_parts.append(text)
+                            made_progress = True
+                        reasoning = self._extract_openai_reasoning_content(delta)
+                        if reasoning:
+                            reasoning_parts.append(reasoning)
+                            made_progress = True
+                        for tool_delta in delta.get("tool_calls") or []:
+                            index = int(tool_delta.get("index", 0))
+                            entry = tool_calls.setdefault(
+                                index,
+                                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                            )
+                            if tool_delta.get("id"):
+                                entry["id"] = tool_delta["id"]
+                            if tool_delta.get("type"):
+                                entry["type"] = tool_delta["type"]
+                            fn_delta = tool_delta.get("function") or {}
+                            if fn_delta.get("name"):
+                                entry["function"]["name"] += fn_delta["name"]
+                            if fn_delta.get("arguments"):
+                                entry["function"]["arguments"] += fn_delta["arguments"]
+                            if fn_delta:
+                                made_progress = True
+                        if made_progress:
+                            saw_generation_progress = True
+                            last_progress_at = loop.time()
+        except VLLMGenerationStallError:
+            logger.warning("Local vLLM generation stall; aborting request for retry (model=%s)", model)
+            raise
+
+        # When vLLM puts all text in reasoning (not content), use reasoning
+        # as the content field so downstream consumers see non-empty content.
+        content_text = "".join(content_parts)
+        reasoning_text = "".join(reasoning_parts)
+        if not content_text and reasoning_text and not tool_calls:
+            content_text = reasoning_text
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": content_text,
+        }
+        if reasoning_parts:
+            message["reasoning"] = reasoning_text
+        if tool_calls:
+            message["tool_calls"] = [tool_calls[idx] for idx in sorted(tool_calls)]
+        return {"choices": [{"message": message}], "usage": usage}
+
+    @staticmethod
+    def _extract_openai_reasoning_content(message: dict) -> str:
+        """Return reasoning text from OpenAI-compatible response variants."""
+        for key in ("reasoning_content", "reasoning"):
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
     @property
     def supports_native_reasoning_multiturn(self) -> bool:
-        """Whether this backend needs native multi-turn with reasoning_content passback.
-
-        DeepSeek v4-pro with thinking enabled requires that reasoning_content
-        from tool-calling turns is passed back in subsequent API calls as part
-        of native assistant messages.  Without this, the model restarts its
-        reasoning chain from scratch on every tool-loop iteration.
-        """
+        """Whether this backend supports native tool turns with reasoning passback."""
+        # Anthropic Messages API is natively multi-turn: assistant tool_use
+        # blocks and user tool_result blocks carry the chain (plus thinking
+        # blocks when extended thinking is on).  complete_multi_turn_anthropic
+        # speaks that format, so the router loop can stay native rather than
+        # re-serializing history to XML on every tool iteration.
+        if self.config.backend == "anthropic":
+            return True
         if self.config.backend != "openai":
             return False
-        if not self.config.base_url or "deepseek" not in self.config.base_url.lower():
+        base_url = (self.config.base_url or "").lower()
+        model = (self.config.model or "").lower()
+
+        # Qwen/vLLM emits native OpenAI tool calls and a `reasoning` field.
+        # Passing that reasoning back as `reasoning_content` preserves the
+        # chain across tool-result turns without XML re-serializing history.
+        if "qwen" in model or "qwen" in base_url:
+            return True
+
+        if not self._is_deepseek_reasoning_backend(model):
             return False
         effort = self.config.get_effective_reasoning_effort(self.config.model)
         return bool(effort and effort != "none")
@@ -855,6 +1247,7 @@ class LLMClient:
         node_id: str,
         system_prompt: str = "",
         tool_prompt: str = "",
+        context_tail: str = "",
         instructions: str = "",
         trigger_msg: "Any | None" = None,
     ) -> str:
@@ -866,6 +1259,8 @@ class LLMClient:
             node_id: This agent's ID (e.g., "agent:researcher")
             system_prompt: Custom system prompt for the agent
             tool_prompt: Generated tool usage instructions (from ToolRegistry)
+            context_tail: Query-dependent context positioned after durable
+                          history for prefix-cache alignment.
             trigger_msg: If provided, the message that triggered this processing.
                          It is extracted from <history> and rendered as a separate
                          <message_received> block between history and instructions.
@@ -935,6 +1330,12 @@ class LLMClient:
             prompt_parts.append(tool_prompt)
 
         prompt_parts.append(history_xml)
+
+        # Exact-prefix caching only survives until the first token difference.
+        # Keep query-dependent retrieval after the append-only history so that
+        # durable history remains reusable across router calls.
+        if context_tail:
+            prompt_parts.append(context_tail)
 
         # Insert <message_received> between history and instructions
         if message_received_xml:
@@ -1016,7 +1417,9 @@ class LLMClient:
         max_tokens: int,
         temperature: float,
         tools: list[dict] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
         images: list[ImageAttachment] | None = None,
+        capture: dict | None = None,
     ) -> str | tuple[str, list[dict]]:
         """
         Complete using OpenAI-compatible API.
@@ -1028,6 +1431,12 @@ class LLMClient:
             temperature: Sampling temperature
             tools: Optional list of OpenAI-formatted tool definitions
             images: Optional list of images to include (for vision models)
+            capture: Optional caller-owned dict filled with request-local
+                copies of ``raw_message`` / ``reasoning_content`` / ``usage``.
+                The matching ``_last_*`` instance fields are shared mutable
+                state and race across await points; a caller that reads them
+                after an await (e.g. the router across tool execution) must
+                read this dict instead.
 
         Returns:
             If tools is None or no tool calls: returns content string
@@ -1042,18 +1451,6 @@ class LLMClient:
         # Only include Authorization header if api_key is set (supports local models)
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
-
-        # Inject cookie-based auth (e.g., TAMU Cloudflare Access)
-        if self.config.cookie_source == "tamu":
-            from .tamu_cookies import load_tamu_cookies
-            cookies = load_tamu_cookies()
-            if cookies:
-                headers["Cookie"] = cookies
-            else:
-                raise RuntimeError(
-                    "TAMU cookies expired or unavailable — "
-                    "log into chat.tamu.ai in mesh-browser to refresh"
-                )
 
         # Build message content - use multi-part format if images are present
         if images:
@@ -1092,6 +1489,18 @@ class LLMClient:
             # Azure-hosted o3 rejects parallel_tool_calls; other models support it
             if not (self.config.cookie_source and "o3" in model.lower()):
                 payload["parallel_tool_calls"] = True
+            # Qwen/vLLM is reluctant to call tools unless tool_choice is explicit.
+            # This matches OpenAI's implicit default for other compatible backends.
+            # DeepSeek thinking mode rejects the tool_choice field entirely
+            # (including "auto").  Omit it and let the model decide.
+            _re = self.config.get_effective_reasoning_effort(model)
+            _deepseek_reasoning = (
+                self._is_deepseek_reasoning_backend(model)
+                and _re
+                and _re != "none"
+            )
+            if not _deepseek_reasoning:
+                payload["tool_choice"] = tool_choice or "auto"
 
         # Add reasoning_effort for Chat Completions reasoning models
         # This works with OpenAI o-series, and Synthetic's OpenAI-compatible endpoint
@@ -1100,8 +1509,12 @@ class LLMClient:
             payload["reasoning_effort"] = reasoning_effort
             # DeepSeek v4-pro requires explicit thinking enablement alongside reasoning_effort.
             # Per docs: reasoning_effort selects effort level, but thinking must be enabled separately.
-            if "deepseek" in (self.config.base_url or "").lower():
+            if self._is_deepseek_reasoning_backend(model):
                 payload["thinking"] = {"type": "enabled"}
+
+        chat_template_kwargs = self.config.get_effective_chat_template_kwargs(model)
+        if chat_template_kwargs:
+            payload["chat_template_kwargs"] = chat_template_kwargs
 
         logger.debug(
             f"LLM request [openai]: model={model} url={url} prompt_len={len(prompt)} "
@@ -1111,48 +1524,53 @@ class LLMClient:
         logger.debug(f"LLM prompt preview (first 500 chars): {prompt[:500]!r}...")
 
         async def _make_request() -> str | tuple[str, list[dict]]:
-            response = await client.post(url, headers=headers, json=payload)
-
-            # Handle models that don't support reasoning_effort (e.g., Qwen3-Coder on Synthetic)
-            # Retry without reasoning_effort if the backend rejects it
-            if response.status_code == 400 and "reasoning_effort" in payload:
-                error_text = response.text
-                effort_val = payload.get("reasoning_effort")
-                # Backend that accepts reasoning_effort but not the specific value
-                # (e.g., vLLM gpt-oss accepts only 'none|low|medium|high', not 'xhigh').
-                # Downgrade rather than dropping entirely so reasoning stays enabled.
-                if (
-                    "reasoning_effort" in error_text
-                    and effort_val == "xhigh"
-                    and "high" in error_text
-                ):
-                    logger.info(
-                        f"Model {model} rejects reasoning_effort='xhigh', "
-                        f"downgrading to 'high' and retrying"
-                    )
-                    payload["reasoning_effort"] = "high"
-                    response = await client.post(url, headers=headers, json=payload)
-                elif "non-reasoning model" in error_text or "does not support reasoning" in error_text:
-                    logger.info(f"Model {model} doesn't support reasoning_effort, retrying without it")
-                    payload.pop("reasoning_effort")
-                    response = await client.post(url, headers=headers, json=payload)
-
-            # Always log 4xx response bodies — they carry the actionable error detail
-            # and were previously dropped, making endpoint-shape bugs hard to diagnose.
-            if 400 <= response.status_code < 500:
-                logger.warning(
-                    f"OpenAI-compatible {response.status_code} from {url} "
-                    f"(model={model}): body[:1000]={response.text[:1000]!r}"
+            if self._is_real_local_vllm_client(client, model):
+                data = await self._stream_local_vllm_chat_completion(
+                    client, url, headers, payload, model
                 )
+            else:
+                response = await client.post(url, headers=headers, json=payload)
 
-            response.raise_for_status()
+                # Handle models that don't support reasoning_effort (e.g., Qwen3-Coder on Synthetic)
+                # Retry without reasoning_effort if the backend rejects it
+                if response.status_code == 400 and "reasoning_effort" in payload:
+                    error_text = response.text
+                    effort_val = payload.get("reasoning_effort")
+                    # Backend that accepts reasoning_effort but not the specific value
+                    # (e.g., vLLM gpt-oss accepts only 'none|low|medium|high', not 'xhigh').
+                    # Downgrade rather than dropping entirely so reasoning stays enabled.
+                    if (
+                        "reasoning_effort" in error_text
+                        and effort_val == "xhigh"
+                        and "high" in error_text
+                    ):
+                        logger.info(
+                            f"Model {model} rejects reasoning_effort='xhigh', "
+                            f"downgrading to 'high' and retrying"
+                        )
+                        payload["reasoning_effort"] = "high"
+                        response = await client.post(url, headers=headers, json=payload)
+                    elif "non-reasoning model" in error_text or "does not support reasoning" in error_text:
+                        logger.info(f"Model {model} doesn't support reasoning_effort, retrying without it")
+                        payload.pop("reasoning_effort")
+                        response = await client.post(url, headers=headers, json=payload)
 
-            try:
-                data = response.json()
-            except Exception as e:
-                raise MalformedResponseError(
-                    f"Failed to parse JSON response from {model}: {e}; body[:200]={response.text[:200]!r}"
-                ) from e
+                # Always log 4xx response bodies — they carry the actionable error detail
+                # and were previously dropped, making endpoint-shape bugs hard to diagnose.
+                if 400 <= response.status_code < 500:
+                    logger.warning(
+                        f"OpenAI-compatible {response.status_code} from {url} "
+                        f"(model={model}): body[:1000]={response.text[:1000]!r}"
+                    )
+
+                response.raise_for_status()
+
+                try:
+                    data = response.json()
+                except Exception as e:
+                    raise MalformedResponseError(
+                        f"Failed to parse JSON response from {model}: {e}; body[:200]={response.text[:200]!r}"
+                    ) from e
 
             # Provider responses occasionally arrive without choices (load-balanced
             # backends like OpenRouter, transient upstream errors, truncated bodies).
@@ -1173,18 +1591,22 @@ class LLMClient:
                 )
             content = message.get("content") or ""
 
-            # Store raw message for native multi-turn reasoning passback (DeepSeek)
+            raw_tool_calls = message.get("tool_calls") or []
+
+            # Store raw message for native multi-turn reasoning passback.
             self._last_raw_message = message
 
-            # Capture reasoning_content from Chat Completions response
-            # Models like GLM-4.7 via Synthetic return this when reasoning is enabled
-            reasoning_content = message.get("reasoning_content") or ""
-            self._last_reasoning_content = reasoning_content.strip() if reasoning_content else None
+            # Capture reasoning from Chat Completions response variants.
+            # DeepSeek/Synthetic use `reasoning_content`; Qwen/vLLM uses `reasoning`.
+            reasoning_content = self._extract_openai_reasoning_content(message)
+            self._last_reasoning_content = reasoning_content or None
 
             # Some models (e.g. gpt-oss via vLLM) put their substantive response
             # entirely in reasoning_content with empty content — use it as fallback.
-            if not content.strip() and reasoning_content.strip():
-                content = reasoning_content.strip()
+            # When the model emitted a tool call, keep content empty so reasoning
+            # is only threaded through the internal reasoning-history path.
+            if not content.strip() and reasoning_content and not raw_tool_calls:
+                content = reasoning_content
 
             usage = data.get("usage", {})
             ct_details = usage.get("completion_tokens_details") or {}
@@ -1207,6 +1629,12 @@ class LLMClient:
                 "backend": "openai",
                 "model": model,
             }
+            # Request-local mirror.  Written from this request's own locals so
+            # a concurrent turn sharing the client cannot corrupt it.
+            if capture is not None:
+                capture["raw_message"] = dict(message)
+                capture["reasoning_content"] = reasoning_content or None
+                capture["usage"] = dict(self._last_usage)
             reasoning_tok = ct_details.get("reasoning_tokens", 0) if isinstance(ct_details, dict) else 0
             logger.debug(
                 f"LLM response: len={len(content)} "
@@ -1219,7 +1647,7 @@ class LLMClient:
             logger.debug(f"LLM response content preview: {content[:500]!r}...")
 
             # Check for tool calls
-            tool_calls = message.get("tool_calls")
+            tool_calls = raw_tool_calls
             if tool_calls:
                 logger.debug(f"LLM returned {len(tool_calls)} tool call(s)")
                 return content, tool_calls
@@ -1235,6 +1663,7 @@ class LLMClient:
         max_tokens: int,
         tools: list[dict] | None = None,
         images: list[ImageAttachment] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> str | tuple[str, list[dict]]:
         """Complete using OpenAI Responses API (for reasoning models: o3, o4, gpt-5).
 
@@ -1253,6 +1682,8 @@ class LLMClient:
             max_tokens: Maximum tokens to generate
             tools: Optional list of OpenAI-formatted tool definitions
             images: Optional list of images to include (for vision models)
+            tool_choice: Accepted for complete_with_tools parity; Responses
+                API tool selection is controlled by the model.
 
         Returns:
             If tools is None or no tool calls: returns content string
@@ -1267,18 +1698,6 @@ class LLMClient:
         # Only include Authorization header if api_key is set (supports local models)
         if self.config.api_key:
             headers["Authorization"] = f"Bearer {self.config.api_key}"
-
-        # Inject cookie-based auth (e.g., TAMU Cloudflare Access)
-        if self.config.cookie_source == "tamu":
-            from .tamu_cookies import load_tamu_cookies
-            cookies = load_tamu_cookies()
-            if cookies:
-                headers["Cookie"] = cookies
-            else:
-                raise RuntimeError(
-                    "TAMU cookies expired or unavailable — "
-                    "log into chat.tamu.ai in mesh-browser to refresh"
-                )
 
         # Build the input - use message array format if images are present
         if images:
@@ -1523,6 +1942,8 @@ class LLMClient:
         temperature: float,
         tools: list[dict] | None = None,
         images: list[ImageAttachment] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        capture: dict[str, Any] | None = None,
     ) -> str | tuple[str, list[dict]]:
         """Complete using Anthropic Messages API with optional extended thinking.
 
@@ -1544,6 +1965,14 @@ class LLMClient:
             temperature: Sampling temperature (ignored if thinking enabled)
             tools: Optional list of Anthropic-formatted tool definitions
             images: Optional list of images to include
+            tool_choice: Accepted for complete_with_tools parity; Anthropic
+                tool selection is controlled by the model.
+            capture: Optional caller-owned dict.  When given, receives this
+                call's ``thinking_blocks`` (request-local copy).  The router
+                seeds its native anthropic message array from this very call,
+                so its thinking blocks must be echoed on the reconstructed
+                assistant turn — and must not be read back off the shared
+                ``_last_thinking_blocks`` field after an await.
 
         Returns:
             If tools is None or no tool calls: returns content string
@@ -1635,21 +2064,22 @@ class LLMClient:
             thinking_content = ""
             tool_calls = []
 
-            # Track thinking blocks for potential preservation in multi-turn
-            self._last_thinking_blocks: list[dict] = []
+            # Track thinking blocks for potential preservation in multi-turn.
+            # Request-local list; the instance field is a mirror assigned below.
+            thinking_blocks: list[dict] = []
 
             for block in data.get("content", []):
                 block_type = block.get("type")
 
                 if block_type == "thinking":
                     # Thinking block - preserve for multi-turn and optionally include in output
-                    self._last_thinking_blocks.append(block)
+                    thinking_blocks.append(block)
                     if self.config.include_thoughts:
                         thinking_content += block.get("thinking", "") + "\n"
 
                 elif block_type == "redacted_thinking":
                     # Redacted thinking - preserve for multi-turn (required for continuity)
-                    self._last_thinking_blocks.append(block)
+                    thinking_blocks.append(block)
 
                 elif block_type == "text":
                     content += block.get("text", "")
@@ -1666,7 +2096,10 @@ class LLMClient:
                     })
 
             # Store thinking content for potential use
+            self._last_thinking_blocks = list(thinking_blocks)
             self._last_reasoning_content = thinking_content.strip() if thinking_content else None
+            if capture is not None:
+                capture["thinking_blocks"] = list(thinking_blocks)
 
             # Log usage
             usage = data.get("usage", {})
@@ -1718,6 +2151,17 @@ class LLMClient:
 
         Returns:
             (content, tool_calls, usage) — same contract as complete_multi_turn.
+
+            When extended thinking is enabled the response's ``thinking`` and
+            ``redacted_thinking`` blocks are returned, in original order, under
+            ``usage["thinking_blocks"]``.  The Messages API requires those
+            blocks to be echoed verbatim at the head of the reconstructed
+            assistant turn, so the caller must be able to read them without
+            touching ``self._last_thinking_blocks`` — that instance field is
+            shared mutable state and a concurrent turn can overwrite it across
+            the caller's tool-execution await (the DeepSeek-400 bug class).
+            Extending the usage dict keeps the 3-tuple shape, so existing
+            unpackers (mesh/harness/session.py) are unaffected.
         """
         from .tools import ToolCall
 
@@ -1738,6 +2182,23 @@ class LLMClient:
         for msg in messages:
             if msg.get("role") == "system":
                 system_content = msg.get("content", "")
+            elif (
+                self.config.anthropic_cache_enabled
+                and msg.get("role") == "user"
+                and isinstance(msg.get("content"), str)
+                and "<history>" in msg["content"]
+            ):
+                # Native Anthropic seed turns carry the serialized prompt as a
+                # user string. Reuse the rolling history breakpoint builder so
+                # its last history message, not the dynamic suffix, is
+                # cache-marked. Tool-result user messages are already block
+                # lists and must pass through unchanged.
+                conversation.append({
+                    **msg,
+                    "content": self._build_anthropic_cached_user_content(
+                        msg["content"],
+                    ),
+                })
             else:
                 conversation.append(msg)
 
@@ -1799,18 +2260,21 @@ class LLMClient:
 
             content = ""
             tool_calls: list[ToolCall] = []
-            self._last_thinking_blocks = []
+            # Request-local accumulator.  The instance mirror below exists only
+            # for legacy readers; everything this method returns comes from
+            # here, so a concurrent turn cannot corrupt the caller's copy.
+            thinking_blocks: list[dict] = []
 
             for block in data.get("content", []):
                 block_type = block.get("type")
 
                 if block_type == "thinking":
-                    self._last_thinking_blocks.append(block)
+                    thinking_blocks.append(block)
                     if self.config.include_thoughts:
                         content += block.get("thinking", "") + "\n"
 
                 elif block_type == "redacted_thinking":
-                    self._last_thinking_blocks.append(block)
+                    thinking_blocks.append(block)
 
                 elif block_type == "text":
                     content += block.get("text", "")
@@ -1823,9 +2287,12 @@ class LLMClient:
                         call_id=block.get("id", ""),
                     ))
 
+            # Legacy mirrors.  Assigned (not mutated) so a reader that grabbed
+            # the previous list keeps a coherent snapshot.
+            self._last_thinking_blocks = list(thinking_blocks)
             self._last_reasoning_content = None
             thinking_text = ""
-            for tb in self._last_thinking_blocks:
+            for tb in thinking_blocks:
                 if tb.get("type") == "thinking":
                     thinking_text += tb.get("thinking", "")
             if thinking_text.strip():
@@ -1845,13 +2312,17 @@ class LLMClient:
 
             logger.debug(
                 "LLM multi-turn-anthropic response: len=%d tool_calls=%d "
-                "input_tokens=%s output_tokens=%s",
-                len(content), len(tool_calls),
+                "thinking_blocks=%d input_tokens=%s output_tokens=%s",
+                len(content), len(tool_calls), len(thinking_blocks),
                 usage_data.get("input_tokens", "?"),
                 usage_data.get("output_tokens", "?"),
             )
 
-            return content, tool_calls, dict(self._last_usage)
+            # `thinking_blocks` rides on the returned copy only — `_last_usage`
+            # stays a pure token ledger for the usage accumulators.
+            result_usage = dict(self._last_usage)
+            result_usage["thinking_blocks"] = list(thinking_blocks)
+            return content, tool_calls, result_usage
 
         return await self._retry_with_backoff(_make_request, f"Multi-turn-anthropic ({model})")
 
@@ -1932,6 +2403,7 @@ class LLMClient:
                         f"{len(available)} available")
 
         last_error: RuntimeError | None = None
+        account_failures: list[dict[str, Any]] = []
 
         for attempt, idx in enumerate(try_order):
             home_dir = all_homes[idx]
@@ -1948,7 +2420,16 @@ class LLMClient:
             except RuntimeError as e:
                 last_error = e
                 home_label = home_dir or "default"
-                # Mark this account as depleted for 5 minutes
+                failed_usage = self._fetch_cc_account_usage(home_dir)
+                account_failures.append({
+                    "label": home_label,
+                    "usage": failed_usage,
+                    "was_in_cooldown": idx in depleted,
+                    "error": str(e),
+                })
+                # Mark this account as depleted for 5 minutes. This currently
+                # treats quota, auth, and transient subprocess failures the same;
+                # richer surfaced errors will let us tune cooldowns safely later.
                 self._cc_depleted[idx] = now + 300
                 logger.info(f"CC account {home_label} marked depleted for 5 min")
 
@@ -1957,7 +2438,6 @@ class LLMClient:
                     next_home = all_homes[next_idx]
                     next_label = next_home or "default"
                     # Fetch usage for the failed account to show why it failed
-                    failed_usage = self._fetch_cc_account_usage(home_dir)
                     next_usage = self._fetch_cc_account_usage(next_home)
                     switch_msg = (
                         f"CC account switch: {home_label} failed → trying {next_label}\n"
@@ -1974,9 +2454,32 @@ class LLMClient:
                             data=switch_msg,
                         ))
                 else:
-                    logger.error(f"CC failed on all {len(try_order)} accounts (last HOME={home_label}): {e}")
+                    summary = self._format_cc_account_failures(
+                        account_failures, total_accounts=len(try_order)
+                    )
+                    logger.error(summary)
+                    raise RuntimeError(summary) from last_error
 
         raise last_error  # type: ignore[misc]
+
+    @staticmethod
+    def _format_cc_account_failures(
+        failures: list[dict[str, Any]], total_accounts: int
+    ) -> str:
+        """Format per-account Claude Code failures for operator-visible errors."""
+        lines = [f"CC failed on all {total_accounts} accounts:"]
+        for failure in failures:
+            status = (
+                "previously in cooldown"
+                if failure.get("was_in_cooldown")
+                else "not in cooldown"
+            )
+            lines.append(
+                f"  {failure.get('label', 'unknown')} "
+                f"({status}; usage: {failure.get('usage', 'usage unknown')}): "
+                f"{failure.get('error', 'unknown error')}"
+            )
+        return "\n".join(lines)
 
     @staticmethod
     def _fetch_cc_account_usage(home_dir: str | None) -> str:
@@ -2356,7 +2859,18 @@ class LLMClient:
 
             if proc.returncode != 0:
                 stderr_data = await proc.stderr.read()
-                error_msg = stderr_data.decode().strip() if stderr_data else f"Exit code {proc.returncode}"
+                stderr_text = stderr_data.decode().strip() if stderr_data else ""
+                event_text = final_result.strip()
+                if not event_text and cc_text_blocks:
+                    event_text = "\n\n".join(cc_text_blocks).strip()
+                if stderr_text and event_text:
+                    error_msg = f"{stderr_text}\n{event_text}"
+                elif stderr_text:
+                    error_msg = stderr_text
+                elif event_text:
+                    error_msg = f"Exit code {proc.returncode} - {event_text}"
+                else:
+                    error_msg = f"Exit code {proc.returncode} (no stderr, no error events)"
                 raise RuntimeError(f"Claude Code error: {error_msg}")
 
             # If CC's result is short but it produced substantial intermediate
@@ -2424,6 +2938,45 @@ class LLMClient:
                     except ProcessLookupError:
                         pass
                 logger.info(f"CC subprocess cleanup complete: pid={proc.pid}")
+
+    @staticmethod
+    def _extract_cc_error_message(event: dict) -> str:
+        """Extract a useful message from Claude Code JSONL error shapes."""
+        messages: list[str] = []
+
+        def add(value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, str):
+                text = value.strip()
+            elif isinstance(value, dict):
+                text = (
+                    str(value.get("message") or value.get("error") or "").strip()
+                    or json.dumps(value, sort_keys=True)
+                )
+            else:
+                text = str(value).strip()
+            if text and text not in messages:
+                messages.append(text)
+
+        add(event.get("error"))
+        errors = event.get("errors")
+        if isinstance(errors, list):
+            for item in errors:
+                add(item)
+        else:
+            add(errors)
+        add(event.get("message"))
+        add(event.get("result"))
+        return "; ".join(messages)
+
+    @staticmethod
+    def _append_cc_error(final_result: str, prefix: str, message: str) -> str:
+        """Append a surfaced Claude Code error to the accumulated response."""
+        text = f"{prefix} {message or 'unknown Claude Code error'}"
+        if final_result.strip():
+            return f"{final_result}\n\n{text}"
+        return text
 
     def _process_cc_event(
         self,
@@ -2518,10 +3071,22 @@ class LLMClient:
                             ))
 
         elif event_type == "result":
+            if event.get("subtype") == "error":
+                msg = self._extract_cc_error_message(event)
+                final_result = self._append_cc_error(
+                    final_result, "[CC result:error]", msg
+                )
+                return final_result
+
             final_result = event.get("result", "")
             # Strip hallucinated user turns (Claude Code sometimes continues the
             # conversation by hallucinating "Human:" messages after its response)
             final_result = _strip_hallucinated_turns(final_result)
+
+        elif event_type in ("error", "turn.failed"):
+            msg = self._extract_cc_error_message(event)
+            prefix = "[CC turn.failed]" if event_type == "turn.failed" else "[CC error]"
+            final_result = self._append_cc_error(final_result, prefix, msg)
 
         return final_result
 
@@ -2589,6 +3154,12 @@ class LLMClient:
             or "codex"
         )
 
+        # Phase 3: the disabled scope (every agent today) reproduces the legacy
+        # command exactly; only an enabled scope reaches the branches below.
+        scope = self.config.isolation_scope or WorkerIsolationScope()
+        extra_args = list(self.config.codex_extra_args or [])
+        working_root = scope.primary_workspace if scope.enabled else os.getcwd()
+
         # Pass prompt via stdin (codex reads from stdin when prompt is "-")
         # to avoid OS argv length limit (E2BIG) on large prompts.
         cmd = [
@@ -2596,13 +3167,24 @@ class LLMClient:
             "-m", model,
             "--ephemeral",
             "--json",
+            "-C", working_root,
+            # The working root above is not a Git repo, so Codex refuses to run
+            # under an explicit `--sandbox` unless the trust check is skipped.
+            # Unconditional here, matching the worker launch path in
+            # tool_implementations._run_mesh_qwen_codex.
+            "--skip-git-repo-check",
         ]
 
-        extra_args = list(self.config.codex_extra_args or [])
-        # `--sandbox` is mutually exclusive with `--dangerously-bypass-approvals-and-sandbox`.
-        # If the caller specifies a sandbox mode, omit the bypass default.
-        if not any(a == "--sandbox" or a.startswith("--sandbox=") for a in extra_args):
-            cmd.append("--dangerously-bypass-approvals-and-sandbox")
+        if scope.enabled:
+            # The scope sets the ceiling: operator arguments may narrow the
+            # sandbox but can never restore the bypass or add a root.
+            cmd.extend(build_codex_isolation_args(scope, extra_args))
+            extra_args = strip_codex_broadening_args(extra_args)
+        else:
+            # `--sandbox` is mutually exclusive with `--dangerously-bypass-approvals-and-sandbox`.
+            # If the caller specifies a sandbox mode, omit the bypass default.
+            if not any(a == "--sandbox" or a.startswith("--sandbox=") for a in extra_args):
+                cmd.append("--dangerously-bypass-approvals-and-sandbox")
 
         effort = self.config.cc_effort
         if effort:
@@ -2616,7 +3198,12 @@ class LLMClient:
         # Use pwd.getpwuid to read /etc/passwd — immune to HOME env overrides.
         proc_env = _build_subprocess_env()
         real_home = pwd.getpwuid(os.getuid()).pw_dir
-        proc_env["HOME"] = real_home
+        # An isolated run gets a private HOME inside its own state root so it
+        # cannot read the operator's Codex config, shell history or caches.
+        # PATH still names the real interpreter/toolchain directories: those
+        # are executables to resolve, and the sandbox — not PATH — is the
+        # filesystem boundary.
+        proc_env["HOME"] = codex_home_dir(scope, create=True) if scope.enabled else real_home
         if self.config.node_id:
             proc_env["MESH_NODE_ID"] = self.config.node_id
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -2626,8 +3213,24 @@ class LLMClient:
             + os.path.join(real_home, ".local/bin") + ":"
             + proc_env.get("PATH", "")
         )
+        # codex_env is operator-controlled backend configuration, applied after
+        # the inherited environment has been allowlisted.
+        if self.config.codex_env:
+            proc_env.update(self.config.codex_env)
+        if scope.enabled:
+            # Backend endpoint/auth overrides are reviewed inputs, but they
+            # must not be able to repoint Codex at the operator's config tree.
+            proc_env["HOME"] = codex_home_dir(scope, create=True)
+            proc_env.pop("CODEX_HOME", None)
+        # Hand the child its scope so nested mesh work cannot lose or broaden
+        # it.  A disabled scope contributes nothing.
+        proc_env.update(scope.to_env())
 
-        logger.debug(f"Codex subprocess: {codex_bin} exec ... -m {model}")
+        logger.debug("Codex subprocess: %s", shlex.join(cmd))
+
+        subprocess_kwargs: dict[str, Any] = {}
+        if scope.enabled:
+            subprocess_kwargs["cwd"] = working_root
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -2636,6 +3239,7 @@ class LLMClient:
             stderr=asyncio.subprocess.PIPE,
             env=proc_env,
             start_new_session=True,
+            **subprocess_kwargs,
         )
 
         if proc.stdin:
@@ -2693,9 +3297,16 @@ class LLMClient:
 
             await proc.wait()
 
+            stderr_text = ""
             if proc.returncode != 0:
                 stderr_data = await proc.stderr.read()
-                error_msg = stderr_data.decode().strip() if stderr_data else f"Exit code {proc.returncode}"
+                if stderr_data:
+                    stderr_text = stderr_data.decode(errors="replace").strip()
+                    error_msg = stderr_text
+                elif text_blocks:
+                    error_msg = "; ".join(text_blocks)
+                else:
+                    error_msg = f"Exit code {proc.returncode} (no stderr, no error events)"
                 logger.warning(f"Codex exited {proc.returncode}: {error_msg[:500]}")
 
             final_text = "\n\n".join(text_blocks)
@@ -2706,6 +3317,12 @@ class LLMClient:
                 "backend": "codex",
                 "model": model,
             }
+
+            # Preserve usable partial text: Codex can emit a complete response
+            # before a late non-zero exit.  A silent failure, however, must not
+            # reach RouterV2 as an empty no-op response.
+            if proc.returncode != 0 and not final_text.strip():
+                raise CodexExecutionError(proc.returncode, stderr_text)
 
             logger.debug(f"Codex response: len={len(final_text)}")
             return final_text
@@ -2825,6 +3442,22 @@ class LLMClient:
                     tool_name=f"codex:mcp:{event.get('name', 'unknown')}",
                     data=event.get("result", {}),
                 ))
+
+        elif event_type in ("error", "turn.failed"):
+            # Surface Codex API / infrastructure errors into the response
+            # so the controller sees them instead of an empty string.
+            # error event:  {"type":"error","message":"..."}
+            # turn.failed:  {"type":"turn.failed","error":{"message":"..."}}
+            if event_type == "turn.failed":
+                inner = event.get("error")
+                if isinstance(inner, dict):
+                    msg = inner.get("message", "")
+                else:
+                    msg = str(inner) if inner else ""
+            else:
+                msg = event.get("message", "")
+            if msg:
+                text_blocks.append(f"[Codex error] {msg}")
 
     def _codex_item_tool_event(
         self,
@@ -3039,16 +3672,38 @@ class LLMClient:
         Codex-style 4-tool surface.
         """
         python = self.config.harness_python or sys.executable or "python3"
+        scope = self.config.isolation_scope or WorkerIsolationScope()
+        harness_backend = self.config.harness_backend or "anthropic"
+        if scope.enabled and harness_backend in {
+            "claude-code", "claude-interactive", "zai"
+        }:
+            raise RuntimeError(
+                f"isolated mesh-harness workers cannot use unsupported "
+                f"sub-backend {harness_backend!r}"
+            )
+        if scope.enabled and self.config.harness_assessor_backend in {
+            "claude-code", "claude-interactive", "zai"
+        }:
+            raise RuntimeError(
+                "isolated mesh-harness workers cannot use unsupported "
+                f"assessor backend {self.config.harness_assessor_backend!r}"
+            )
 
         # Pass prompt via stdin ("--prompt -") to avoid OS argv length limit
         # (E2BIG / errno 7) on large prompts. The harness CLI reads stdin when
         # --prompt is "-" or omitted.
         cmd = [
             python, "-m", "mesh.harness", "exec",
-            "--backend", self.config.harness_backend or "anthropic",
+            "--backend", harness_backend,
             "--model", model,
             "--prompt", "-",
         ]
+        if scope.enabled:
+            # The child installs the serialized policy before honoring this
+            # argument.  Supplying it is essential: without --cwd the harness
+            # would keep the agent process's repository cwd, which may be
+            # outside the isolated agent's workspace.
+            cmd.extend(["--cwd", scope_workspace_cwd(scope)])
 
         effort = self.config.cc_effort
         if effort:
@@ -3127,6 +3782,10 @@ class LLMClient:
         harness_env = _build_subprocess_env()
         if self.config.node_id:
             harness_env["MESH_NODE_ID"] = self.config.node_id
+        # Phase 3: the harness child runs mesh tools in its own process, so it
+        # needs the same scope its parent was launched under.  A disabled
+        # scope adds nothing.
+        harness_env.update(scope.to_env())
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -3239,6 +3898,9 @@ class LLMClient:
                         model=model,
                         prompt_len=len(prompt),
                         usage=dict(self._last_usage),
+                        log_dir=(
+                            getattr(self.config, "harness_crash_log_dir", "") or None
+                        ),
                     )
                     if log_path:
                         logger.warning(f"Mesh harness crash log written: {log_path}")
@@ -3418,6 +4080,12 @@ class LLMClient:
         cc_system_prompt: str | None = None,
         cc_user_prompt: str | None = None,
         cc_watchdog: Any = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        # Kept last for positional-call compatibility with existing backend
+        # integrations.
+        context_tail: str = "",
+        *,
+        capture: dict | None = None,
     ) -> tuple[str, list["ToolCall"]]:
         """
         Complete with tool support.
@@ -3434,6 +4102,15 @@ class LLMClient:
             model: Optional model override
             callback: Optional callback for streaming events (CC tool calls, etc.)
             instructions: Optional task-specific instructions to replace default "Respond to latest message"
+            context_tail: Query-dependent XML context positioned after durable
+                history and before the current trigger.
+            capture: Optional caller-owned dict filled with request-local
+                copies of ``prompt`` / ``raw_message`` / ``reasoning_content``
+                / ``usage`` for the OpenAI native-tool path.  The ``_last_*``
+                instance fields mirroring these are shared mutable state: a
+                concurrent turn on the same client overwrites them, including
+                while this call is still awaiting its own HTTP response.  Any
+                caller that reads them after an await must read this instead.
 
         Returns:
             Tuple of (response_text, tool_calls) where tool_calls is empty if none.
@@ -3458,11 +4135,22 @@ class LLMClient:
         if backend == "openai" and tool_names:
             # Build prompt WITH common guidance but OpenAI syntax (tools are passed via API)
             openai_tool_prompt = tool_registry.format_tools_prompt(tool_names, backend="openai")
-            prompt = self.format_history_xml(history, node_id, system_prompt, tool_prompt=openai_tool_prompt, instructions=instructions, trigger_msg=trigger_msg)
+            prompt = self.format_history_xml(
+                history, node_id, system_prompt,
+                tool_prompt=openai_tool_prompt,
+                context_tail=context_tail,
+                instructions=instructions,
+                trigger_msg=trigger_msg,
+            )
             prompt = sanitize_prompt(prompt)
 
-            # Store prompt for native multi-turn reasoning passback (DeepSeek)
+            # Store prompt for native multi-turn reasoning passback (DeepSeek).
+            # The instance field is written before the HTTP await below, so a
+            # concurrent turn can overwrite it while this request is still in
+            # flight — the capture copy is the one callers can trust.
             self._last_prompt = prompt
+            if capture is not None:
+                capture["prompt"] = prompt
 
             # Extract images from history for vision models
             all_images = self._extract_images_from_history(history)
@@ -3474,11 +4162,14 @@ class LLMClient:
             if self.config.should_use_responses_api(model):
                 # Responses API uses flattened tool format
                 openai_tools = tool_registry.get_openai_responses_tools(tool_names)
-                result = await self._complete_openai_responses(prompt, model, max_tokens, tools=openai_tools, images=all_images)
+                result = await self._complete_openai_responses(prompt, model, max_tokens, tools=openai_tools, images=all_images, tool_choice=tool_choice)
             else:
                 # Chat Completions API uses nested function format
                 openai_tools = tool_registry.get_openai_tools(tool_names)
-                result = await self._complete_openai(prompt, model, max_tokens, temperature, tools=openai_tools, images=all_images)
+                # Forward `capture` only when the caller asked for it, so this
+                # stays signature-inert for existing callers and test doubles.
+                _capture_kw = {"capture": capture} if capture is not None else {}
+                result = await self._complete_openai(prompt, model, max_tokens, temperature, tools=openai_tools, images=all_images, tool_choice=tool_choice, **_capture_kw)
 
             # Parse result
             self._log_usage()
@@ -3494,8 +4185,23 @@ class LLMClient:
         if backend == "anthropic" and tool_names:
             # Build prompt WITH common guidance (tools are passed via API)
             anthropic_tool_prompt = tool_registry.format_tools_prompt(tool_names, backend="openai")  # Same guidance format
-            prompt = self.format_history_xml(history, node_id, system_prompt, tool_prompt=anthropic_tool_prompt, instructions=instructions, trigger_msg=trigger_msg)
+            prompt = self.format_history_xml(
+                history, node_id, system_prompt,
+                tool_prompt=anthropic_tool_prompt,
+                context_tail=context_tail,
+                instructions=instructions,
+                trigger_msg=trigger_msg,
+            )
             prompt = sanitize_prompt(prompt)
+
+            # Store prompt for native multi-turn passback, mirroring the OpenAI
+            # branch above.  The router seeds its native message array from this
+            # prompt on the first tool-calling iteration; without it the
+            # anthropic native path can never engage.  The instance field races
+            # across concurrent turns — `capture` is the copy callers trust.
+            self._last_prompt = prompt
+            if capture is not None:
+                capture["prompt"] = prompt
 
             # Extract images from history for vision models
             all_images = self._extract_images_from_history(history)
@@ -3505,7 +4211,10 @@ class LLMClient:
             max_tokens = self.config.max_tokens
             temperature = self.config.temperature
 
-            result = await self._complete_anthropic(prompt, model, max_tokens, temperature, tools=anthropic_tools, images=all_images)
+            # Forward `capture` only when the caller asked for it, so this
+            # stays signature-inert for existing test doubles.
+            _capture_kw = {"capture": capture} if capture is not None else {}
+            result = await self._complete_anthropic(prompt, model, max_tokens, temperature, tools=anthropic_tools, images=all_images, tool_choice=tool_choice, **_capture_kw)
 
             # Parse result
             self._log_usage()
@@ -3523,6 +4232,7 @@ class LLMClient:
             prompt = self.format_history_xml(
                 history, node_id, system_prompt,
                 tool_prompt="",  # no XML tools block
+                context_tail=context_tail,
                 instructions=instructions,
                 trigger_msg=trigger_msg,
             )
@@ -3542,7 +4252,12 @@ class LLMClient:
             DeprecationWarning, stacklevel=2,
         )
         tool_prompt = tool_registry.format_tools_prompt(tool_names) if tool_names else ""
-        prompt = self.format_history_xml(history, node_id, system_prompt, tool_prompt, instructions=instructions, trigger_msg=trigger_msg)
+        prompt = self.format_history_xml(
+            history, node_id, system_prompt, tool_prompt,
+            context_tail=context_tail,
+            instructions=instructions,
+            trigger_msg=trigger_msg,
+        )
         response = await self.complete(prompt, model=model, callback=callback, cc_watchdog=cc_watchdog)
 
         # Parse XML tool calls
@@ -3558,7 +4273,8 @@ class LLMClient:
         tools: list[dict] | None = None,
         model: str | None = None,
         parallel_tool_calls: bool = True,
-    ) -> tuple[str, list["ToolCall"], dict]:
+        tool_choice: str | dict[str, Any] | None = None,
+    ) -> MultiTurnResult:
         """OpenAI Chat Completions call with native multi-turn messages.
 
         Unlike complete_with_tools (which XML-serializes history into a
@@ -3566,7 +4282,10 @@ class LLMClient:
         format and passes them directly to the API.
 
         Returns:
-            (content, tool_calls, usage) where tool_calls may be empty.
+            A MultiTurnResult carrying request-local content, tool_calls,
+            usage, raw_message and reasoning_content.  Callers must read
+            these off the result rather than off the client's ``_last_*``
+            fields, which a concurrent call can overwrite across an await.
         """
         from .tools import ToolCall
 
@@ -3596,16 +4315,30 @@ class LLMClient:
             payload["tools"] = tools
             if parallel_tool_calls:
                 payload["parallel_tool_calls"] = True
+            # DeepSeek thinking mode rejects the tool_choice field entirely
+            # (including "auto").  Omit it and let the model decide.
+            reasoning_effort_for_tools = self.config.get_effective_reasoning_effort(model)
+            deepseek_reasoning = (
+                self._is_deepseek_reasoning_backend(model)
+                and reasoning_effort_for_tools
+                and reasoning_effort_for_tools != "none"
+            )
+            if not deepseek_reasoning:
+                payload["tool_choice"] = tool_choice or "auto"
 
         reasoning_effort = self.config.get_effective_reasoning_effort(model)
         if reasoning_effort and reasoning_effort != "none":
             payload["reasoning_effort"] = reasoning_effort
-            if "deepseek" in (self.config.base_url or "").lower():
+            if self._is_deepseek_reasoning_backend(model):
                 payload["thinking"] = {"type": "enabled"}
 
         if thinking_enabled:
             payload["enable_thinking"] = True
             payload["thinking_budget"] = self.config.thinking_budget
+
+        chat_template_kwargs = self.config.get_effective_chat_template_kwargs(model)
+        if chat_template_kwargs:
+            payload["chat_template_kwargs"] = chat_template_kwargs
 
         logger.debug(
             "LLM multi-turn request: model=%s url=%s messages=%d tools=%d thinking=%s",
@@ -3614,26 +4347,31 @@ class LLMClient:
         )
 
         async def _make_request() -> tuple[str, list[ToolCall], dict]:
-            response = await client.post(url, headers=headers, json=payload)
-
-            if response.status_code == 400 and "reasoning_effort" in payload:
-                error_text = response.text
-                effort_val = payload.get("reasoning_effort")
-                if effort_val == "xhigh" and "high" in error_text:
-                    payload["reasoning_effort"] = "high"
-                    response = await client.post(url, headers=headers, json=payload)
-                elif "non-reasoning model" in error_text or "does not support reasoning" in error_text:
-                    payload.pop("reasoning_effort")
-                    response = await client.post(url, headers=headers, json=payload)
-
-            if 400 <= response.status_code < 500:
-                logger.warning(
-                    "Multi-turn %d from %s (model=%s): body[:1000]=%s",
-                    response.status_code, url, model, response.text[:1000],
+            if self._is_real_local_vllm_client(client, model):
+                data = await self._stream_local_vllm_chat_completion(
+                    client, url, headers, payload, model
                 )
+            else:
+                response = await client.post(url, headers=headers, json=payload)
 
-            response.raise_for_status()
-            data = response.json()
+                if response.status_code == 400 and "reasoning_effort" in payload:
+                    error_text = response.text
+                    effort_val = payload.get("reasoning_effort")
+                    if effort_val == "xhigh" and "high" in error_text:
+                        payload["reasoning_effort"] = "high"
+                        response = await client.post(url, headers=headers, json=payload)
+                    elif "non-reasoning model" in error_text or "does not support reasoning" in error_text:
+                        payload.pop("reasoning_effort")
+                        response = await client.post(url, headers=headers, json=payload)
+
+                if 400 <= response.status_code < 500:
+                    logger.warning(
+                        "Multi-turn %d from %s (model=%s): body[:1000]=%s",
+                        response.status_code, url, model, response.text[:1000],
+                    )
+
+                response.raise_for_status()
+                data = response.json()
 
             choices = data.get("choices")
             if not choices or not isinstance(choices, list):
@@ -3649,10 +4387,11 @@ class LLMClient:
 
             content = message.get("content") or ""
             self._last_raw_message = message
-            reasoning_content = message.get("reasoning_content") or ""
-            self._last_reasoning_content = reasoning_content.strip() if reasoning_content else None
-            if not content.strip() and reasoning_content.strip():
-                content = reasoning_content.strip()
+            raw_tool_calls = message.get("tool_calls") or []
+            reasoning_content = self._extract_openai_reasoning_content(message)
+            self._last_reasoning_content = reasoning_content or None
+            if not content.strip() and reasoning_content and not raw_tool_calls:
+                content = reasoning_content
 
             usage = data.get("usage", {})
             ct_details = usage.get("completion_tokens_details") or {}
@@ -3673,9 +4412,14 @@ class LLMClient:
                 "model": model,
             }
 
-            raw_tool_calls = message.get("tool_calls") or []
             tool_calls = self._convert_openai_tool_calls(raw_tool_calls)
-            return content, tool_calls, dict(self._last_usage)
+            return MultiTurnResult(
+                content=content,
+                tool_calls=tool_calls,
+                usage=dict(self._last_usage),
+                raw_message=dict(message),
+                reasoning_content=reasoning_content or None,
+            )
 
         return await self._retry_with_backoff(_make_request, f"Multi-turn request ({model})")
 
@@ -3720,10 +4464,31 @@ class LLMClient:
             args_str = func.get("arguments", "{}")
 
             # Parse arguments JSON
-            try:
-                arguments = json.loads(args_str)
-            except json.JSONDecodeError:
+            if args_str in (None, "", "{}", "null"):
                 arguments = {}
+            else:
+                try:
+                    arguments = json.loads(args_str)
+                except (json.JSONDecodeError, TypeError) as exc:
+                    logger.warning(
+                        "Dropping malformed OpenAI tool call id=%r name=%r: "
+                        "arguments[:200]=%r (%s)",
+                        tc.get("id", ""),
+                        name,
+                        str(args_str)[:200],
+                        exc,
+                    )
+                    continue
+
+            if not isinstance(arguments, dict):
+                logger.warning(
+                    "Dropping OpenAI tool call id=%r name=%r with non-object "
+                    "arguments: %r",
+                    tc.get("id", ""),
+                    name,
+                    arguments,
+                )
+                continue
 
             # Generate synthetic XML for compatibility with existing code
             # This is used for logging and debugging

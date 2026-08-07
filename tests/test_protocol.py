@@ -14,9 +14,19 @@ from mesh.protocol import (
     make_control,
     make_tool_request,
     make_tool_result,
+    make_history_sync,
     make_todo_get,
     make_todo_mutate,
     make_todo_response,
+    make_conversation_notes_get,
+    make_conversation_notes_set,
+    make_autonomous_control,
+    make_autonomous_control_response,
+    parse_autonomous_control,
+    build_autonomous_wake_prompt,
+    AUTONOMOUS_CONTROL_OPS,
+    AUTONOMOUS_WAKE_HEADER,
+    make_conversation_notes_response,
     encode_for_wire,
     decode_length_prefix,
 )
@@ -230,6 +240,24 @@ class TestConvenienceConstructors:
         )
         assert msg.metadata["config"] == {"model": "gpt-4"}
 
+    def test_make_history_sync_with_before(self):
+        """make_history_sync can request older pages in one conversation."""
+        msg = make_history_sync(
+            "user:testuser",
+            conversation_id="channel:rec-fishing",
+            before="2026-01-01T00:03:00.000Z",
+            limit=200,
+        )
+
+        assert msg.type == MessageType.CONTROL
+        assert msg.to_node == "router"
+        assert msg.content == {
+            "action": ControlAction.HISTORY_SYNC.value,
+            "limit": 200,
+            "conversation_id": "channel:rec-fishing",
+            "before": "2026-01-01T00:03:00.000Z",
+        }
+
     def test_make_tool_request(self):
         """make_tool_request creates a TOOL_REQUEST message."""
         msg = make_tool_request(
@@ -345,6 +373,145 @@ class TestMessageTypes:
         assert ControlAction.TODO_GET.value == "todo_get"
         assert ControlAction.TODO_MUTATE.value == "todo_mutate"
         assert ControlAction.TODO_RESPONSE.value == "todo_response"
+        assert ControlAction.CONVERSATION_NOTES_GET.value == "conversation_notes_get"
+        assert ControlAction.CONVERSATION_NOTES_SET.value == "conversation_notes_set"
+        assert ControlAction.CONVERSATION_NOTES_RESPONSE.value == "conversation_notes_response"
+        assert ControlAction.AUTONOMOUS_CONTROL.value == "autonomous_control"
+        assert ControlAction.AUTONOMOUS_CONTROL_RESPONSE.value == "autonomous_control_response"
+
+
+class TestAutonomousControlMessages:
+    def test_make_autonomous_control_addresses_the_router(self):
+        msg = make_autonomous_control("user:testuser", "status", agent="agent:coder:autopilot")
+        assert msg.type == MessageType.CONTROL
+        assert msg.to_node == "router"
+        assert msg.content["action"] == ControlAction.AUTONOMOUS_CONTROL.value
+        assert msg.content["payload"]["op"] == "status"
+        assert msg.content["payload"]["agent"] == "agent:coder:autopilot"
+
+    def test_round_trip_each_op(self):
+        """Every op survives make -> parse with its op-specific fields intact."""
+        cases = {
+            "status": {},
+            "wake": {"project": "project:bluesky-rl", "wake_time": "in 30 minutes"},
+            "cancel": {"wake_id": "wake-dbf4b6f4"},
+            "budget": {"project": "project:bluesky-rl", "count": 10},
+            "budget-reset": {"project": "project:bluesky-rl"},
+            "active": {"project": "project:bluesky-rl", "value": True},
+            "report": {"project": "project:bluesky-rl", "since": "2026-08-01"},
+        }
+        assert set(cases) == set(AUTONOMOUS_CONTROL_OPS)
+        for op, extra in cases.items():
+            msg = make_autonomous_control(
+                "user:testuser", op, agent="agent:coder:autopilot-rl", **extra
+            )
+            parsed = parse_autonomous_control(msg.content)
+            assert parsed["op"] == op
+            assert parsed["agent"] == "agent:coder:autopilot-rl"
+            for field, value in extra.items():
+                assert parsed[field] == value
+            if op == "budget-reset":
+                assert parsed["count"] is None
+
+    def test_parse_accepts_bare_payload_and_full_content(self):
+        msg = make_autonomous_control("user:testuser", "status", agent="agent:researcher:reme")
+        assert (
+            parse_autonomous_control(msg.content)
+            == parse_autonomous_control(msg.content["payload"])
+        )
+
+    def test_parse_rejects_malformed_payloads(self):
+        with pytest.raises(ValueError):
+            parse_autonomous_control(None)
+        with pytest.raises(ValueError, match="unknown op"):
+            parse_autonomous_control({"op": "detonate"})
+        with pytest.raises(ValueError, match="unknown op"):
+            parse_autonomous_control({})
+        with pytest.raises(ValueError, match="wake_time required"):
+            parse_autonomous_control({"op": "wake"})
+        with pytest.raises(ValueError, match="wake_id required"):
+            parse_autonomous_control({"op": "cancel"})
+        with pytest.raises(ValueError, match="project required for op=report"):
+            parse_autonomous_control({"op": "report"})
+        with pytest.raises(ValueError, match="since must be YYYY-MM-DD"):
+            parse_autonomous_control(
+                {"op": "report", "project": "project:x", "since": "2026/08/01"}
+            )
+        with pytest.raises(ValueError, match="since must be YYYY-MM-DD"):
+            parse_autonomous_control(
+                {"op": "report", "project": "project:x", "since": "2026-8-1"}
+            )
+        with pytest.raises(ValueError, match="count required"):
+            parse_autonomous_control({"op": "budget", "project": "project:x"})
+        with pytest.raises(ValueError, match="project required for op=budget-reset"):
+            parse_autonomous_control({"op": "budget-reset"})
+        with pytest.raises(ValueError, match="count must be an integer"):
+            parse_autonomous_control(
+                {"op": "budget", "project": "project:x", "count": "many"}
+            )
+        with pytest.raises(ValueError, match="project required for op=active"):
+            parse_autonomous_control({"op": "active", "value": True})
+        with pytest.raises(ValueError, match="value required for op=active"):
+            parse_autonomous_control({"op": "active", "project": "project:x"})
+        with pytest.raises(ValueError, match="value must be one of"):
+            parse_autonomous_control(
+                {"op": "active", "project": "project:x", "value": "maybe"}
+            )
+
+    def test_active_value_is_normalized_to_a_bool_at_the_boundary(self):
+        """Operators type words; every consumer downstream sees a real bool."""
+        for spelling in ("on", "ON", "true", "yes", "1", "enable", True):
+            parsed = parse_autonomous_control(
+                {"op": "active", "project": "project:x", "value": spelling}
+            )
+            assert parsed["value"] is True, spelling
+        for spelling in ("off", "OFF", "false", "no", "0", "disable", False):
+            parsed = parse_autonomous_control(
+                {"op": "active", "project": "project:x", "value": spelling}
+            )
+            assert parsed["value"] is False, spelling
+
+    def test_active_false_survives_make_and_parse(self):
+        """`value=False` must not be dropped the way a falsy optional would."""
+        msg = make_autonomous_control(
+            "user:testuser", "active", agent="agent:coder:autopilot-rl",
+            project="project:bluesky-rl", value=False,
+        )
+        assert parse_autonomous_control(msg.content)["value"] is False
+
+    def test_response_carries_result_and_error(self):
+        ok = make_autonomous_control_response(
+            "user:testuser", "wake", agent="agent:coder:autopilot-rl",
+            result={"wake_id": "wake-1"}, in_reply_to="msg-1",
+        )
+        assert ok.content["action"] == ControlAction.AUTONOMOUS_CONTROL_RESPONSE.value
+        assert ok.content["accepted"] is True
+        assert ok.content["result"]["wake_id"] == "wake-1"
+        assert ok.in_reply_to == "msg-1"
+
+        bad = make_autonomous_control_response(
+            "user:testuser", "wake", accepted=False, error="nope"
+        )
+        assert bad.content["accepted"] is False
+        assert bad.content["error"] == "nope"
+
+    def test_wake_prompt_carries_the_session_contract(self):
+        prompt = build_autonomous_wake_prompt(
+            "project:bluesky-rl",
+            "/home/testuser/.mesh/digests/project-bluesky-rl.md",
+            max_workers_this_session=10,
+        )
+        assert prompt.startswith(AUTONOMOUS_WAKE_HEADER)
+        assert "project_entity_key: project:bluesky-rl" in prompt
+        assert "project_dossier: /home/testuser/.mesh/digests/project-bluesky-rl.md" in prompt
+        assert "report_to: user:operator" in prompt
+        assert "max_workers_this_session: 10" in prompt
+        assert "never call dossier_spend_budget yourself" in prompt
+
+        with_extra = build_autonomous_wake_prompt(
+            "project:bluesky-rl", "/tmp/d.md", 3, extra_instructions="Focus on T-004."
+        )
+        assert with_extra.endswith("\n\nFocus on T-004.")
 
 
 class TestTodoControlMessages:
@@ -357,7 +524,7 @@ class TestTodoControlMessages:
         assert get_msg.content["conversation_ids"] == ["channel:mesh-infra"]
 
         mutate_msg = make_todo_mutate(
-            "agent:coder:sobek",
+            "agent:coder:coder1",
             "channel:mesh-infra",
             "add",
             payload={"text": "Draft plan"},
@@ -381,6 +548,37 @@ class TestTodoControlMessages:
         assert response.content["section_order"]["channel:mesh-infra"] == ["today", "medium-term"]
         assert response.content["accepted"] is True
         assert response.in_reply_to == mutate_msg.id
+
+
+class TestConversationNotesControlMessages:
+    def test_make_conversation_notes_messages(self):
+        """Conversation note control factories create broker-routed messages."""
+        get_msg = make_conversation_notes_get("agent:coder:coder1", "channel:mesh-infra")
+        assert get_msg.type == MessageType.CONTROL
+        assert get_msg.to_node == "router"
+        assert get_msg.content["action"] == ControlAction.CONVERSATION_NOTES_GET.value
+        assert get_msg.content["conversation_id"] == "channel:mesh-infra"
+
+        set_msg = make_conversation_notes_set(
+            "agent:coder:coder1",
+            "channel:mesh-infra",
+            "Operations: docs/operations/computehost.md",
+        )
+        assert set_msg.content["action"] == ControlAction.CONVERSATION_NOTES_SET.value
+        assert set_msg.content["content"] == "Operations: docs/operations/computehost.md"
+
+        response = make_conversation_notes_response(
+            "user:testuser",
+            {"channel:mesh-infra": {"content": "Worklog: docs/worklog.md"}},
+            accepted=True,
+            conversation_id="channel:mesh-infra",
+            in_reply_to=set_msg.id,
+        )
+        assert response.from_node == "router"
+        assert response.content["action"] == ControlAction.CONVERSATION_NOTES_RESPONSE.value
+        assert response.content["accepted"] is True
+        assert response.content["notes"]["channel:mesh-infra"]["content"] == "Worklog: docs/worklog.md"
+        assert response.in_reply_to == set_msg.id
 
 
 class TestConfirmMessages:

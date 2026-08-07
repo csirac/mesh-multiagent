@@ -65,7 +65,7 @@ Two embeddings are computed per memory entry:
 
 1. **Reflection embedding** — used for facility location diversity selection (accept/evict decisions). The reflection captures meta-cognitive reasoning — the right abstraction for measuring information diversity across the memory set.
 
-2. **Retrieval key embedding** — used for worker retrieval (top-K by task similarity). The retrieval key is an LLM-generated 1-2 sentence task descriptor produced during reflection. This normalizes quality: even terse triggers like "hey bob, status?" get a specific retrieval key like "Checking status of running agents and mesh router health on sobek."
+2. **Retrieval key embedding** — used for worker retrieval (top-K by task similarity). The retrieval key is an LLM-generated 1-2 sentence task descriptor produced during reflection. This normalizes quality: even terse triggers like "hey operator, status?" get a specific retrieval key like "Checking status of running agents and mesh router health on the configured host."
 
 Why not embed the raw trigger or summary:
 - **Raw trigger** is unreliable — many triggers are too short/generic for meaningful similarity

@@ -4,13 +4,14 @@
 #   cp mesh.yaml.example mesh.yaml
 #
 # For the quickstart walkthrough, see the README.
-# For the full architecture reference, see docs/mesh_technical_report.pdf.
+# For the full architecture reference, see docs/technical-report/.
 
 router:
   host: 127.0.0.1
   port: 7700
   ws_port: 8765
   storage_path: ~/.mesh/storage/messages.db
+  # cc_usage_monitor_enabled: false  # Opt in only for an account-usage dashboard.
   # auth_token: ${MESH_AUTH_TOKEN}   # Uncomment to read token from env.bash
 
 # ─── LLM Backends ──────────────────────────────────────────────────────────
@@ -55,7 +56,7 @@ llm_backends:
 # Agent types correspond to system prompt files in mesh/prompts/:
 #   researcher.md, assistant.md, sysadmin.md, coder.md
 
-agents:
+nodes:
   agent:researcher:
     nickname: alice
     llm_backend: default
@@ -82,6 +83,24 @@ agents:
 #   memory_active_size: 50
 #   memory_pool_max_entries: 1000
 #   memory_embedding_model: text-embedding-3-small
+#   memory_llm_backend: default        # Optional separate backend for formation
+#   memory_formation_v3_enabled: true
+#   entity_self_curation_enabled: true
+#   entity_essays_enabled: true
+#
+# Autonomous projects: enable this only for an agent that is explicitly
+# responsible for one or more project dossiers. The durable local artifacts
+# are created beneath ~/.mesh by default:
+#   dossiers: ~/.mesh/digests/project-<project>.md
+#   session reports: ~/.mesh/reports/
+#   admission budget ledger: ~/.mesh/budget/
+#
+#   autonomous_agent_mode_enabled: true
+#   autonomous_projects:
+#     - project:example-project
+#   autonomous_max_workers_per_session: 2
+#   autonomous_active_gap_minutes: 60
+#   autonomous_controller_prompt_file: autonomous_controller.txt
 #
 # Firebase push notifications (Android client):
 # Requires firebase-credentials.json — see firebase-credentials.example.json.

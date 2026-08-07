@@ -312,6 +312,8 @@ class ConversationHistory:
 
         Used by memory v2: no summary generated, just returns the old turns
         and trims the window to the recent half.
+        Tool-result turns older than the recent horizon are dropped first so
+        large historical tool payloads cannot starve the token partition.
 
         Returns the old_half turns (empty list if nothing to split).
         """
@@ -321,6 +323,32 @@ class ConversationHistory:
         self._summarizing = True
         try:
             W = self._window_budget
+            tool_result_horizon = 10
+            pre_dropped: list[Turn] = []
+
+            if self._window:
+                n = len(self._window)
+                kept_window: list[Turn] = []
+                for i, turn in enumerate(self._window):
+                    distance_from_end = n - 1 - i
+                    is_tool_result = turn.meta.get("trace_block") == "tool_result"
+                    if is_tool_result and distance_from_end > tool_result_horizon:
+                        pre_dropped.append(turn)
+                    else:
+                        kept_window.append(turn)
+
+                if pre_dropped:
+                    self._window = kept_window
+                    logger.info(
+                        "Window partition pre-drop: removed %d old tool_result turns (> %d back), "
+                        "kept %d turns",
+                        len(pre_dropped), tool_result_horizon, len(kept_window),
+                    )
+
+                    if not self._window or self.estimate_window_tokens() < 2 * W:
+                        self._save_if_configured()
+                        return pre_dropped
+
             accumulated = 0
             partition_idx = 0
             for i, turn in enumerate(self._window):
@@ -332,19 +360,40 @@ class ConversationHistory:
                 partition_idx = i + 1
 
             if partition_idx <= 0:
-                if len(self._window) > 1:
+                consecutive_tool_results = 0
+                for turn in self._window:
+                    if turn.meta.get("trace_block") == "tool_result":
+                        consecutive_tool_results += 1
+                    else:
+                        break
+                if consecutive_tool_results > 0:
+                    partition_idx = consecutive_tool_results
+                    logger.info(
+                        "Window partition: first %d turns are tool_results exceeding W=%d, "
+                        "dropping all at once",
+                        consecutive_tool_results, W,
+                    )
+                elif len(self._window) > 1:
                     partition_idx = 1
                 else:
+                    if pre_dropped:
+                        self._save_if_configured()
+                        return pre_dropped
                     return []
 
-            old_half = self._window[:partition_idx]
+            if pre_dropped and partition_idx >= len(self._window):
+                self._save_if_configured()
+                return pre_dropped
+
+            old_half = pre_dropped + self._window[:partition_idx]
             recent_half = self._window[partition_idx:]
 
             self._window = recent_half
+            dropped_tokens = sum(t.token_estimate + self._per_msg_overhead for t in old_half)
             logger.info(
                 "Window partition (v2): dropped %d turns (~%d tokens), "
                 "kept %d turns (~%d tokens)",
-                len(old_half), accumulated,
+                len(old_half), dropped_tokens,
                 len(recent_half), self.estimate_window_tokens(),
             )
             self._save_if_configured()
@@ -513,7 +562,7 @@ class ConversationHistory:
 
         Turns with topic labels are grouped under section headers:
           --- Topic: document editing (2026-02-26 22:26) ---
-          [user:yourname at ...] ...
+          [user:operator at ...] ...
 
         Turns without topic labels are rendered inline without headers.
         Consecutive turns with the same topic share a single header.
@@ -592,6 +641,40 @@ class ConversationHistory:
             self.save()
 
         return result
+
+    def enforce_hard_limit(self) -> int:
+        """Drop oldest window turns until the estimated total is under the hard limit.
+
+        Same policy as the prune inside build_context_for_llm(), but callable
+        mid-turn. The router's tool-iteration loop appends turns per iteration
+        and would otherwise not re-check the cap until the *next* trigger, so a
+        single turn with several large tool results can leave the persisted
+        window far above the hard limit (observed: 246% of cap).
+
+        Only the persisted window is touched; the caller's in-flight context is
+        unaffected, so calling this mid-loop cannot change the current LLM call.
+
+        Returns the number of turns dropped.
+        """
+        summary_tokens = self._summary.token_estimate if self._summary else 0
+        entry_tokens = [t.token_estimate + self._per_msg_overhead for t in self._window]
+        total = self._base_overhead + summary_tokens + sum(entry_tokens)
+
+        dropped = 0
+        # Keep at least one turn, mirroring build_context_for_llm().
+        while total > self._hard_limit and len(entry_tokens) > 1:
+            total -= entry_tokens.pop(0)
+            dropped += 1
+
+        if dropped > 0:
+            self._window = self._window[dropped:]
+            logger.info(
+                f"Hard limit prune (mid-turn): dropped {dropped} oldest window "
+                f"entries ({len(self._window)} remaining, ~{total} tokens)"
+            )
+            self.save()
+
+        return dropped
 
     # -------------------------------------------------------------------------
     # Persistence

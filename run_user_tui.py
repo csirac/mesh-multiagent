@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
 """
 Mesh User TUI - Terminal interface for mesh communication.
 
@@ -16,10 +15,10 @@ Usage:
     python run_user_tui.py [--nickname <nick>] [--config PATH]
 
 Examples:
-    python run_user_tui.py --nickname yourname
+    python run_user_tui.py --nickname owner
     python run_user_tui.py -n sarah
-    python run_user_tui.py -n yourname --fresh  # Start fresh (no history)
-    python run_user_tui.py user:yourname  # Legacy style
+    python run_user_tui.py -n owner --fresh  # Start fresh (no history)
+    python run_user_tui.py user:operator  # Legacy style
 
 By default, sessions resume from previous history. Use --fresh or --no-resume
 to start without history.
@@ -58,8 +57,11 @@ from mesh.protocol import (
     make_channel_create, make_channel_delete, make_channel_join, make_channel_leave,
     make_channel_list, make_channel_members, make_channel_invite, make_history_sync,
     make_scratchpad_get, make_scratchpad_set, make_todo_get, make_todo_mutate,
+    make_autonomous_control, AUTONOMOUS_BUDGET_MIN, AUTONOMOUS_BUDGET_MAX,
+    parse_active_value,
     parse_node_id,
 )
+from mesh.worker_status import format_worker_state, format_worker_detail_lines
 from mesh.wez_math_renderer import WezMathRenderer
 from mesh.markdown_renderer import MarkdownRenderer
 import json
@@ -77,6 +79,18 @@ _GREEN = "\033[32m"
 _RED = "\033[31m"
 _YELLOW = "\033[33m"
 _RESET = "\033[0m"
+
+#: How long `/auto` waits for the enrolled controllers to answer its status
+#: fan-out before rendering whatever arrived. Sized for a controller that is
+#: mid-LLM-turn: the CONTROL branch answers before the router loop, but the
+#: agent's event loop still has to get a slice.
+AUTO_STATUS_TIMEOUT_SECS = 6.0
+
+#: The wake_time sent when the operator asks for a session *now* and gives no
+#: clock time. The wire contract requires op=wake to carry a non-empty
+#: wake_time, so "immediate" is a value rather than an absence; the agent's
+#: `parse_wake_time` resolves it to a few seconds out.
+IMMEDIATE_WAKE_TIME = "now"
 
 
 def format_tool_activity_call(name: str, args: dict, max_width: int = 120) -> str:
@@ -354,6 +368,11 @@ class MeshTUI:
         # Conversation view filter (None = show all, otherwise filter to this node/channel)
         self.current_view: Optional[str] = None
 
+        # Sender filter within a channel view (set by /v sub:<agent>, None = no filter).
+        # Stores a full node ID (e.g. "agent:assistant:alice"). Only takes effect while
+        # current_view is a channel; cleared whenever the view itself changes.
+        self.view_sender_filter: Optional[str] = None
+
         # Target selection
         self.default_target: Optional[str] = None
 
@@ -446,6 +465,10 @@ class MeshTUI:
 
         # Pending confirmation requests: msg_id -> asyncio.Future[bool]
         self._pending_confirms: dict[str, asyncio.Future[bool]] = {}
+
+        # In-flight `/auto` status fan-out. One collector at a time: the command
+        # is interactive and rare, and a second one would interleave two blocks.
+        self._auto_status_collector: Optional[dict] = None
 
         # Per-conversation drafts: partner_node_id -> draft_text
         self._drafts: dict[str, str] = {}
@@ -557,6 +580,9 @@ class MeshTUI:
                 parts.append(f"#{self.current_view.split(':')[1]}")
             else:
                 parts.append(f"@{view_name}")
+        # Show active sender filter (/v sub:<agent>)
+        if self.view_sender_filter:
+            parts.append(f"| from: {get_display_name(self.view_sender_filter)}")
         # Show target
         if self.default_target:
             parts.append(f"→{get_display_name(self.default_target)}")
@@ -706,7 +732,6 @@ class MeshTUI:
         if status_summary:
             print()
             state = status_summary.get("state", "")
-            worker_elapsed = status_summary.get("worker_elapsed_s")
             ctx_tokens = status_summary.get("context_tokens", 0)
             hist_turns = status_summary.get("history_turns", 0)
             hist_pct = status_summary.get("history_pct", 0)
@@ -717,12 +742,9 @@ class MeshTUI:
             # State with color
             if state:
                 state_upper = state.upper()
-                if state == "busy":
-                    state_color = self.YELLOW
-                    if worker_elapsed is not None:
-                        state_str = f"{state_upper} ({int(worker_elapsed)}s)"
-                    else:
-                        state_str = state_upper
+                if state in ("busy", "auto"):
+                    state_color = self.YELLOW if state == "busy" else self.CYAN
+                    state_str = format_worker_state(status_summary, state_upper)
                 else:
                     state_color = self.GREEN
                     state_str = state_upper
@@ -730,6 +752,10 @@ class MeshTUI:
                 if ctx_tokens:
                     print(f"  {self.DIM}{ctx_tokens // 1000}k ctx{self.RESET}", end="")
                 print()
+                for worker_line in format_worker_detail_lines(
+                    status_summary, indent="    "
+                ):
+                    print(f"{self.DIM}{worker_line}{self.RESET}")
 
             # Detail line: history, memory, uptime
             detail = []
@@ -866,7 +892,10 @@ class MeshTUI:
             print()
             print(f"{self.BOLD}Router:{self.RESET}")
             state = r.get("state", "?").upper()
-            state_color = self.YELLOW if state == "BUSY" else self.GREEN
+            state_color = (
+                self.YELLOW if state == "BUSY"
+                else (self.CYAN if state == "AUTO" else self.GREEN)
+            )
             print(f"  {self.DIM}State:{self.RESET}   {state_color}{state}{self.RESET}")
             if r.get("worker_active"):
                 elapsed = r.get("worker_elapsed_seconds")
@@ -1007,7 +1036,8 @@ class MeshTUI:
 
             if is_channel:
                 # Channel messages: to_node matches the channel
-                if msg.to_node == partner:
+                # (and the /v sub:<agent> sender filter, when it is active here)
+                if msg.to_node == partner and self._sender_filter_allows(msg, partner):
                     filtered.append(entry)
             else:
                 # DM messages: either from or to the partner
@@ -1220,14 +1250,30 @@ class MeshTUI:
 
     def _print_current_context(self):
         """Print current conversation context (after pager, etc.)."""
+        suffix = ""
+        if self.view_sender_filter:
+            suffix = f" | from: {get_display_name(self.view_sender_filter)}"
         if self.current_view:
             view_name = get_display_name(self.current_view)
             if self.current_view.startswith("channel:"):
-                print(f"{self.DIM}[#{self.current_view.split(':')[1]}]{self.RESET}")
+                print(f"{self.DIM}[#{self.current_view.split(':')[1]}{suffix}]{self.RESET}")
             else:
-                print(f"{self.DIM}[@{view_name}]{self.RESET}")
+                print(f"{self.DIM}[@{view_name}{suffix}]{self.RESET}")
         else:
-            print(f"{self.DIM}[all messages]{self.RESET}")
+            print(f"{self.DIM}[all messages{suffix}]{self.RESET}")
+
+    def _sender_filter_allows(self, msg, view: str) -> bool:
+        """Apply the /v sub:<agent> sender filter to a message shown in `view`.
+
+        Returns True (a no-op) unless a sender filter is set AND `view` is the
+        current channel view. The filter is a read-narrowing device for channels
+        only — DM views and any other conversation being rendered are unaffected.
+        """
+        if not self.view_sender_filter:
+            return True  # Disabled path: identical behavior to before the filter existed
+        if view != self.current_view or not view.startswith("channel:"):
+            return True
+        return msg.from_node == self.view_sender_filter
 
     def _matches_current_view(self, msg) -> bool:
         """Check if a message matches the current conversation view filter."""
@@ -1240,14 +1286,18 @@ class MeshTUI:
             # Channel: to_node must be the channel address
             # Router broadcasts with to_node=channel:name, so we check that
             # Also check metadata.channel as a fallback
+            in_channel = False
             if msg.to_node == self.current_view:
-                return True
-            # Fallback: check metadata (in case router adds it)
-            if msg.metadata and msg.metadata.get("channel"):
+                in_channel = True
+            elif msg.metadata and msg.metadata.get("channel"):
+                # Fallback: check metadata (in case router adds it)
                 chan_name = msg.metadata.get("channel")
                 chan_addr = f"channel:{chan_name}" if not chan_name.startswith("channel:") else chan_name
-                return chan_addr == self.current_view
-            return False
+                in_channel = chan_addr == self.current_view
+            if not in_channel:
+                return False
+            # Narrow to a single sender when /v sub:<agent> is active
+            return self._sender_filter_allows(msg, self.current_view)
         else:
             # DM: either from or to the view partner
             return (
@@ -1382,17 +1432,13 @@ class MeshTUI:
         # Status line
         if status_summary:
             state = status_summary.get("state", "")
-            worker_elapsed = status_summary.get("worker_elapsed_s")
             ctx_tokens = status_summary.get("context_tokens", 0)
 
             if state:
                 state_upper = state.upper()
-                if state == "busy":
-                    state_color = self.YELLOW
-                    if worker_elapsed is not None:
-                        state_str = f"{state_upper} ({int(worker_elapsed)}s)"
-                    else:
-                        state_str = state_upper
+                if state in ("busy", "auto"):
+                    state_color = self.YELLOW if state == "busy" else self.CYAN
+                    state_str = format_worker_state(status_summary, state_upper)
                 else:
                     state_color = self.GREEN
                     state_str = state_upper
@@ -1400,6 +1446,10 @@ class MeshTUI:
                 if ctx_tokens:
                     print(f"  {self.DIM}{ctx_tokens // 1000}k ctx{self.RESET}", end="")
                 print()
+                for worker_line in format_worker_detail_lines(
+                    status_summary, indent="    "
+                ):
+                    print(f"{self.DIM}{worker_line}{self.RESET}")
 
         # In-Progress Activity
         if current_activity:
@@ -1668,7 +1718,12 @@ class MeshTUI:
         print()
 
     def _outgoing_matches_view(self, to_node: str) -> bool:
-        """Check if an outgoing message matches the current view filter."""
+        """Check if an outgoing message matches the current view filter.
+
+        Note: the /v sub:<agent> sender filter is deliberately NOT applied here.
+        It narrows *reading* ("show me just her messages"), but the user still
+        needs to see their own replies land in the channel for context.
+        """
         if self.current_view is None:
             return True  # No filter, show all
 
@@ -1726,6 +1781,8 @@ class MeshTUI:
                     parts.append(f"#{self.current_view.split(':')[1]}")
                 else:
                     parts.append(f"@{view_name}")
+            if self.view_sender_filter:
+                parts.append(f"| from: {get_display_name(self.view_sender_filter)}")
             if self.default_target:
                 parts.append(f"→{get_display_name(self.default_target)}")
             else:
@@ -1843,16 +1900,12 @@ class MeshTUI:
                     if status:
                         state = status.get("state", "")
                         ctx_tokens = status.get("context_tokens", 0)
-                        worker_elapsed = status.get("worker_elapsed_s")
                         # State line
                         if state:
                             state_upper = state.upper()
-                            if state == "busy":
-                                state_color = self.YELLOW
-                                if worker_elapsed is not None:
-                                    state_str = f"{state_upper} ({int(worker_elapsed)}s)"
-                                else:
-                                    state_str = state_upper
+                            if state in ("busy", "auto"):
+                                state_color = self.YELLOW if state == "busy" else self.CYAN
+                                state_str = format_worker_state(status, state_upper)
                             else:
                                 state_color = self.GREEN
                                 state_str = state_upper
@@ -1860,6 +1913,10 @@ class MeshTUI:
                             if ctx_tokens:
                                 print(f" {self.DIM}· {ctx_tokens // 1000}k ctx{self.RESET}", end="")
                             print()
+                            for worker_line in format_worker_detail_lines(
+                                status, indent="      "
+                            ):
+                                print(f"{self.DIM}{worker_line}{self.RESET}")
                         # History + memory line
                         detail2 = []
                         hist_pct = status.get("history_pct")
@@ -2152,8 +2209,36 @@ class MeshTUI:
                 print(f"{self.DIM}→ Inviting {node_id} to #{channel_name}...{self.RESET}")
 
         elif cmd == "/view" or cmd == "/v":
-            if not arg or arg.lower() == "all":
+            if arg and arg.lower().startswith("sub:"):
+                # Sender filter within the current view: /v sub:alice, /v sub: or
+                # /v sub:all to clear. Never changes current_view or default_target.
+                spec = arg[4:].strip()
+                if not spec or spec.lower() == "all":
+                    if self.view_sender_filter:
+                        cleared = get_display_name(self.view_sender_filter)
+                        self.view_sender_filter = None
+                        print(f"{self.DIM}View: sender filter cleared (was {cleared}){self.RESET}")
+                    else:
+                        print(f"{self.DIM}View: no sender filter set{self.RESET}")
+                else:
+                    if spec.startswith("@"):
+                        spec = spec[1:]
+                    resolved = self.node.resolve_target(spec) if ":" not in spec else spec
+                    if not resolved:
+                        print(f"{self.YELLOW}Could not resolve agent '{spec}'. Use /list to see available nodes.{self.RESET}")
+                    else:
+                        self.view_sender_filter = resolved
+                        sender_name = get_display_name(resolved)
+                        if self.current_view and self.current_view.startswith("channel:"):
+                            chan = self.current_view.split(":", 1)[1]
+                            print(f"{self.DIM}View: #{chan} filtered to messages from {sender_name}{self.RESET}")
+                        else:
+                            print(f"{self.DIM}View: sender filter set to {sender_name}{self.RESET}")
+                            print(f"{self.YELLOW}Note: the sender filter only takes effect while viewing a channel "
+                                  f"(use /v #channel first).{self.RESET}")
+            elif not arg or arg.lower() == "all":
                 self.current_view = None
+                self.view_sender_filter = None  # Switching views always resets the sender filter
                 print(f"{self.DIM}View: showing all messages{self.RESET}")
             else:
                 # Check if arg is a channel name (starts with # or is already channel: prefix)
@@ -2174,6 +2259,7 @@ class MeshTUI:
 
                 if ":" in target:
                     self.current_view = target
+                    self.view_sender_filter = None  # Switching views always resets the sender filter
                     self.default_target = target  # Auto-set target to match view
                     self._clear_unread(target)  # Mark as read
                     view_name = get_display_name(target)
@@ -2202,6 +2288,7 @@ class MeshTUI:
             else:
                 partner = self._recent_conversations[0]
                 self.current_view = partner
+                self.view_sender_filter = None  # Switching views always resets the sender filter
                 self.default_target = partner
                 self._clear_unread(partner)
                 view_name = get_display_name(partner)
@@ -2245,6 +2332,18 @@ class MeshTUI:
         elif cmd == "/todo" or cmd == "/td":
             await self._handle_todo_command(arg)
 
+        elif cmd == "/auto" or cmd == "/autopilot":
+            await self._handle_auto_command(arg)
+
+        elif cmd == "/wake" or cmd == "/step":
+            await self._handle_wake_command(arg)
+
+        elif cmd == "/report":
+            await self._handle_report_command(arg)
+
+        elif cmd == "/dossier" or cmd == "/dos":
+            self._handle_dossier_command(arg)
+
         elif cmd == "/calendar" or cmd == "/cal":
             await self._show_calendar()
 
@@ -2271,6 +2370,8 @@ class MeshTUI:
             print(f"  {self.CYAN}/watch, /w <node>{self.RESET}    - Live-stream agent activity (q/Esc to exit)")
             print(f"  {self.CYAN}/context, /ctx [n]{self.RESET} - Show your own recent context")
             print(f"  {self.CYAN}/view, /v <node|all>{self.RESET} - Filter to conversation or show all")
+            print(f"  {self.CYAN}/v sub:<agent>{self.RESET}     - In a channel view, show only that agent's messages")
+            print(f"  {self.CYAN}/v sub:all{self.RESET}         - Clear the sender filter")
             print(f"  {self.CYAN}/clear{self.RESET}            - Clear screen")
             print()
             print(f"{self.BOLD}Channels:{self.RESET}")
@@ -2287,6 +2388,23 @@ class MeshTUI:
             print(f"  {self.CYAN}/todo add <text> [--section name]{self.RESET} - Add a todo")
             print(f"  {self.CYAN}/todo done|start <n>{self.RESET} - Update todo status by visible number")
             print(f"  {self.CYAN}/calendar, /cal{self.RESET}    - Show today's calendar once")
+            print()
+            print(f"{self.BOLD}Autonomous fleet:{self.RESET}")
+            print(f"  {self.CYAN}/auto, /autopilot{self.RESET}  - Show enrolled auto projects, budgets, pending wakes")
+            print(f"  {self.CYAN}/wake, /step [project] [-- instructions]{self.RESET} - Schedule an immediate autonomous session")
+            print(f"  {self.DIM}    project inferred from the channel you are viewing when omitted{self.RESET}")
+            print(f"  {self.CYAN}/report [project] [since YYYY-MM-DD]{self.RESET} - Generate a PI LaTeX/PDF report")
+            print(f"  {self.DIM}    project inferred from the channel; boundary defaults to the prior report{self.RESET}")
+            print(f"  {self.CYAN}/auto wake <agent> [<project>] [<time>] [-- instructions]{self.RESET} - Schedule an autonomous session")
+            print(f"  {self.DIM}    omit the time to start immediately: /auto wake tron{self.RESET}")
+            print(f"  {self.DIM}    /auto wake <agent> <time>  - project inferred for single-project agents{self.RESET}")
+            print(f"  {self.DIM}    <project> may be bare (bluesky-rl) or prefixed (project:bluesky-rl){self.RESET}")
+            print(f"  {self.CYAN}/auto budget <project> <n>{self.RESET} - Set the per-day worker ceiling ({AUTONOMOUS_BUDGET_MIN}-{AUTONOMOUS_BUDGET_MAX})")
+            print(f"  {self.CYAN}/auto budget <project> reset{self.RESET} - Reset today's spent-worker count to zero")
+            print(f"  {self.CYAN}/auto active <project> on|off{self.RESET} - Arm/disarm automatic paced next-session wakes")
+            print(f"  {self.CYAN}/auto cancel <agent> <wake-id>{self.RESET} - Cancel a scheduled wake")
+            print(f"  {self.CYAN}/dossier, /dos [project]{self.RESET} - Open a project dossier in emacs")
+            print(f"  {self.DIM}    project inferred from the channel you are viewing when omitted{self.RESET}")
             print(f"  {self.CYAN}/cc-usage, /usage{self.RESET}  - Show Claude Code plan usage")
             print(f"  {self.CYAN}/quit, /q{self.RESET}         - Disconnect")
             print()
@@ -2312,6 +2430,7 @@ class MeshTUI:
                 if 0 <= idx < len(self._recent_conversations):
                     partner = self._recent_conversations[idx]
                     self.current_view = partner
+                    self.view_sender_filter = None  # Switching views always resets the sender filter
                     self.default_target = partner
                     self._clear_unread(partner)
                     view_name = get_display_name(partner)
@@ -2565,6 +2684,10 @@ class MeshTUI:
                         self._handle_scratchpad_response(content)
                     elif action == ControlAction.TODO_RESPONSE.value:
                         self._handle_todo_response(content)
+                    elif action == ControlAction.AUTONOMOUS_CONTROL_RESPONSE.value:
+                        self._handle_autonomous_control_response(
+                            content, msg.from_node, msg.in_reply_to
+                        )
                     elif action == ControlAction.CALENDAR_RESPONSE.value:
                         pass
                     elif action != "list_nodes":  # Don't show list_nodes responses here
@@ -3057,6 +3180,624 @@ class MeshTUI:
         else:
             self._print_prompt_hint()
 
+    # =========================================================================
+    # Autonomous-fleet control (/auto)
+    #
+    # Enrollment is read from mesh.yaml locally so the client can resolve
+    # "which agent owns this project" before it sends anything.  The router
+    # independently re-validates against the same config — the local read is a
+    # convenience, never the authorization.
+    # =========================================================================
+
+    def _enrolled_autonomous_agents(self) -> dict[str, dict]:
+        """Map ``node_id -> enrollment`` for every configured autonomous controller."""
+        enrolled: dict[str, dict] = {}
+        try:
+            config = load_config()
+        except Exception as e:
+            logger.error(f"Failed to load mesh config for /auto: {e}")
+            return enrolled
+        for node_id, node_config in config.nodes.items():
+            if not getattr(node_config, "autonomous_agent_mode_enabled", False):
+                continue
+            enrolled[node_id] = {
+                "node_id": node_id,
+                "nickname": getattr(node_config, "nickname", "") or "",
+                "projects": list(getattr(node_config, "autonomous_projects", []) or []),
+                "max_workers_per_session": getattr(
+                    node_config, "autonomous_max_workers_per_session", 2
+                ),
+            }
+        return enrolled
+
+    def _resolve_autonomous_agent(self, name: str) -> tuple[str | None, str | None]:
+        """Resolve an agent by node id or nickname. Returns ``(node_id, error)``."""
+        enrolled = self._enrolled_autonomous_agents()
+        if not enrolled:
+            return None, "No agents are enrolled in autonomous mode in mesh.yaml."
+        if name in enrolled:
+            return name, None
+        matches = [
+            node_id for node_id, info in enrolled.items()
+            if info["nickname"].lower() == name.lower()
+        ]
+        if len(matches) == 1:
+            return matches[0], None
+        if len(matches) > 1:
+            return None, f"'{name}' is ambiguous: {', '.join(sorted(matches))}"
+        known = ", ".join(
+            sorted(info["nickname"] or node_id for node_id, info in enrolled.items())
+        )
+        return None, f"Unknown autonomous agent '{name}'. Enrolled: {known}"
+
+    def _resolve_autonomous_project(self, project: str) -> tuple[str | None, str | None]:
+        """Find the enrolled agent that owns ``project``. Returns ``(node_id, error)``."""
+        key = project if project.startswith("project:") else f"project:{project}"
+        enrolled = self._enrolled_autonomous_agents()
+        owners = [
+            node_id for node_id, info in enrolled.items() if key in info["projects"]
+        ]
+        if len(owners) == 1:
+            return owners[0], None
+        if not owners:
+            known = sorted(
+                {p for info in enrolled.values() for p in info["projects"]}
+            )
+            return None, (
+                f"No enrolled agent owns {key}. "
+                f"Known projects: {', '.join(known) or '(none)'}"
+            )
+        return None, f"{key} is claimed by several agents: {', '.join(sorted(owners))}"
+
+    async def _send_autonomous_control(self, **kwargs) -> str | None:
+        """Send one control request. Returns its message id for correlation."""
+        if not self.node or not self.node._conn:
+            print(f"{self.RED}Not connected to router.{self.RESET}")
+            return None
+        msg = make_autonomous_control(self.node_id, **kwargs)
+        await self.node._conn.send(msg)
+        return msg.id
+
+    @staticmethod
+    def _autonomous_display_order(enrolled: dict[str, dict]) -> list[str]:
+        """Stable render order: alphabetical by nickname, node id as tie-break.
+
+        Nickname is what the operator types and reads, so the block stays in
+        the same order across runs even when mesh.yaml is reordered.
+        """
+        return sorted(
+            enrolled,
+            key=lambda node_id: (
+                (enrolled[node_id].get("nickname") or node_id).lower(),
+                node_id,
+            ),
+        )
+
+    def _parse_autonomous_wake_args(
+        self, agent: str, tokens: list[str]
+    ) -> tuple[str | None, str | None, str | None]:
+        """Split ``<project?> <time...>`` for ``/auto wake``.
+
+        Returns ``(project_key, wake_time, error)``.
+
+        The time is optional. When it is missing the wake is immediate, which is
+        expressed on the wire as the literal ``"now"`` — a value the agent's
+        ``parse_wake_time`` resolves to a few seconds out. That keeps the wire
+        contract (op=wake always carries a non-empty wake_time) intact.
+
+        The first token is a project only when it is unambiguously one — it is
+        ``project:``-prefixed, or ``project:<token>`` is a project key known
+        anywhere in the enrolled fleet. No time expression can collide with
+        either test, so the two-form grammar stays unambiguous and the old form
+        keeps working. Matching fleet-wide (not just against this agent) is what
+        makes a bare cross-owner project an error instead of silently becoming
+        the first word of the wake time.
+        """
+        enrolled = self._enrolled_autonomous_agents()
+        owned = list(enrolled.get(agent, {}).get("projects") or [])
+        fleet_projects = {p for info in enrolled.values() for p in info.get("projects") or []}
+
+        head = tokens[0] if tokens else ""
+        looks_like_project = bool(head) and (
+            head.startswith("project:") or f"project:{head}" in fleet_projects
+        )
+
+        if looks_like_project:
+            node_id, err = self._resolve_autonomous_project(head)
+            if err:
+                return None, None, err
+            key = head if head.startswith("project:") else f"project:{head}"
+            if node_id != agent:
+                return None, None, (
+                    f"{key} belongs to {node_id}, not {agent}. "
+                    f"{agent} owns: {', '.join(owned) or '(none)'}"
+                )
+            wake_time = " ".join(tokens[1:]).strip() or IMMEDIATE_WAKE_TIME
+            return key, wake_time, None
+
+        # No project named — infer it, but only when there is nothing to guess.
+        wake_time = " ".join(tokens).strip() or IMMEDIATE_WAKE_TIME
+        if len(owned) == 1:
+            return owned[0], wake_time, None
+        if not owned:
+            return None, None, (
+                f"{agent} is enrolled in autonomous mode but owns no projects; "
+                f"nothing to wake it on."
+            )
+        return None, None, (
+            f"{agent} owns {len(owned)} projects ({', '.join(owned) or 'none'}); "
+            f"name one: /auto wake <agent> <project> [<time>]"
+        )
+
+    async def _handle_wake_command(self, arg: str | None) -> None:
+        """``/wake`` and ``/step`` — start an autonomous session right now.
+
+        The project comes from the argument when there is one and otherwise
+        from the channel being viewed, so sitting in ``#rec-fishing`` and typing
+        ``/wake`` is enough. The owning controller is derived from the project,
+        which is why no agent name is ever typed here.
+        """
+        raw = arg or ""
+        head, _, extra = raw.partition("--")
+        slug = self._project_slug(head)
+        if not slug:
+            print(
+                f"{self.YELLOW}Usage: /wake [project] [-- instructions] — no "
+                f"project given and you are not viewing a channel.{self.RESET}"
+            )
+            return
+
+        key = f"project:{slug}"
+        agent, err = self._resolve_autonomous_project(key)
+        if err:
+            print(f"{self.RED}{err}{self.RESET}")
+            return
+
+        print(
+            f"{self.DIM}Kicking {get_display_name(agent)} on {key} now…{self.RESET}"
+        )
+        await self._send_autonomous_control(
+            op="wake",
+            agent=agent,
+            project=key,
+            wake_time=IMMEDIATE_WAKE_TIME,
+            prompt=extra.strip() or None,
+        )
+
+    async def _handle_report_command(self, arg: str | None) -> None:
+        """``/report [project] [since YYYY-MM-DD]`` — request one PI report."""
+        parts = (arg or "").split()
+        if len(parts) > 2:
+            print(
+                f"{self.YELLOW}Usage: /report [project] [since YYYY-MM-DD]"
+                f"{self.RESET}"
+            )
+            return
+
+        project_arg = ""
+        since: str | None = None
+        if len(parts) == 2:
+            project_arg, since = parts
+        elif len(parts) == 1:
+            # In a project channel, accept `/report 2026-08-01` as the
+            # omitted-project form. A project slug cannot be a valid date.
+            try:
+                datetime.strptime(parts[0], "%Y-%m-%d")
+            except ValueError:
+                project_arg = parts[0]
+            else:
+                since = parts[0]
+
+        slug = self._project_slug(project_arg)
+        if not slug:
+            print(
+                f"{self.YELLOW}Usage: /report [project] [since YYYY-MM-DD] — no "
+                f"project given and you are not viewing a channel.{self.RESET}"
+            )
+            return
+
+        key = f"project:{slug}"
+        agent, err = self._resolve_autonomous_project(key)
+        if err:
+            print(f"{self.RED}{err}{self.RESET}")
+            return
+
+        await self._send_autonomous_control(
+            op="report", agent=agent, project=key, since=since
+        )
+
+    async def _handle_auto_command(self, arg: str | None) -> None:
+        raw = arg or ""
+        parts = raw.split()
+        sub = parts[0].lower() if parts else ""
+
+        if not sub:
+            await self._start_autonomous_status_collection()
+            return
+
+        if sub == "wake":
+            # /auto wake <agent> [<project>] [<time...>] [-- extra instructions]
+            # Split on `--` before tokenizing so the extra instructions keep
+            # their original spacing. Omitting the time means "now".
+            head, _, extra = raw.partition("--")
+            head_parts = head.split()
+            if len(head_parts) < 2:
+                print(
+                    f"{self.YELLOW}Usage: /auto wake <agent> [<project>] [<time>] "
+                    f"[-- instructions]{self.RESET}"
+                )
+                return
+            agent, err = self._resolve_autonomous_agent(head_parts[1])
+            if err:
+                print(f"{self.RED}{err}{self.RESET}")
+                return
+            project, wake_time, err = self._parse_autonomous_wake_args(
+                agent, head_parts[2:]
+            )
+            if err:
+                print(f"{self.RED}{err}{self.RESET}")
+                return
+            await self._send_autonomous_control(
+                op="wake",
+                agent=agent,
+                project=project,
+                wake_time=wake_time or IMMEDIATE_WAKE_TIME,
+                prompt=extra.strip() or None,
+            )
+            return
+
+        if sub == "budget":
+            if len(parts) != 3:
+                print(
+                    f"{self.YELLOW}Usage: /auto budget <project> <n>|reset{self.RESET}"
+                )
+                return
+            agent, err = self._resolve_autonomous_project(parts[1])
+            if err:
+                print(f"{self.RED}{err}{self.RESET}")
+                return
+            key = parts[1] if parts[1].startswith("project:") else f"project:{parts[1]}"
+            if parts[2].lower() == "reset":
+                await self._send_autonomous_control(
+                    op="budget-reset", agent=agent, project=key
+                )
+                return
+            try:
+                count = int(parts[2])
+            except ValueError:
+                print(f"{self.RED}Budget must be an integer, got '{parts[2]}'.{self.RESET}")
+                return
+            if not (AUTONOMOUS_BUDGET_MIN <= count <= AUTONOMOUS_BUDGET_MAX):
+                print(
+                    f"{self.RED}Budget must be between {AUTONOMOUS_BUDGET_MIN} "
+                    f"and {AUTONOMOUS_BUDGET_MAX}.{self.RESET}"
+                )
+                return
+            await self._send_autonomous_control(
+                op="budget", agent=agent, project=key, count=count
+            )
+            return
+
+        if sub == "active":
+            if len(parts) != 3:
+                print(
+                    f"{self.YELLOW}Usage: /auto active <project> on|off{self.RESET}"
+                )
+                return
+            agent, err = self._resolve_autonomous_project(parts[1])
+            if err:
+                print(f"{self.RED}{err}{self.RESET}")
+                return
+            try:
+                value = parse_active_value(parts[2])
+            except ValueError:
+                print(
+                    f"{self.RED}Active must be on or off, got "
+                    f"'{parts[2]}'.{self.RESET}"
+                )
+                return
+            key = parts[1] if parts[1].startswith("project:") else f"project:{parts[1]}"
+            await self._send_autonomous_control(
+                op="active", agent=agent, project=key, value=value
+            )
+            return
+
+        if sub == "cancel":
+            if len(parts) != 3:
+                print(f"{self.YELLOW}Usage: /auto cancel <agent> <wake-id>{self.RESET}")
+                return
+            agent, err = self._resolve_autonomous_agent(parts[1])
+            if err:
+                print(f"{self.RED}{err}{self.RESET}")
+                return
+            await self._send_autonomous_control(
+                op="cancel", agent=agent, wake_id=parts[2]
+            )
+            return
+
+        print(f"{self.YELLOW}Unknown /auto subcommand '{sub}'. Try /help.{self.RESET}")
+
+    # -------------------------------------------------------------------------
+    # /auto status collector
+    #
+    # The fan-out is one request per enrolled controller, so the replies arrive
+    # independently and out of order.  Rather than render each as it lands (three
+    # blocks, interleaved with whatever else the channel is doing), the client
+    # correlates them by the request's message id and renders one ordered block
+    # when the last one arrives — or when the timeout fires, whichever is first.
+    # -------------------------------------------------------------------------
+
+    async def _start_autonomous_status_collection(self) -> None:
+        """Fan `op=status` out to every enrolled controller and collect the replies."""
+        enrolled = self._enrolled_autonomous_agents()
+        if not enrolled:
+            print(f"\n{self.YELLOW}No agents are enrolled in autonomous mode.{self.RESET}")
+            return
+        if self._auto_status_collector is not None:
+            print(f"{self.YELLOW}A /auto status query is already in flight.{self.RESET}")
+            return
+        if not self.node or not self.node._conn:
+            # Checked once up front so a fan-out does not print the same
+            # "not connected" line once per enrolled agent.
+            print(f"{self.RED}Not connected to router.{self.RESET}")
+            return
+
+        order = self._autonomous_display_order(enrolled)
+        collector: dict = {
+            "enrolled": enrolled,
+            "queried": [],        # node_ids actually sent to, in render order
+            "pending": {},        # message_id -> node_id
+            "responses": {},      # node_id -> response content
+            "done": asyncio.Event(),
+        }
+        self._auto_status_collector = collector
+
+        sent_any = False
+        for node_id in order:
+            message_id = await self._send_autonomous_control(op="status", agent=node_id)
+            if message_id:
+                collector["pending"][message_id] = node_id
+                collector["queried"].append(node_id)
+                sent_any = True
+
+        if not sent_any:
+            # Not connected — _send_autonomous_control already said so.
+            self._auto_status_collector = None
+            return
+
+        print(
+            f"\n{self.DIM}Querying {len(collector['pending'])} autonomous "
+            f"controller(s)…{self.RESET}"
+        )
+        # Held on the collector so the task is not garbage-collected mid-flight,
+        # and so tests can await the render deterministically.
+        collector["task"] = asyncio.create_task(
+            self._collect_autonomous_status(collector)
+        )
+
+    async def _collect_autonomous_status(self, collector: dict) -> None:
+        """Wait for the fan-out to complete (or time out), then render once."""
+        try:
+            await asyncio.wait_for(
+                collector["done"].wait(), timeout=AUTO_STATUS_TIMEOUT_SECS
+            )
+        except asyncio.TimeoutError:
+            pass
+        except Exception as e:  # pragma: no cover — defensive
+            logger.error(f"/auto status collection failed: {e}")
+        finally:
+            if self._auto_status_collector is collector:
+                self._auto_status_collector = None
+        self._render_autonomous_status_block(collector)
+
+    def _record_autonomous_status_response(
+        self, content: dict, in_reply_to: str | None
+    ) -> bool:
+        """Route a response into the active collector. True if it was consumed."""
+        collector = self._auto_status_collector
+        if not collector or not in_reply_to:
+            return False
+        node_id = collector["pending"].pop(in_reply_to, None)
+        if node_id is None:
+            return False
+        collector["responses"][node_id] = content
+        if not collector["pending"]:
+            collector["done"].set()
+        return True
+
+    def _render_autonomous_status_block(self, collector: dict) -> None:
+        """Render the consolidated, ordered fleet status block."""
+        enrolled = collector["enrolled"]
+        queried = collector["queried"]
+        responses = collector["responses"]
+        total = len(queried)
+        got = len(responses)
+
+        print(f"\n{self.BOLD}Autonomous fleet ({got} of {total} responded):{self.RESET}")
+        for node_id in queried:
+            content = responses.get(node_id)
+            if content is None:
+                display = get_display_name(node_id)
+                print(
+                    f"\n  {self.MAGENTA}{self.BOLD}{display}{self.RESET} "
+                    f"{self.YELLOW}· no response (timed out){self.RESET}"
+                )
+                continue
+            self._render_autonomous_status_agent(content, node_id, enrolled.get(node_id))
+
+        missing = [n for n in queried if n not in responses]
+        if missing:
+            names = ", ".join(get_display_name(n) for n in missing)
+            print(
+                f"\n  {self.YELLOW}({got} of {total} agents responded — "
+                f"timed out after {AUTO_STATUS_TIMEOUT_SECS:g}s waiting for: {names}){self.RESET}"
+            )
+        self._print_prompt_hint()
+
+    def _render_autonomous_status_agent(
+        self, content: dict, node_id: str, enrollment: dict | None = None
+    ) -> None:
+        """Render one agent's sub-section of the fleet status block."""
+        display = get_display_name(content.get("agent") or node_id)
+        result = content.get("result") if isinstance(content.get("result"), dict) else {}
+
+        if not content.get("accepted", False):
+            # A router rejection (offline / unenrolled) lands here — it belongs
+            # inline in the block, not as a separate error line.
+            error = content.get("error") or result.get("error") or "unreachable"
+            print(
+                f"\n  {self.MAGENTA}{self.BOLD}{display}{self.RESET} "
+                f"{self.RED}· {error}{self.RESET}"
+            )
+            if enrollment and enrollment.get("projects"):
+                print(
+                    f"    {self.DIM}configured: "
+                    f"{', '.join(enrollment['projects'])}{self.RESET}"
+                )
+            return
+
+        projects = result.get("autonomous_projects") or []
+        per_session = result.get("autonomous_max_workers_per_session")
+        enabled = result.get("autonomous_agent_mode_enabled", True)
+        enabled_note = "" if enabled else f" {self.YELLOW}· DISABLED{self.RESET}"
+        print(
+            f"\n  {self.MAGENTA}{self.BOLD}{display}{self.RESET} "
+            f"{self.DIM}· {len(projects)} project(s) · "
+            f"{per_session} worker(s)/session{self.RESET}{enabled_note}"
+        )
+        if result.get("session_in_progress"):
+            current_session = result.get("current_session") or {}
+            session_id = current_session.get("session_id") or "?"
+            project_key = current_session.get("project_key") or "?"
+            print(
+                f"    {self.CYAN}● session in progress{self.RESET}: "
+                f"session {session_id} on {project_key}"
+            )
+        budgets = result.get("budgets") or {}
+        active = result.get("active") or {}
+        for key in projects:
+            budget = budgets.get(key) or {}
+            # Absent for an agent running pre-active-mode code — render nothing
+            # rather than claiming the project is disarmed.
+            if key in active:
+                flag = (
+                    f" {self.GREEN}· ACTIVE{self.RESET}"
+                    if active[key]
+                    else f" {self.DIM}· manual{self.RESET}"
+                )
+            else:
+                flag = ""
+            if budget.get("error"):
+                print(f"    {key}  {self.YELLOW}budget unavailable: {budget['error']}{self.RESET}{flag}")
+                continue
+            print(
+                f"    {self.CYAN}{key}{self.RESET}  "
+                f"{budget.get('used', '?')}/{budget.get('limit', '?')} used today · "
+                f"{self.DIM}{budget.get('remaining', '?')} left · "
+                f"resets {budget.get('resets_at', '?')}{self.RESET}{flag}"
+            )
+        wakes = result.get("wakes") or []
+        if not wakes:
+            print(f"    {self.DIM}no pending wakes{self.RESET}")
+        for wake in wakes:
+            recurrence = wake.get("recurrence")
+            suffix = f" {self.DIM}({recurrence}){self.RESET}" if recurrence else ""
+            print(
+                f"    {self.GREEN}{wake.get('id', '?')}{self.RESET} "
+                f"{wake.get('wake_time_local', wake.get('wake_time_utc', '?'))}{suffix}"
+            )
+            preview = (wake.get("prompt_preview") or "").splitlines()
+            if preview:
+                print(f"      {self.DIM}{preview[0]}{self.RESET}")
+
+    def _handle_autonomous_control_response(
+        self, content: dict, from_node: str, in_reply_to: str | None = None
+    ) -> None:
+        """Render an autonomous-control result as scrollback lines.
+
+        Status replies belonging to an in-flight `/auto` fan-out are swallowed
+        here and rendered later as one consolidated block.
+        """
+        op = content.get("op", "?")
+        agent = content.get("agent") or from_node
+        display = get_display_name(agent)
+        result = content.get("result") if isinstance(content.get("result"), dict) else {}
+
+        if op == "status" and self._record_autonomous_status_response(content, in_reply_to):
+            return
+
+        if not content.get("accepted", False):
+            error = content.get("error") or result.get("error") or "rejected"
+            print(f"\n{self.RED}✗ /auto {op} ({display}): {error}{self.RESET}")
+            self._print_prompt_hint()
+            return
+
+        if op == "status":
+            # A late or unsolicited status reply — render it standalone.
+            self._render_autonomous_status_agent(content, agent)
+        elif op == "wake":
+            print(
+                f"\n{self.GREEN}✓ Wake {result.get('wake_id', '?')} scheduled on "
+                f"{display} for {result.get('wake_time_local', '?')}{self.RESET}"
+            )
+            print(
+                f"  {self.DIM}{result.get('project', '?')} · up to "
+                f"{result.get('max_workers_this_session', '?')} worker(s) this session{self.RESET}"
+            )
+        elif op == "cancel":
+            print(
+                f"\n{self.GREEN}✓ Cancelled {result.get('cancelled_id', '?')} on "
+                f"{display}{self.RESET} "
+                f"{self.DIM}(was scheduled for {result.get('was_scheduled_for', '?')}){self.RESET}"
+            )
+        elif op == "budget":
+            budget = result.get("budget") or {}
+            verb = "Set" if result.get("changed") else "Unchanged —"
+            print(
+                f"\n{self.GREEN}✓ {verb} {result.get('project', '?')} daily worker "
+                f"ceiling: {budget.get('limit', '?')}{self.RESET}"
+            )
+            print(
+                f"  {self.DIM}used {budget.get('used', '?')} · "
+                f"{budget.get('remaining', '?')} remaining · "
+                f"resets {budget.get('resets_at', '?')}{self.RESET}"
+            )
+        elif op == "budget-reset":
+            budget = result.get("budget") or {}
+            print(
+                f"\n{self.GREEN}✓ Reset {result.get('project', '?')} daily spent-worker "
+                f"count{self.RESET}"
+            )
+            print(
+                f"  {self.DIM}used {budget.get('used', '?')}/{budget.get('limit', '?')} · "
+                f"{budget.get('remaining', '?')} remaining · "
+                f"resets {budget.get('resets_at', '?')}{self.RESET}"
+            )
+        elif op == "active":
+            on = bool(result.get("active"))
+            state = f"{self.GREEN}ACTIVE{self.RESET}" if on else f"{self.YELLOW}off{self.RESET}"
+            verb = "Set" if result.get("changed") else "Unchanged —"
+            print(
+                f"\n{self.GREEN}✓ {verb} {result.get('project', '?')} active mode: "
+                f"{self.RESET}{state}"
+            )
+            if on:
+                budget = result.get("budget") or {}
+                print(
+                    f"  {self.DIM}next session self-schedules at closeout while "
+                    f"budget remains ({budget.get('remaining', '?')} left), paced "
+                    f"{result.get('gap_minutes', '?')} min apart{self.RESET}"
+                )
+            else:
+                print(
+                    f"  {self.DIM}sessions must be scheduled with "
+                    f"/auto wake{self.RESET}"
+                )
+        else:
+            print(f"\n{self.DIM}[auto:{op}] {json.dumps(result, default=str)}{self.RESET}")
+
+        self._print_prompt_hint()
+
     async def _handle_todo_command(self, arg: str) -> None:
         conv_id = self._get_current_conversation_id()
         if not conv_id:
@@ -3163,6 +3904,117 @@ class MeshTUI:
         print(
             f"{self.YELLOW}Usage: /todo [panel|list|add|start|done|reopen|status|edit|rm|clear-done]{self.RESET}"
         )
+
+    def _project_slug(self, arg: str) -> Optional[str]:
+        """Bare project slug from an argument or the current view, else None.
+
+        An explicit argument wins and is accepted in either form. Otherwise the
+        channel being viewed names the project: channels and project slugs share
+        a namespace (``#rec-fishing`` ↔ ``project:rec-fishing``).
+        """
+        slug = (arg or "").strip().split()[0] if (arg or "").strip() else ""
+        if not slug and self.current_view and self.current_view.startswith("channel:"):
+            slug = self.current_view.split(":", 1)[1]
+        if slug.startswith("project:"):
+            slug = slug[len("project:"):]
+        return slug or None
+
+    def _dossier_slug(self, arg: str) -> Optional[str]:
+        """Project slug for ``/dossier [project]``, or None if unresolvable."""
+        return self._project_slug(arg)
+
+    def _dossier_editor_plan(self, path: Path) -> tuple[Optional[list[str]], str]:
+        """How to open *path* in a visible emacs here, or ``(None, "")``.
+
+        Emacs needs somewhere to draw. Under tmux that is a new tmux window,
+        which the tmux server owns — so it outlives the TUI and needs no
+        DISPLAY, which is what makes this work over SSH. With a graphical
+        display it is a frame: ``emacsclient`` reuses a running server and
+        ``-a emacs`` starts a standalone GUI Emacs when there is none.
+
+        With neither, there is nowhere to draw and the caller must say so
+        rather than launch an editor that dies unseen.
+        """
+        if os.environ.get("TMUX"):
+            return (
+                [
+                    "tmux",
+                    "new-window",
+                    "-c",
+                    str(path.parent),
+                    "emacs",
+                    "-nw",
+                    str(path),
+                ],
+                "a new tmux window",
+            )
+        if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+            return (["emacsclient", "-n", "-a", "emacs", str(path)], "emacs")
+        return (None, "")
+
+    def _handle_dossier_command(self, arg: str) -> None:
+        """Open a project dossier in emacs without blocking the TUI."""
+        from mesh.project_dossier import DossierError, dossier_path
+
+        slug = self._dossier_slug(arg)
+        if not slug:
+            print(
+                f"{self.YELLOW}Usage: /dossier [project] — no project given and "
+                f"you are not viewing a channel.{self.RESET}"
+            )
+            return
+
+        try:
+            path = dossier_path(f"project:{slug}")
+        except DossierError as e:
+            print(f"{self.YELLOW}{e}{self.RESET}")
+            return
+
+        if not path.exists():
+            print(f"{self.YELLOW}No dossier for project:{slug} at {path}{self.RESET}")
+            return
+
+        argv, where = self._dossier_editor_plan(path)
+        if argv is None:
+            print(
+                f"{self.YELLOW}No tmux session and no display — nowhere to open "
+                f"an Emacs frame from here.{self.RESET}"
+            )
+            print(f"{self.DIM}The dossier is at {path} — open it with: emacs {path}{self.RESET}")
+            return
+
+        try:
+            if argv[0] == "tmux":
+                # tmux returns as soon as the window exists, so waiting costs
+                # nothing and turns a silent failure into a reported one.
+                result = subprocess.run(
+                    argv, capture_output=True, text=True, timeout=10
+                )
+                if result.returncode != 0:
+                    detail = (result.stderr or result.stdout or "").strip()
+                    print(
+                        f"{self.RED}Could not open {path}: tmux exited "
+                        f"{result.returncode}{f' — {detail}' if detail else ''}{self.RESET}"
+                    )
+                    return
+            else:
+                subprocess.Popen(
+                    argv,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+        except FileNotFoundError:
+            print(f"{self.YELLOW}{argv[0]} not found — dossier is at {path}{self.RESET}")
+            return
+        except subprocess.TimeoutExpired:
+            print(f"{self.RED}Timed out asking tmux to open {path}{self.RESET}")
+            return
+        except OSError as e:
+            print(f"{self.RED}Could not open {path}: {e}{self.RESET}")
+            return
+
+        print(f"{self.DIM}Opening {path} in {where}{self.RESET}")
 
     def _calendar_account_events(self, account: str, date_str: str) -> list[dict]:
         """Fetch one account's events for the calendar panel."""
@@ -3561,7 +4413,7 @@ def cli():
         help="Quiet mode: suppress presence messages and desktop notifications"
     )
     # Legacy positional argument for backwards compatibility
-    parser.add_argument("node_id", nargs="?", help="Legacy: Node ID (e.g., user:yourname)")
+    parser.add_argument("node_id", nargs="?", help="Legacy: Node ID (e.g., user:operator)")
     args = parser.parse_args()
 
     # Determine nickname

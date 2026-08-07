@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 from typing import Any
 
@@ -34,6 +35,13 @@ AGENT_LOCAL_TOOLS = {
     "send_message", "channel_list", "channel_members",
     "schedule_wake", "schedule_list", "schedule_cancel",
     "agent_shutdown", "mesh_status", "agent_status",
+    # Curation mutations must traverse AgentNode's scoped dispatcher so they
+    # retain the turn capability and pre-commit validation boundary.
+    "entity_create", "entity_merge", "entity_edit",
+    "entity_group_create", "entity_group_member_add",
+    "entity_group_member_remove",
+    "entity_link_correct", "essay_edit", "digest_edit",
+    "entity_backfill",
 }
 
 # MCP schema for send_message (always injected, even if not in the local registry)
@@ -48,7 +56,7 @@ SEND_MESSAGE_SCHEMA = {
         "properties": {
             "to": {
                 "type": "string",
-                "description": "Target node ID (e.g., 'user:yourname', 'agent:coder:sobek'). Use 'channel:general' for broadcast.",
+                "description": "Target node ID (e.g., 'user:operator', 'agent:coder:worker'). Use 'channel:general' for broadcast.",
             },
             "content": {
                 "type": "string",
@@ -272,11 +280,18 @@ class MCPServer:
         """Route a tool call to agent_node.py via Unix domain socket."""
         import aiohttp
         try:
+            payload: dict[str, Any] = {"name": name, "arguments": arguments}
+            capability = os.environ.get("MESH_EXECUTION_CAPABILITY", "")
+            if capability:
+                payload["capability"] = capability
+            worker_id = os.environ.get("MESH_WORKER_ID", "")
+            if worker_id:
+                payload["worker_id"] = worker_id
             connector = aiohttp.UnixConnector(path=self.agent_socket_path)
             async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.post(
                     "http://localhost/tool",
-                    json={"name": name, "arguments": arguments},
+                    json=payload,
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
                     data = await resp.json()

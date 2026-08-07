@@ -18,6 +18,11 @@ from . import file_edit  # noqa: F401
 from . import phase_complete  # noqa: F401
 from . import grep  # noqa: F401
 from . import find_files  # noqa: F401
+from . import get_context  # noqa: F401
+# A fold subprocess opts into a stricter replacement for file_read/file_edit/
+# file_write through PEV_FOLD_TOOL_MODE.  Import this last so its registrations
+# win the normal harness/legacy name collisions only in that subprocess.
+from . import fold_files  # noqa: F401
 
 HARNESS_TOOLS = [
     "apply_patch",
@@ -28,6 +33,7 @@ HARNESS_TOOLS = [
     "phase_complete",
     "grep",
     "find_files",
+    "get_context",
 ]
 
 PLANNER_TOOLS = [
@@ -35,6 +41,7 @@ PLANNER_TOOLS = [
     "list_dir",
     "grep",
     "find_files",
+    "get_context",
 ]
 
 MESH_READ_ONLY_TOOLS = frozenset({

@@ -67,8 +67,8 @@ class TestIsAtMentioned:
         assert is_at_mentioned("@bob", ["bob"]) is True
 
     def test_nickname_with_hyphen(self):
-        """Nicknames like 'claude-sobek' should work."""
-        assert is_at_mentioned("@claude-sobek help", ["claude-sobek"]) is True
+        """Hyphenated nicknames should work."""
+        assert is_at_mentioned("@claude-coder help", ["claude-coder"]) is True
 
     def test_no_match_without_at_symbol(self):
         """Without @, even an exact match shouldn't trigger."""
@@ -87,7 +87,7 @@ class TestIsNicknamedMention:
         assert is_nicknamed_mention("hey claude can you help", ["claude"]) is True
 
     def test_nickname_mention_substring(self):
-        assert is_nicknamed_mention("claude-sobek is online", ["claude"]) is True
+        assert is_nicknamed_mention("claude-coder is online", ["claude"]) is True
 
     def test_nickname_no_match(self):
         assert is_nicknamed_mention("what do you think", ["claude", "alice"]) is False

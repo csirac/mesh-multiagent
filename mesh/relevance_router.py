@@ -75,6 +75,10 @@ class RelevanceRouter:
         if self._client is None:
             llm_config = LLMConfig.from_env(backend=self.config.backend)
             llm_config.model = self.config.model
+            if self.config.base_url is not None:
+                llm_config.base_url = self.config.base_url
+            if self.config.api_key is not None:
+                llm_config.api_key = self.config.api_key
             self._client = LLMClient(llm_config)  # node_id not needed — only calls complete(), no subprocesses
         return self._client
 
@@ -143,18 +147,13 @@ class RelevanceRouter:
             response = await client.complete(
                 prompt=prompt,
                 temperature=0.0,  # Deterministic scoring
-                max_tokens=100,
+                max_tokens=self.config.max_tokens,
             )
 
             return self._parse_response(response)
         except Exception as e:
-            logger.warning(f"Relevance router LLM call failed: {e}, defaulting to relevant")
-            # Default to relevant on error - better to process than drop
-            return RelevanceResult(
-                score=1.0,
-                reason=f"LLM call failed, passing through: {e}",
-                bypassed=True,
-            )
+            logger.error(f"Relevance router LLM classification failed: {e}")
+            raise
 
     def _build_prompt(
         self,
@@ -218,15 +217,22 @@ class RelevanceRouter:
 {display_content}
 
 Rate from 0-10 whether this agent should respond:
-- 10: Agent is directly addressed (e.g., @{self.agent_nickname}, hey {self.agent_nickname}, {self.agent_nickname}:)
-- 9-10: The new message is a DIRECT FOLLOW-UP to this agent's most recent response (marked [THIS AGENT] above)
-- 8-9: Clear continuation of a conversation thread this agent was participating in
-- 6-7: Topic matches agent's role AND no one else responded yet
-- 3-5: Tangentially related, but another agent or no response may be better
-- 1-2: General chatter, observation, or rhetorical - no response needed
-- 0: Addressed to someone else, or completely outside agent's domain
+- 10: @all or @everyone appears anywhere in the message; this is a universal channel trigger.
+- 10: Agent is directly addressed (e.g., @{self.agent_nickname}, hey {self.agent_nickname}, {self.agent_nickname}:). Direct address wins even if the topic is outside the agent's usual role.
+- 9-10: User follow-up to this agent's most recent response (marked [THIS AGENT]), especially asking for more work.
+- 8-9: Clear continuation of a thread this agent was participating in.
+- 6-8: Broadcast greetings or open invitations from a user (e.g., "hello everyone", "can someone check this"). Multiple agents may independently answer the original broadcast.
+- 6-7: Topic matches agent's role and no one else is clearly assigned.
+- 3-5: Tangentially related; another agent or no response may be better.
+- 1-2: Short acknowledgment/reply/status from another agent that is not addressed to this agent; it closes the conversational turn.
+- 0: Addressed to someone else, outside agent's domain, or an agent-to-agent acknowledgment with no new request.
 
-IMPORTANT: If the most recent message in the conversation was from [THIS AGENT], and the new message looks like a follow-up question or acknowledgment, score 9-10.
+Turn rules:
+- Score the NEW MESSAGE. Use Recent Conversation only to decide whether it is an original broadcast, a follow-up to this agent, or a reply/ack to someone else.
+- User broadcast/open requests are first-level invitations; score them 6-8 even if multiple agents may answer.
+- Other-agent short replies like "morning", "agreed", "thanks", "done", or status-only updates are terminal replies; score 0-2 unless they directly ask this agent to act.
+- A reference is not a direct address. "alice already checked it" or "bob was right" should score 0-2 for alice/bob unless it asks them a new question/task.
+- User follow-up after [THIS AGENT] should score 9-10. Avoid acknowledgment loops.
 
 Respond with a single line: SCORE: <0-10> REASON: <brief explanation>"""
 
@@ -237,7 +243,8 @@ Respond with a single line: SCORE: <0-10> REASON: <brief explanation>"""
         response = response.strip()
 
         # Try to parse "SCORE: X REASON: Y" format
-        score_match = re.search(r'SCORE:\s*(\d+(?:\.\d+)?)', response, re.IGNORECASE)
+        score_matches = list(re.finditer(r'SCORE:\s*(\d+(?:\.\d+)?)', response, re.IGNORECASE))
+        score_match = score_matches[-1] if score_matches else None
         reason_match = re.search(r'REASON:\s*(.+)$', response, re.IGNORECASE)
 
         if score_match:

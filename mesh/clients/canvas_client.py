@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 TOKEN_FILE = os.path.join(
     __import__("pwd").getpwuid(os.getuid()).pw_dir, ".mesh", "canvas_token.json"
 )
-DEFAULT_BASE_URL = "https://canvas.tamu.edu"
+DEFAULT_BASE_URL = "https://canvas.example.edu"
 
 
 class CanvasClient:

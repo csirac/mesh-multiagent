@@ -1,0 +1,51 @@
+schema_version: 1
+id: model-service-recovery
+version: 1
+status: proposed
+owner_agent: example-agent
+purpose: Recover a verified local model service after confirming its identity.
+triggers:
+  - model service is unavailable
+preconditions:
+  - key: service
+    operator: present
+    value: ""
+    aliases: []
+    required: true
+authority:
+  reads: allowed
+  file_write: explicit_user_request
+  external_publish: explicit_user_request
+  destructive_actions: forbidden
+required_invariants:
+  - Confirm the requested service identity before any restart.
+  - Preserve the configured deployment topology.
+verification:
+  - Inspect service health and the local model endpoint after recovery.
+rollback:
+  description: Restore the previously recorded service configuration if the new launch fails.
+  source: version control
+procedure_source:
+  - kind: documentation
+    path: docs/operations/model-service.md
+    approved_fingerprint: null
+evidence: []
+proposed_by:
+  mechanism: public_example
+  agent: example-agent
+  fold_round: null
+  run_id: example
+  proposed_at: null
+caveats:
+  trace_assessment: no_trace
+  pitfalls:
+    - No deployment-specific procedure is included in this public example.
+  unverified_steps:
+    - Replace the example probes with environment-specific verification.
+  unexplored_alternatives:
+    - Consider a read-only diagnosis before restarting a service.
+approved_by: null
+approved_at: null
+supersedes_version: null
+last_reviewed_at: null
+outcomes: []

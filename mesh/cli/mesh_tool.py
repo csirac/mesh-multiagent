@@ -84,6 +84,10 @@ CLI_TOOLS = frozenset({
     # Standing digest
     "digest_get",
     "digest_edit",
+    # Interpretive essays
+    "essay_get",
+    "essay_list",
+    "essay_edit",
     # History (raw conversation history; executes locally — reads the
     # calling agent's history file via MESH_NODE_ID, no socket needed)
     "history_search",
@@ -95,6 +99,8 @@ CLI_TOOLS = frozenset({
     "todo_remove",
     "todo_reorder",
     "todo_set_section_order",
+    "conversation_notes_get",
+    "conversation_notes_set",
     # Maps
     "map_get",
     "map_list",
@@ -110,13 +116,27 @@ CLI_TOOLS = frozenset({
     "channel_members",
     # Messaging
     "send_message",
+    "send_report",
     # Utility
     "current_time",
     "tool_help",
+    # Local delegated executor and academic writing
+    "mesh_qwen",
+    "recursive_harness",
+    "style_filter",
+    "math_thinking",
+    # Writing worker support tools
+    "get_context",
+    "count_words",
+    "write_lines",
     # Finance (read-only)
     "plaid_link_status",
     "plaid_accounts",
     "plaid_transactions",
+    # Devices
+    "boox_upload",
+    # Security
+    "security_scan",
     # Quota
     "synthetic_quota",
     "claude_code_usage",
@@ -128,6 +148,11 @@ CLI_TOOLS = frozenset({
     "schedule_list",
     # Personality
     "personality_get",
+    # One-shot recursive autonomous-controller pilots.  Routed to the owning
+    # agent, which refuses unless autonomous_recursive_controller_enabled is
+    # set on that agent (plan §10.3 — the ReAct loop is the controller, and a
+    # second planner must not compete with it).
+    "autonomous_controller_run",
     # Canvas LMS
     "canvas_auth_status",
     "canvas_list_courses",
@@ -154,10 +179,12 @@ CLI_TOOLS = frozenset({
     "worker_stop",
 })
 
-# Tools whose registered handler is a placeholder — they need the agent's
-# Unix socket to actually execute (the agent intercepts and routes them).
+# Tools that require the calling agent's Unix socket, either because their
+# registered handler is a placeholder or because per-agent authority must be
+# enforced in the owning agent process.
 AGENT_ROUTED_TOOLS = {
     "send_message",
+    "send_report",
     "mesh_status",
     "agent_status",
     "channel_list",
@@ -183,6 +210,20 @@ AGENT_ROUTED_TOOLS = {
     "todo_remove",
     "todo_reorder",
     "todo_set_section_order",
+    "conversation_notes_get",
+    "conversation_notes_set",
+    "autonomous_controller_run",
+    "mesh_qwen",
+    "recursive_harness",
+    "style_filter",
+    "math_thinking",
+    # Per-agent memory artifacts.  The CLI subprocess has no initialized
+    # memory/digest globals, so these must execute in the owning agent.
+    "digest_get",
+    "digest_edit",
+    "essay_get",
+    "essay_edit",
+    "essay_list",
 }
 
 
@@ -215,14 +256,30 @@ async def _call_agent_socket(
     """Route a tool call to the running agent via its Unix socket."""
     import aiohttp
     payload: dict[str, Any] = {"name": name, "arguments": arguments}
+    capability = os.environ.get("MESH_EXECUTION_CAPABILITY", "")
+    if capability:
+        payload["capability"] = capability
+    worker_id = os.environ.get("MESH_WORKER_ID", "")
+    if worker_id:
+        payload["worker_id"] = worker_id
     if account:
         payload["account"] = account
     connector = aiohttp.UnixConnector(path=socket_path)
+    if name == "autonomous_controller_run":
+        total_timeout = 3000
+    elif name == "recursive_harness":
+        # One invocation may contain several bounded local ReAct phases.
+        total_timeout = 9000
+    elif name in {"style_filter", "math_thinking", "mesh_qwen"}:
+        # Both tools run one bounded local ReAct loop for prose.
+        total_timeout = 930
+    else:
+        total_timeout = 30
     async with aiohttp.ClientSession(connector=connector) as session:
         async with session.post(
             "http://localhost/tool",
             json=payload,
-            timeout=aiohttp.ClientTimeout(total=30),
+            timeout=aiohttp.ClientTimeout(total=total_timeout),
         ) as resp:
             data = await resp.json()
             return data.get("result", json.dumps(data))
@@ -266,9 +323,20 @@ def _find_agent_socket() -> str | None:
 # ---------------------------------------------------------------------------
 
 def _print_tool_list(registry) -> None:
-    """Print all available CLI tools with one-line descriptions."""
+    """Print all available CLI tools with one-line descriptions.
+
+    Every name in ``CLI_TOOLS`` must appear somewhere in this listing.  Workers
+    discover their tool surface by running ``mesh-tool`` with no arguments, so a
+    callable tool that is missing from the output is invisible in practice --
+    that is exactly how ``send_report`` went unnoticed and workers silently
+    skipped the completion contract.  Any tool not placed in a curated category
+    below is collected into "Other" rather than dropped.
+    """
     # Group by category
     categories = {
+        # First: the worker completion contract.  A dispatched worker reads this
+        # listing to find out how to report back, so it leads.
+        "Worker Reporting": ["send_report", "worker_stop"],
         "Gmail": ["gmail_list_recent", "gmail_list_unread", "gmail_search_emails",
                   "gmail_list_from_date", "gmail_get_email",
                   "gmail_send_message", "gmail_reply_to",
@@ -283,12 +351,18 @@ def _print_tool_list(registry) -> None:
         "Memory": ["memory_search", "memory_get", "memory_list", "memory_add",
                    "memory_edit", "memory_delete", "history_search"],
         "Digest": ["digest_get", "digest_edit"],
+        "Essays": ["essay_list", "essay_get", "essay_edit"],
         "Todos": ["todo_list", "todo_add", "todo_update", "todo_toggle",
                   "todo_remove", "todo_reorder", "todo_set_section_order"],
+        "Conversation Notes": ["conversation_notes_get", "conversation_notes_set"],
         "Maps": ["map_get", "map_list", "map_edit", "map_create",
                  "map_review", "set_project_context"],
         "Mesh": ["mesh_list", "mesh_status", "agent_status",
-                 "channel_list", "channel_members", "send_message"],
+                 "channel_list", "channel_members", "send_message",
+                 "autonomous_controller_run"],
+        "Delegation & Composition": ["mesh_qwen", "recursive_harness",
+                                     "style_filter", "math_thinking"],
+        "Writing Worker": ["get_context", "count_words", "write_lines"],
         "Canvas": ["canvas_auth_status", "canvas_list_courses", "canvas_list_students",
                    "canvas_get_student", "canvas_list_assignments", "canvas_list_submissions",
                    "canvas_get_grades", "canvas_list_announcements",
@@ -300,10 +374,20 @@ def _print_tool_list(registry) -> None:
                    "canvas_create_page", "canvas_update_page",
                    "canvas_upload_file"],
         "Finance": ["plaid_link_status", "plaid_accounts", "plaid_transactions"],
+        "Devices": ["boox_upload"],
+        "Security": ["security_scan"],
         "Utility": ["current_time", "tool_help", "synthetic_quota",
                      "claude_code_usage", "account_get_current", "account_list",
-                     "schedule_list", "personality_get"],
+                     "account_set_current", "schedule_list", "personality_get"],
     }
+
+    # Structural backstop: anything callable but uncategorized still gets shown.
+    # Without this, adding a name to CLI_TOOLS and forgetting the categories dict
+    # makes the tool undiscoverable even though it dispatches fine.
+    categorized = {name for names in categories.values() for name in names}
+    uncategorized = sorted(CLI_TOOLS - categorized)
+    if uncategorized:
+        categories["Other"] = uncategorized
 
     print("mesh-tool — shell access to mesh tools\n")
     print(f"  MESH_NODE_ID = {os.environ.get('MESH_NODE_ID', '(not set)')}\n")

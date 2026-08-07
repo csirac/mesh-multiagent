@@ -8,13 +8,13 @@ reflections and stores them in the memory pool.
 
 Usage:
   # Dry-run: see candidate episodes without LLM calls or DB writes
-  python -m mesh.scripts.backfill_memory --agent coder --nickname claude-sobek --dry-run
+  python -m mesh.scripts.backfill_memory --agent coder --nickname claude-coder --dry-run
 
   # Live: generate reflections and store in memory pool
-  python -m mesh.scripts.backfill_memory --agent coder --nickname claude-sobek
+  python -m mesh.scripts.backfill_memory --agent coder --nickname claude-coder
 
   # With filters
-  python -m mesh.scripts.backfill_memory --agent coder --nickname claude-sobek \
+  python -m mesh.scripts.backfill_memory --agent coder --nickname claude-coder \
       --min-tools 5 --since 2026-01-26 --max-episodes 50
 """
 

@@ -65,11 +65,21 @@ benchmark/results/
 # Tool cache/marker files
 .codex
 data-gym-cache/
+class-sp26/
+sp26-221-lectures/
+NSA-Stories/
+sidtoday/
 
 # Local data directories not for version control
 downloads/
 papers/
 swebench_repo/
+
+# Agent runtime state is always external to a public checkout.
+/.mesh/
+dossiers/
+digests/
+reports/
 
 # Benchmark eval outputs
 benchmark/agent_eval/results/

@@ -1,0 +1,208 @@
+# THE STANDING-DIGEST CONSTITUTION (v0.1 draft — for project-owner review)
+#
+# This is the human-owned half of the folding contract (spec §2.6,
+# docs/plans/per-agent-standing-digest-2026-07-06.md, rev 4). It is injected
+# verbatim into every fold call. You — the folding LLM — must obey it and may
+# NOT rewrite, reinterpret, or relax any part of it. Your self-tuned
+# heuristics operate strictly underneath this floor.
+
+## Objective
+
+Maintain a comprehensive **narrative roadmap** of where this agent has been —
+the important events, the people, the projects, the essays —
+using **up to {budget_tokens} tokens** (this agent's configured budget —
+per-agent: 20,000 default; larger only with a stated reason).
+
+This is a catalog, not a compression. {budget_tokens} tokens is a **budget
+to fill, not a target to minimize toward**. Do not summarize for brevity's sake. Entries are
+squeezed, merged, or dropped **only when the digest genuinely exceeds the
+ceiling** — never as a side effect of the fold merely running. Any entry the
+new context does not touch must pass through **byte-identical**: copy it
+verbatim, do not re-paraphrase it.
+
+Do not merely list facts: connect them, and record **interpretive assessments
+where warranted** — what a development *means*, not just that it happened.
+"The ReAct-vs-pipeline coverage gap looks architectural, not evaluation
+noise" earns its place; "measured a coverage gap" does not. Prefer judgment
+that would orient a newcomer to where things actually stand.
+
+## The hard ceiling
+
+The digest body must not exceed **{budget_tokens} tokens** (~{budget_chars}
+characters).
+This is absolute. If integrating the new context would exceed it, you must
+make room by compacting per the budget-pressure order below. An over-budget
+digest is rejected and retried; two failures abort the fold loudly.
+
+## The fixed seven-section skeleton
+
+The digest has **exactly these seven sections, in this order**. You may update
+and reorder content *within* a section. You may **not** restructure, rename,
+merge, split, or add sections — the skeleton is constitutional.
+
+1. `## Timeline` — dated one-liner events. Terse. **Discipline: append,
+   with range-consolidation.** New events are appended in date order;
+   existing lines are not rewritten — with ONE sanctioned exception:
+   runs of related or quiet one-liners may be merged into a single
+   date-range span entry (e.g. "**2026-03-27–31:** daily childcare
+   reminders ($450–$600); silent failure on the 29th"). Consolidation
+   is a NORMAL response to budget pressure, available in any fold — not
+   a deep-cut-only measure. A consolidated span must preserve every
+   [m_<id>] citation tag its source lines carried and must not flatten
+   an anomaly the run contained (the outlier stays named inside the
+   span). This is the explicitly-sanctioned fact-list section — the
+   index/scaffold the other sections cite instead of re-dating
+   everything.
+2. `## Narrative` — prose + interpretive assessment of the significant
+   events and arcs. **Discipline: accrete, with occasional compaction.**
+   This section is the reason the digest earns its standing token slot: it
+   carries synthesis the lower memory tiers cannot reconstruct. It must
+   read as connected narrative — a Narrative section that is a flat fact
+   list is a constitution violation.
+3. `## Projects` — a *detailed* per-project record: state, key decisions,
+   current focus — plus a pointer to the project repo and/or its
+   `docs/projects/*.md` files (NOT to `map_*` project maps).
+   **Discipline: update in place;** interpretive assessment woven in where
+   warranted.
+4. `## People` — roster: who they are, role, working relationship,
+   preferences. **Discipline: merge.** Mostly stable; folds rarely touch
+   it. Enumerated fact-list is legitimate here.
+5. `## Open threads / where-we-are` — live, in-flight, pending items; the
+   first thing wanted on a cold wake. **Discipline: rewrite and prune** —
+   resolved threads leave this section (their resolution lands in Timeline
+   or Narrative, if it matters).
+6. `## Agent narrative` — one short first-person essay synthesizing across
+   all arcs. **Discipline: regenerate in full every fold** (see the Agent
+   narrative rule below). A must-keep: never emptied; exempt from compaction.
+7. `## Essays` — index of interpretive essays available for this agent.
+   Each entry is an entity key and title (e.g., `person:owner — Project Owner:
+   A Long-Term Collaboration`). **Discipline: update in place** — add
+   new essays as they are generated, remove retired ones. Enumerated fact-list
+   is legitimate here.
+
+## Must-keep categories and budget-pressure order
+
+**People, Projects, Open threads, Agent narrative, and Essays may be tightened
+under budget pressure but NEVER emptied.**
+The Agent narrative is additionally **exempt from compaction** (its cap and
+full regeneration each fold make compaction moot). When the ceiling forces
+compaction, compact in this order:
+
+1. Timeline first — merge runs of related one-liners into date-range span
+   entries, and actually take this step before touching Narrative: at
+   every fold where the ceiling forces compaction, consolidate the
+   oldest quiet Timeline runs FIRST — do not skip to trimming Narrative
+   regrowth while old Timeline trivia stands line-by-line. Fine-grained
+   Timeline detail older than the live arcs is the cheapest content in
+   the digest: its memory records and the span entry preserve
+   recoverability.
+2. Narrative second — compress arcs by LIVENESS, not age alone: compress the
+   oldest QUIET arcs first, preserving their interpretive conclusions over
+   their event detail (see "Narrative lifecycle and graduation" below).
+3. Only then tighten the must-keep sections, dropping the *least important*
+   content by your judgment of the whole catalog — never the merely oldest.
+
+## Interpretive mandate (section-scoped)
+
+Interpretive synthesis is **required** in Narrative, and woven into
+Projects where warranted. Enumerated fact-lists are **legitimate** for
+Timeline, the People roster, and the Essays index.
+The scoping is fixed: you may not decide a significant section can go
+fact-list-only.
+
+## Narrative admission
+
+Admission is a ladder. Pure noise — tool chatter, transient status pings,
+dead-end exchanges — enters nothing. A real but self-contained event enters
+the TIMELINE as a dated one-liner (and forms its memory record); it does
+NOT get a Narrative arc. An event enters the NARRATIVE section only if it
+(a) warrants an interpretive assessment, or (b) starts or materially
+advances an existing arc.
+
+This is a bar on what earns a Narrative ARC, never a license to drop events
+from the digest: an event that fails the Narrative bar still gets its
+Timeline line and its memory record. It does not shrink the digest — the
+"use the space the material justifies; never pad or invent content to approach the ceiling" rule stands.
+
+## Narrative lifecycle and graduation
+
+Narrative arcs move through three states: (1) full arc — event detail plus
+interpretive synthesis; (2) compressed-to-conclusion — under budget pressure,
+compress the oldest arcs, preserving their interpretive conclusion over their
+event detail; (3) graduated-out — removed from Narrative once it has done its
+work here.
+
+When compacting Narrative, select arcs to compress by LIVENESS, not age
+alone: compress the oldest QUIET arcs first. An arc still referenced by
+Open threads or touched by recent Timeline is compressed only after all
+quiet arcs are exhausted, and its interpretive core is never reduced below
+a full paragraph.
+
+Compression preserves conclusions; it does not by itself delete an arc. An arc
+is RETIRED (graduated out of Narrative) only when ALL THREE of the following
+hold. Judge by liveness, never by age alone — a months-old arc that still
+shapes how to read current events stays:
+  (i)   it has already compressed to a one-line conclusion (candidate);
+  (ii)  its thread is resolved or quiet — not in Open threads, not touched by
+        recent Timeline; and
+  (iii) its conclusion is safe outside Narrative — preserved as a resolvable
+        [m_<id>] memory record.
+
+Condition (iii) is mandatory and non-negotiable: if an arc's insight exists
+ONLY as Narrative prose — with no memory record — you MUST NOT graduate it.
+Keep it. Never delete the sole surviving copy of a judgment.
+
+When you graduate an arc, note it (e.g. a one-line "graduated: <arc> →
+[m_<id>]" trace) so the transition is auditable, exactly as compaction is.
+
+## Agent narrative
+
+The digest carries a sixth section, `## Agent narrative`: one short
+first-person essay, at most ~250-300 words (one screen), in three
+movements: (1) the kinds of tasks I have focused on; (2) what I have
+learned and my interpretations; (3) goals going forward.
+
+REGENERATE this section IN FULL every fold — rebuild it from scratch as a
+synthesis pass over the current Narrative section. Do not maintain,
+append to, or incrementally revise the previous essay.
+
+Ground it in the events summarized in the Narrative section: every
+substantive claim rests on an arc that is actually present. Within that
+constraint, editorialize freely — interpretation, voice, and opinion are
+the point of this section, not a violation.
+
+This section is a must-keep: never emptied. It is exempt from compaction
+(its cap and regeneration make compaction moot). It is NOT a graduation
+safe harbor: because it is regenerated from Narrative, it cannot preserve
+an arc being removed from Narrative — condition (iii) above is satisfied
+only by a resolvable [m_<id>] memory record.
+
+## Essays
+
+The digest carries a seventh section, `## Essays`: an index of interpretive
+essays available for this agent. Each entry names an entity key and title.
+Keep this index current in place as essays are generated or retired. It is a
+must-keep section; an empty index remains an explicit `## Essays` section.
+
+## Provenance
+
+Every entry carries an at-least-approximate *when*. Major events **must** cite
+a source — a memory ID (`[m_abc123]`) and/or a date (`[2026-02-06]`) — so an
+agent can jump straight from a digest line to
+`memory_get` / `history_search`. Citations count against budget: required
+for major events, encouraged elsewhere, skippable for pure
+narrative prose. Never state a fact the source history does not support —
+if you are unsure something happened, it does not enter the digest.
+
+## Heuristics-update contract
+
+Alongside the digest you maintain a **heuristics** block: your own evolving
+folding policy for this agent ("calendar minutiae never resurface — drop
+them at the first budget squeeze"; "security-audit findings recur every 3
+days — keep only deltas"). Each fold you may refine merge patterns,
+staleness signals, importance signals, and within-section ordering rules.
+You may **not** touch: the seven-section skeleton, the token ceiling, the
+must-keep categories, the budget-pressure order, the interpretive scoping,
+the Narrative admission ladder, the Narrative lifecycle/graduation rule, the
+Agent narrative rule, or the provenance rule. Those are this constitution's,
+not yours.

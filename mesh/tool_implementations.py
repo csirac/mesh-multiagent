@@ -17,12 +17,29 @@ Tools are organized into categories:
 
 from __future__ import annotations
 
+import asyncio
+from collections import deque
+import contextlib
+import contextvars
+import hashlib
 import json
+import logging
+import math
 import os
 from pathlib import Path
+import pwd
+import re
+import signal
+import shutil
+import subprocess
+import sys
+import time
 from typing import Any, Optional
+import uuid
 
 from .tools import tool, ToolParameter, get_registry
+
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # Client singletons (lazy initialization)
@@ -32,10 +49,13 @@ _bash_tools = None
 _bash_working_directory = None  # Working directory for bash commands
 _memory_system = None  # MemorySystem singleton, set by AgentNode on init
 _memory_search_mode = "hybrid"  # default search mode, set from agent config
+_standing_digest_path = ""  # digest path, set by AgentNode on init
 _exa_client = None
 _tool_host = None
 _browser_client = None
 _scholar_client = None
+
+# Ephemeral process-supervisor state.  This intentionally belongs to the
 
 # Sandbox settings (module-level, set by agent_node)
 _sandboxed: bool = False
@@ -62,6 +82,165 @@ def configure_sandbox(
     _bash_tools = None
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Phase 2B — isolation context for module-level tool implementations
+# ─────────────────────────────────────────────────────────────────────
+#
+# Tool implementations in this module are free functions invoked by the
+# registry with only their declared arguments, so there is no call-site to
+# thread a policy through.  AgentNode installs the active policy here instead.
+#
+# Two layers, deliberately:
+#   * a process global, matching the existing ``configure_sandbox`` pattern,
+#     for the ordinary one-agent-per-process deployment;
+#   * a ContextVar override that wins when set, so a test process (or future
+#     multi-agent host) can run two policies without leaking one into the
+#     other.  This is the concurrency risk the plan flags for this module.
+#
+# Both default to ``None`` = "no policy" = today's exact behaviour.
+
+_isolation_policy = None            # type: ignore[var-annotated]
+_isolation_state_paths = None       # type: ignore[var-annotated]
+_ISOLATION_CTX_UNSET = object()
+_ISOLATION_CTX: "contextvars.ContextVar[object]" = contextvars.ContextVar(
+    "mesh_tool_isolation", default=_ISOLATION_CTX_UNSET
+)
+
+
+def configure_isolation(policy=None, state_paths=None) -> None:
+    """Install the active isolation policy for module-level tool functions.
+
+    Called by :class:`AgentNode` during initialization.  Passing ``None``
+    (the default) clears the policy, which restores the legacy fast path — the
+    reset matters because a test process constructs many agents in sequence and
+    an enabled policy must not survive into the next one.
+    """
+    global _isolation_policy, _isolation_state_paths, _bash_working_directory, _bash_tools
+    previous_policy = _isolation_policy
+    _isolation_policy = policy if (policy is not None and policy.enabled) else None
+    _isolation_state_paths = state_paths if _isolation_policy is not None else None
+    # A cwd selected before isolation was installed must not survive as the
+    # shell's implicit starting point.  The disabled path deliberately leaves
+    # it untouched.
+    if _isolation_policy is not None:
+        _bash_working_directory = str(_isolation_policy.workspace)
+    elif previous_policy is not None:
+        _bash_working_directory = None
+    # Cached BashTools captures sandbox, network, scratch, and policy settings
+    # at construction time.  It must never outlive a policy transition.
+    _bash_tools = None
+
+
+def current_isolation():
+    """Return ``(policy, state_paths)`` for this call, or ``(None, None)``.
+
+    One ContextVar read plus one global read on the disabled path; no
+    filesystem work and no allocation.
+    """
+    scoped = _ISOLATION_CTX.get()
+    if scoped is not _ISOLATION_CTX_UNSET:
+        return scoped
+    return _isolation_policy, _isolation_state_paths
+
+
+def _current_worker_scope():
+    """The frozen scope to hand a worker subprocess launched from this call.
+
+    Derived from the active policy, or recovered from the environment when
+    this process is itself an isolated child (a nested PEV phase), so a scope
+    can be narrowed by the parent but never lost on the way down.
+    """
+    from .isolation import WorkerIsolationScope
+
+    policy, _ = current_isolation()
+    scope = WorkerIsolationScope.from_policy(policy)
+    if scope.enabled:
+        return scope
+    return WorkerIsolationScope.from_env()
+
+
+@contextlib.contextmanager
+def isolation_context(policy=None, state_paths=None):
+    """Temporarily scope the isolation policy to the current context."""
+    active = (
+        (policy, state_paths)
+        if (policy is not None and policy.enabled)
+        else (None, None)
+    )
+    token = _ISOLATION_CTX.set(active)
+    try:
+        yield
+    finally:
+        _ISOLATION_CTX.reset(token)
+
+
+def _scratch_dir(policy, state_paths) -> "Path | None":
+    """The agent's private scratch directory, created on demand."""
+    if policy is None:
+        return None
+    scratch = (
+        state_paths.tmp_dir if state_paths is not None else policy.scratch_dir
+    )
+    scratch = Path(scratch)
+    try:
+        scratch.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    # The directory is writable by the isolated agent.  If it was replaced
+    # with a symlink to a host path, it must stop being the scratch exception.
+    if not policy.contains(scratch):
+        return None
+    return scratch
+
+
+def _enforce_isolation_path(resolved: "Path", original: str, require_write: bool) -> None:
+    """Apply the isolation boundary to an already-resolved path.
+
+    No-op when no policy is installed, which is every agent today.  When a
+    policy *is* installed this is the single decision point behind both
+    ``_validate_path`` and ``_resolve_path`` so the two cannot drift.
+
+    Raises:
+        PermissionError: escape, protected state, or read-only violation.
+    """
+    policy, state_paths = current_isolation()
+    if policy is None:
+        return
+
+    from .isolation import is_path_contained
+
+    scratch = _scratch_dir(policy, state_paths)
+    if scratch is not None and is_path_contained(resolved, (scratch,)):
+        # Scratch is inside a workspace root and inside state_root; allow it
+        # before the protected-state check rather than after.
+        if require_write and not policy.writable:
+            raise PermissionError(
+                f"Cannot write to '{original}': isolation filesystem_mode is "
+                f"'{policy.filesystem_mode.value}'."
+            )
+        return
+
+    if not policy.contains(resolved):
+        op = "write to" if require_write else "access"
+        roots = ", ".join(str(p) for p in policy.workspaces)
+        raise PermissionError(
+            f"Cannot {op} '{original}': resolves to {resolved}, which is outside "
+            f"this agent's isolation boundary. Allowed roots: {roots}"
+        )
+
+    if policy.is_protected_state(resolved):
+        raise PermissionError(
+            f"Cannot access '{original}': {resolved} is protected agent state. "
+            f"Use the typed memory/digest/history tools instead of raw file access."
+        )
+
+    if require_write and not policy.writable:
+        raise PermissionError(
+            f"Cannot write to '{original}': isolation filesystem_mode is "
+            f"'{policy.filesystem_mode.value}'."
+        )
+
+
 def _validate_path(path: str, require_write: bool = False) -> str:
     """
     Validate and resolve a path against sandbox restrictions.
@@ -81,6 +260,11 @@ def _validate_path(path: str, require_write: bool = False) -> str:
     expanded = _rp(path)
     resolved = Path(expanded).resolve()
 
+    # Isolation boundary is checked first and independently of the legacy
+    # sandbox flag: an isolated agent is bounded whether or not `sandboxed`
+    # was ever set. No-op when no policy is installed.
+    _enforce_isolation_path(resolved, path, require_write)
+
     if not _sandboxed:
         return str(resolved)
 
@@ -93,25 +277,73 @@ def _validate_path(path: str, require_write: bool = False) -> str:
         except ValueError:
             continue
 
-    # Also allow /tmp
-    try:
-        resolved.relative_to(Path("/tmp").resolve())
-        return str(resolved)
-    except ValueError:
-        pass
+    # Also allow /tmp — but only for an unisolated agent. Under an enabled
+    # policy the host tmp is a shared, world-writable escape hatch; the
+    # private scratch directory above replaces it.
+    if _isolation_allows_host_tmp():
+        try:
+            resolved.relative_to(Path("/tmp").resolve())
+            return str(resolved)
+        except ValueError:
+            pass
 
     if require_write:
         raise PermissionError(
             f"Path '{path}' is not in allowed directories. "
-            f"Allowed: {_allowed_dirs + ['/tmp']}"
+            f"Allowed: {_allowed_dirs + _host_tmp_suffix()}"
         )
     else:
         # For read operations, we're more permissive but still log
         # Actually, let's be consistent - sandbox means sandbox
         raise PermissionError(
             f"Path '{path}' is not in allowed directories. "
-            f"Allowed: {_allowed_dirs + ['/tmp']}"
+            f"Allowed: {_allowed_dirs + _host_tmp_suffix()}"
         )
+
+
+def _isolation_allows_host_tmp() -> bool:
+    """Whether the implicit host ``/tmp`` allowance still applies."""
+    policy, _ = current_isolation()
+    return policy is None
+
+
+def _host_tmp_suffix() -> list[str]:
+    """The ``/tmp`` entry in sandbox error messages, when it still applies."""
+    return ["/tmp"] if _isolation_allows_host_tmp() else []
+
+
+def _validated_attachment_paths(
+    attachments: list | None,
+    tool_name: str,
+) -> list | None:
+    """Canonicalize file-bearing attachment arguments under isolation.
+
+    Gmail opens these paths in its client layer, outside the ordinary raw-file
+    helpers.  Returning the original object on the disabled fast path preserves
+    the legacy call exactly; enabled callers receive a shallow copy whose paths
+    are the canonical paths that were actually authorized.
+    """
+    policy, _ = current_isolation()
+    if policy is None or attachments is None:
+        return attachments
+    if not isinstance(attachments, list):
+        raise PermissionError(f"{tool_name} attachments must be a list")
+
+    validated: list = []
+    for index, item in enumerate(attachments):
+        if not isinstance(item, dict) or not str(item.get("path") or "").strip():
+            raise PermissionError(
+                f"{tool_name} attachment {index} must contain a non-empty path"
+            )
+        original = str(item["path"])
+        from .paths import resolve_path as _rp
+
+        resolved = Path(_rp(original)).resolve()
+        _enforce_isolation_path(resolved, original, require_write=False)
+        copied = dict(item)
+        copied["path"] = str(resolved)
+        validated.append(copied)
+    return validated
 
 
 def _get_bash_tools():
@@ -119,13 +351,20 @@ def _get_bash_tools():
     global _bash_tools
     if _bash_tools is None:
         from .clients.bash_tools import BashTools
+        policy, state_paths = current_isolation()
+        # Phase 4: an enabled policy always runs its shell inside bwrap. The
+        # legacy `_sandboxed` flag stays the only switch for unisolated
+        # agents, so nothing changes for the fleet running with isolation off.
         _bash_tools = BashTools(
             user_confirm=False,  # No CLI confirmation in mesh context
             timeout_sec=30.0,
             max_output_chars=100000,
-            sandboxed=_sandboxed,
+            sandboxed=_sandboxed or policy is not None,
             allowed_dirs=_allowed_dirs,
             allow_network=_allow_network,
+            isolation_policy=policy,
+            workdir=(str(policy.workspace) if policy is not None else None),
+            scratch_dir=str(_scratch_dir(policy, state_paths) or "") or None,
         )
     return _bash_tools
 
@@ -344,13 +583,25 @@ def schedule_cancel(wake_id: str) -> str:
     ],
 )
 def set_working_directory(path: str) -> str:
-    """Set the working directory for bash commands."""
+    """Set the working directory for bash commands.
+
+    Under an enabled isolation policy the target must resolve inside a
+    declared workspace root: otherwise this tool is a one-call escape, since
+    every later relative path in ``_resolve_path`` is joined against it.
+    Symlinks are resolved before the check, so a link inside the workspace
+    pointing out of it is rejected too.
+    """
     global _bash_working_directory
     from .paths import resolve_path as _rp
     expanded = _rp(path)
 
     if not os.path.isdir(expanded):
         return json.dumps({"error": f"Directory does not exist: {path}"})
+
+    try:
+        _enforce_isolation_path(Path(expanded).resolve(), path, require_write=False)
+    except PermissionError as exc:
+        return json.dumps({"error": str(exc)})
 
     _bash_working_directory = os.path.abspath(expanded)
     return json.dumps({"working_directory": _bash_working_directory})
@@ -415,6 +666,958 @@ def bash_exec(command: str, timeout: float = 30) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
+# Local-Qwen simple-code executor. This deliberately uses the clean-room
+# harness rather than a one-shot completion: callers delegate an atomic code
+# subtask and Qwen gets its own bounded inspect → edit → test ReAct loop. Its
+# model, endpoint, prompt, toolset, and thinking controls come from the named
+# backend in backends.yaml rather than a second hard-coded configuration.
+_MESH_QWEN_BACKEND = "mesh-harness-qwen"
+_MESH_QWEN_TIMEOUT_SECS = 3600
+_MESH_QWEN_MAX_ITERS = 500
+_MESH_QWEN_MAX_TOKENS = 16_384
+_MESH_QWEN_SYNTHESIS_GRACE_SECS = 120
+_MESH_QWEN_STDOUT_TAIL_BYTES = 2 * 1024 * 1024
+_MESH_QWEN_STDERR_TAIL_BYTES = 256 * 1024
+_MESH_QWEN_RETURNED_EVENT_TAIL_CHARS = 64 * 1024
+
+
+def _mesh_qwen_result_from_jsonl(stdout: str) -> tuple[str, dict[str, Any], list[str]]:
+    """Extract terminal or latest partial output and fatal diagnostics."""
+    final_text = ""
+    usage: dict[str, Any] = {}
+    errors: list[str] = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        event_type = event.get("type")
+        data = event.get("data") or {}
+        if event_type == "thread.finished":
+            terminal_text = str(data.get("final_text") or "")
+            if terminal_text:
+                final_text = terminal_text
+            usage = data.get("usage") or {}
+        elif event_type == "assistant.message":
+            assistant_text = str(data.get("text") or "")
+            if assistant_text:
+                final_text = assistant_text
+        elif event_type == "usage" and isinstance(data, dict):
+            usage = data
+        elif event_type == "error" and data.get("fatal", True):
+            errors.append(str(data.get("message") or "unknown harness error"))
+    return final_text, usage, errors
+
+
+def _mesh_qwen_event_tail(stdout: str) -> str:
+    """Return a bounded recent JSONL tail for hard-timeout recovery."""
+    tail = "\n".join(stdout.splitlines()[-30:])
+    if len(tail) > _MESH_QWEN_RETURNED_EVENT_TAIL_CHARS:
+        tail = tail[-_MESH_QWEN_RETURNED_EVENT_TAIL_CHARS:]
+    return tail
+
+
+def _mesh_qwen_work_deadline(timeout: int) -> tuple[int, int]:
+    """Reserve synthesis time inside the caller's absolute timeout."""
+    grace = min(
+        _MESH_QWEN_SYNTHESIS_GRACE_SECS,
+        max(5, timeout // 10),
+    )
+    return max(1, timeout - grace), grace
+
+
+async def _collect_capped_stream(
+    stream: asyncio.StreamReader | None,
+    *,
+    max_bytes: int,
+) -> bytes:
+    """Drain a subprocess stream while retaining only its newest bytes."""
+    if stream is None:
+        return b""
+    chunks: deque[bytes] = deque()
+    retained = 0
+    while True:
+        chunk = await stream.read(64 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        retained += len(chunk)
+        while chunks and retained > max_bytes:
+            excess = retained - max_bytes
+            first = chunks[0]
+            if len(first) <= excess:
+                retained -= len(chunks.popleft())
+            else:
+                chunks[0] = first[excess:]
+                retained -= excess
+    return b"".join(chunks)
+
+
+async def _feed_process_stdin(
+    writer: asyncio.StreamWriter | None,
+    payload: bytes,
+) -> None:
+    """Write one prompt and close stdin without buffering child output."""
+    if writer is None:
+        return
+    try:
+        writer.write(payload)
+        await writer.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+    finally:
+        writer.close()
+        wait_closed = getattr(writer, "wait_closed", None)
+        if wait_closed is not None:
+            try:
+                await wait_closed()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+
+async def _kill_process_group(process: asyncio.subprocess.Process) -> None:
+    """Kill the dedicated harness process group and reap the child."""
+    if process.returncode is not None:
+        return
+    pid = getattr(process, "pid", None)
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            process.kill()
+    else:
+        process.kill()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+    except asyncio.TimeoutError:
+        logger.error("Timed out reaping mesh_qwen process after SIGKILL")
+
+
+def _mesh_codex_result_from_jsonl(stdout: str) -> tuple[str, dict[str, Any], list[str]]:
+    """Extract a terminal response from Codex's ``exec --json`` event stream."""
+    text_blocks: list[str] = []
+    usage: dict[str, Any] = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "cached_input_tokens": 0,
+    }
+    errors: list[str] = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        event_type = event.get("type")
+        if event_type in ("turn.completed", "turn_complete"):
+            event_usage = event.get("usage") or {}
+            if isinstance(event_usage, dict):
+                for name in usage:
+                    usage[name] += int(event_usage.get(name) or 0)
+        elif event_type == "agent_message":
+            message = event.get("message")
+            if isinstance(message, str) and message.strip():
+                text_blocks.append(message.strip())
+        elif event_type in ("item.completed", "item_completed"):
+            item = event.get("item") or {}
+            if isinstance(item, dict) and item.get("type") in (None, "agent_message"):
+                text = item.get("text")
+                if isinstance(text, str) and text.strip():
+                    text_blocks.append(text.strip())
+        elif event_type == "error":
+            detail = event.get("message") or event.get("error") or "unknown Codex error"
+            errors.append(str(detail))
+    return "\n\n".join(text_blocks), usage, errors
+
+
+async def _run_mesh_qwen_codex(
+    *,
+    task: str,
+    cwd: str,
+    delegated_task: str,
+    llm_config: Any,
+    timeout: int,
+) -> str:
+    """Run a configured Codex backend as a PEV phase worker.
+
+    Codex already owns its native ReAct loop, so wrapping it in
+    ``mesh.harness exec`` would be both redundant and unsupported.  This keeps
+    the same JSON envelope as mesh_qwen while pinning Codex to the PEV cwd.
+    """
+    from .isolation import (
+        build_codex_isolation_args,
+        codex_home_dir,
+        strip_codex_broadening_args,
+    )
+
+    # Phase 3: prefer the scope the caller pinned onto the backend config, and
+    # fall back to the module-level policy this process was configured with so
+    # a nested PEV phase cannot silently drop it.  Both are disabled today.
+    configured_scope = getattr(llm_config, "isolation_scope", None)
+    inherited_scope = _current_worker_scope()
+    if inherited_scope.enabled:
+        if configured_scope is not None and configured_scope.enabled:
+            if configured_scope != inherited_scope:
+                return json.dumps({
+                    "status": "error",
+                    "task": task,
+                    "error": (
+                        "configured Codex scope differs from the inherited "
+                        "worker isolation scope"
+                    ),
+                })
+        scope = inherited_scope
+    else:
+        scope = configured_scope or inherited_scope
+    if scope.enabled:
+        from .isolation import assert_cwd_in_scope
+
+        try:
+            cwd = assert_cwd_in_scope(scope, cwd)
+        except PermissionError as exc:
+            return json.dumps({"status": "error", "task": task, "error": str(exc)})
+
+    codex_binary = llm_config.codex_binary or shutil.which("codex") or "codex"
+    command = [
+        codex_binary,
+        "exec",
+        "-",
+        "-m",
+        llm_config.model,
+        "--ephemeral",
+        "--json",
+        "-C",
+        cwd,
+        "--skip-git-repo-check",
+    ]
+    extra_args = list(llm_config.codex_extra_args or [])
+    if scope.enabled:
+        # Same builder as LLMClient._complete_codex so the two Codex launch
+        # paths cannot drift apart.
+        command.extend(build_codex_isolation_args(scope, extra_args))
+        extra_args = strip_codex_broadening_args(extra_args)
+    elif not any(arg == "--sandbox" or arg.startswith("--sandbox=") for arg in extra_args):
+        command.append("--dangerously-bypass-approvals-and-sandbox")
+    if llm_config.cc_effort:
+        command.extend(["-c", f'model_reasoning_effort="{llm_config.cc_effort}"'])
+    command.extend(extra_args)
+
+    env = os.environ.copy()
+    real_home = pwd.getpwuid(os.getuid()).pw_dir
+    env["HOME"] = (
+        codex_home_dir(scope, create=True) if scope.enabled else real_home
+    )
+    repo_root = Path(__file__).resolve().parent.parent
+    env["PATH"] = (
+        f"{repo_root}:{real_home}/.local/share/node-v22/bin:{real_home}/.local/bin:"
+        f"{env.get('PATH', '')}"
+    )
+    # Keep the worker launch path consistent with LLMClient._complete_codex:
+    # a configured Codex provider may require endpoint/auth overrides.
+    if llm_config.codex_env:
+        env.update(llm_config.codex_env)
+    if scope.enabled:
+        env["HOME"] = codex_home_dir(scope, create=True)
+        env.pop("CODEX_HOME", None)
+    env.update(scope.to_env())
+    started = time.monotonic()
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+            env=env,
+            start_new_session=True,
+        )
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            process.communicate(delegated_task.encode("utf-8")), timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        if "process" in locals() and process.returncode is None:
+            process.kill()
+            await process.wait()
+        return json.dumps({
+            "status": "error",
+            "task": task,
+            "cwd": cwd,
+            "error": f"Codex phase exceeded {timeout} seconds",
+        })
+    except OSError as exc:
+        return json.dumps({"status": "error", "error": f"failed to start Codex: {exc}"})
+
+    stdout = stdout_bytes.decode("utf-8", errors="replace")
+    stderr = stderr_bytes.decode("utf-8", errors="replace")
+    final_text, usage, errors = _mesh_codex_result_from_jsonl(stdout)
+    if process.returncode != 0 and not errors:
+        errors.append(f"Codex exited {process.returncode}")
+    if not final_text and not errors:
+        errors.append("Codex returned no final report")
+    return json.dumps({
+        "status": "ok" if process.returncode == 0 and final_text and not errors else "error",
+        "task": task,
+        "cwd": cwd,
+        "exit_code": process.returncode,
+        "elapsed_secs": round(time.monotonic() - started, 3),
+        "final_text": final_text,
+        "usage": usage,
+        "errors": errors,
+        "stderr_tail": "\n".join(stderr.splitlines()[-30:]),
+    }, ensure_ascii=False)
+
+
+@tool(
+    name="mesh_qwen",
+    description=(
+        "Execute one subtask through a bounded harness ReAct loop. Launches a subprocess "
+        "through the configured backend (mesh-harness, codex, or direct API) to inspect, "
+        "edit, and test files in cwd. Accepts one task and returns a structured result. "
+        "Useful for delegating narrow subtasks from orchestrators like pev_harness or "
+        "recursive_harness."
+    ),
+    parameters=[
+        ToolParameter(
+            name="task", type="string", required=True,
+            description=(
+                "Self-contained subtask with concrete success criteria. Avoid broad "
+                "architecture tasks; decompose first then pass narrow, verifiable work."
+            ),
+        ),
+        ToolParameter(
+            name="cwd", type="string", required=True,
+            description="Absolute working directory containing the files Qwen may inspect and edit.",
+        ),
+        ToolParameter(
+            name="max_iters", type="integer", required=False,
+            default=_MESH_QWEN_MAX_ITERS,
+            description="Maximum ReAct iterations (default controlled by the backend's config cap).",
+        ),
+        ToolParameter(
+            name="max_tokens", type="integer", required=False, default=16384,
+            description="Maximum completion tokens per turn (default controlled by the backend's config cap).",
+        ),
+        ToolParameter(
+            name="timeout_secs", type="integer", required=False,
+            default=_MESH_QWEN_TIMEOUT_SECS,
+            description="Wall-clock execution limit in seconds (default controlled by the backend's config cap).",
+        ),
+    ],
+)
+async def mesh_qwen(
+    task: str,
+    cwd: str,
+    max_iters: int = _MESH_QWEN_MAX_ITERS,
+    max_tokens: int = _MESH_QWEN_MAX_TOKENS,
+    timeout_secs: int = _MESH_QWEN_TIMEOUT_SECS,
+    _delegated_prompt: str | None = None,
+    _include_trace: bool = False,
+    _backend_name: str | None = None,
+    _tools: str | None = None,
+    _require_write: bool = True,
+    _node_id: str = "mesh-qwen-subworker",
+    _max_iters_override: int | None = None,
+    _max_tokens_override: int | None = None,
+    _timeout_override: int | None = None,
+    _thinking_budget_override: int | None = None,
+) -> str:
+    """Run one subtask through a configured harness ReAct loop.
+
+    This is the general-purpose harness subprocess launcher. It spans mesh-harness
+    exec, codex exec, and direct API backends based on backend config.  Private
+    arguments let internal orchestrators (pev_harness, recursive_harness) reuse
+    the same subprocess machinery with an alternative backend, narrower tool
+    surface, or relaxed resource caps.
+    """
+    if not isinstance(task, str) or not task.strip():
+        return json.dumps({"status": "error", "error": "task must be a non-empty string"})
+    if not isinstance(cwd, str) or not cwd.strip():
+        return json.dumps({"status": "error", "error": "cwd must be an absolute directory path"})
+    backend_name = (_backend_name or _MESH_QWEN_BACKEND).strip()
+    if not backend_name:
+        return json.dumps({"status": "error", "error": "backend name must be non-empty"})
+    try:
+        resolved_cwd = _validate_path(cwd, require_write=_require_write)
+    except (OSError, PermissionError) as exc:
+        return json.dumps({"status": "error", "error": f"invalid cwd: {exc}"})
+    if not os.path.isabs(cwd) or not os.path.isdir(resolved_cwd):
+        return json.dumps({"status": "error", "error": "cwd must be an existing absolute directory"})
+    try:
+        iterations = int(max_iters)
+        output_tokens = int(max_tokens)
+        timeout = int(timeout_secs)
+    except (TypeError, ValueError):
+        return json.dumps({"status": "error", "error": "max_iters, max_tokens, and timeout_secs must be integers"})
+    _max_iters = _max_iters_override if _max_iters_override is not None else _MESH_QWEN_MAX_ITERS
+    _max_tokens = _max_tokens_override if _max_tokens_override is not None else _MESH_QWEN_MAX_TOKENS
+    _max_timeout = _timeout_override if _timeout_override is not None else _MESH_QWEN_TIMEOUT_SECS
+    if not 1 <= iterations <= _max_iters:
+        return json.dumps({"status": "error", "error": f"max_iters must be between 1 and {_max_iters}"})
+    if not 256 <= output_tokens <= _max_tokens:
+        return json.dumps({"status": "error", "error": f"max_tokens must be between 256 and {_max_tokens}"})
+    if not 30 <= timeout <= _max_timeout:
+        return json.dumps({"status": "error", "error": f"timeout_secs must be between 30 and {_max_timeout}"})
+    if _thinking_budget_override is not None:
+        if isinstance(_thinking_budget_override, bool):
+            return json.dumps({
+                "status": "error",
+                "error": "thinking budget must be a positive integer",
+            })
+        try:
+            explicit_thinking_budget = int(_thinking_budget_override)
+        except (TypeError, ValueError):
+            return json.dumps({
+                "status": "error",
+                "error": "thinking budget must be a positive integer",
+            })
+        if not 1 <= explicit_thinking_budget <= 1_000_000:
+            return json.dumps({
+                "status": "error",
+                "error": "thinking budget must be between 1 and 1000000",
+            })
+    else:
+        explicit_thinking_budget = None
+    from .config import backend_config_to_llm_config, load_llm_backends
+
+    repo_root = Path(__file__).resolve().parent.parent
+    try:
+        backend_config = load_llm_backends(repo_root / "mesh.yaml").get(backend_name)
+        if backend_config is None:
+            return json.dumps({
+                "status": "error",
+                "error": f"{backend_name} backend is not configured",
+            })
+        llm_config = backend_config_to_llm_config(backend_config)
+    except (OSError, ValueError) as exc:
+        return json.dumps({"status": "error", "error": f"failed to load {backend_name} backend: {exc}"})
+
+    delegated_task = _delegated_prompt or f"""You are the local executor for one atomic simple-code subtask delegated by a parent worker.
+
+Work only inside {resolved_cwd}. Inspect the relevant files, make the smallest complete change, and run focused verification. Do not decompose this task further, dispatch another worker, use network or agent-local mesh tools, or broaden the requested scope. Finish with a concise report naming files changed and commands/tests run. The parent worker owns cross-subtask integration and will independently review your result.
+
+## Atomic subtask
+{task.strip()}
+"""
+
+    inherited_scope = _current_worker_scope()
+
+    if backend_config.backend_type == "mesh-harness":
+        harness_python = llm_config.harness_python or sys.executable or "python3"
+        harness_backend = llm_config.harness_backend or "openai"
+        harness_base_url = llm_config.harness_base_url
+        harness_api_key = llm_config.harness_api_key
+        harness_tools = llm_config.harness_tools
+        harness_toolset = llm_config.harness_toolset
+        harness_soft_limit = llm_config.harness_soft_limit
+    elif backend_config.backend_type in {"openai", "anthropic", "claude-code"}:
+        # A direct backend can still drive the clean-room ReAct loop. This is
+        # useful for independent verification without requiring a duplicate
+        # mesh-harness wrapper entry in backends.yaml.
+        harness_python = sys.executable or "python3"
+        harness_backend = backend_config.backend_type
+        harness_base_url = llm_config.base_url
+        harness_api_key = (
+            llm_config.anthropic_api_key
+            if backend_config.backend_type == "anthropic"
+            else llm_config.api_key
+        )
+        harness_tools = ""
+        harness_toolset = "harness"
+        harness_soft_limit = 0
+    elif backend_config.backend_type == "codex":
+        return await _run_mesh_qwen_codex(
+            task=task.strip(),
+            cwd=resolved_cwd,
+            delegated_task=delegated_task,
+            llm_config=llm_config,
+            timeout=timeout,
+        )
+    else:
+        return json.dumps({
+            "status": "error",
+            "error": (
+                f"{backend_name} uses unsupported ReAct backend type "
+                f"{backend_config.backend_type!r}"
+            ),
+        })
+
+    if inherited_scope.enabled and harness_backend in {
+        "claude-code", "claude-interactive", "zai"
+    }:
+        return json.dumps({
+            "status": "error",
+            "error": (
+                "isolated mesh_qwen workers cannot use unsupported "
+                f"backend {harness_backend!r}"
+            ),
+        })
+
+    thinking_budget = (
+        explicit_thinking_budget
+        if explicit_thinking_budget is not None
+        else llm_config.thinking_budget
+    )
+    logger.info(
+        "mesh_qwen backend=%s resolved thinking_budget=%s",
+        backend_name,
+        thinking_budget,
+    )
+    system_prompt_file = llm_config.harness_system_prompt_file
+    if system_prompt_file:
+        system_prompt_path = Path(system_prompt_file)
+        if not system_prompt_path.is_absolute():
+            system_prompt_path = repo_root / system_prompt_path
+    else:
+        system_prompt_path = Path(__file__).with_name("harness") / "system_prompt.md"
+    if not system_prompt_path.is_file():
+        return json.dumps({"status": "error", "error": "mesh harness system prompt is unavailable"})
+
+    command = [
+        harness_python,
+        "-m", "mesh.harness", "exec",
+        "--backend", harness_backend,
+        "--model", llm_config.model,
+        "--prompt", "-",
+    ]
+    if llm_config.cc_effort:
+        command.extend(["--effort", llm_config.cc_effort])
+    if isinstance(thinking_budget, int) and thinking_budget > 0:
+        command.extend(["--thinking-budget", str(thinking_budget)])
+    if harness_base_url:
+        command.extend(["--base-url", harness_base_url])
+    if harness_api_key:
+        command.extend(["--api-key", harness_api_key])
+    if backend_config.backend_type == "claude-code" and llm_config.cc_binary:
+        command.extend(["--cc-binary", llm_config.cc_binary])
+    if _tools is not None:
+        command.extend(["--tools", _tools])
+    elif harness_tools:
+        command.extend(["--tools", harness_tools])
+    elif harness_toolset:
+        command.extend(["--toolset", harness_toolset])
+    command.extend(["--system-prompt-file", str(system_prompt_path)])
+    if llm_config.harness_agent_socket:
+        command.extend(["--agent-socket", llm_config.harness_agent_socket])
+    if harness_soft_limit:
+        command.extend(["--soft-limit", str(harness_soft_limit)])
+    work_deadline_secs, synthesis_grace_secs = _mesh_qwen_work_deadline(timeout)
+    command.extend([
+        "--deadline-secs", str(work_deadline_secs),
+        "--max-iters", str(iterations),
+        "--max-tokens", str(output_tokens),
+        "--node-id", _node_id,
+        "--cwd", resolved_cwd,
+    ])
+    started = time.monotonic()
+    # ``mesh.harness`` is imported by module name before its ``--cwd`` task
+    # directory is applied.  A delegated task may legitimately run outside
+    # the repository (for example an isolated dark-fold workspace), so launch
+    # the child from the repository root and let ``--cwd`` select its actual
+    # tool workspace after imports succeed.
+    harness_launch_dir = str(repo_root)
+    timed_out = False
+    stdout_bytes = b""
+    stderr_bytes = b""
+    # Phase 3: hand the child harness its scope.  A disabled scope produces an
+    # empty fragment, so ``harness_env`` stays ``None`` and the subprocess
+    # inherits this process's environment exactly as it does today.
+    harness_scope = inherited_scope
+    scope_env = harness_scope.to_env()
+    harness_env: dict[str, str] | None = None
+    if scope_env:
+        harness_env = os.environ.copy()
+        harness_env.update(scope_env)
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+            cwd=harness_launch_dir,
+            **({"env": harness_env} if harness_env is not None else {}),
+        )
+        stdout_task = asyncio.create_task(
+            _collect_capped_stream(
+                process.stdout,
+                max_bytes=_MESH_QWEN_STDOUT_TAIL_BYTES,
+            )
+        )
+        stderr_task = asyncio.create_task(
+            _collect_capped_stream(
+                process.stderr,
+                max_bytes=_MESH_QWEN_STDERR_TAIL_BYTES,
+            )
+        )
+
+        async def _feed_and_wait() -> int:
+            await _feed_process_stdin(
+                process.stdin,
+                delegated_task.encode("utf-8"),
+            )
+            return await process.wait()
+
+        await asyncio.wait_for(_feed_and_wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        timed_out = True
+        if "process" in locals() and process.returncode is None:
+            await _kill_process_group(process)
+    except OSError as exc:
+        return json.dumps({"status": "error", "error": f"failed to start mesh_qwen: {exc}"})
+    finally:
+        if "stdout_task" in locals():
+            stdout_bytes, stderr_bytes = await asyncio.gather(
+                stdout_task,
+                stderr_task,
+            )
+
+    stdout = stdout_bytes.decode("utf-8", errors="replace")
+    stderr = stderr_bytes.decode("utf-8", errors="replace")
+    final_text, usage, fatal_errors = _mesh_qwen_result_from_jsonl(stdout)
+    if timed_out:
+        result = {
+            "status": "error",
+            "error": (
+                f"mesh_qwen reached its absolute {timeout}-second timeout; "
+                f"the child had {work_deadline_secs} seconds for normal work "
+                f"and {synthesis_grace_secs} seconds reserved for synthesis, "
+                "but synthesis did not complete"
+            ),
+            "task": task.strip(),
+            "cwd": resolved_cwd,
+            "exit_code": process.returncode,
+            "elapsed_secs": round(time.monotonic() - started, 3),
+            "final_text": final_text,
+            "usage": usage,
+            "errors": fatal_errors,
+            "stderr_tail": "\n".join(stderr.splitlines()[-30:]),
+        }
+        event_tail = _mesh_qwen_event_tail(stdout)
+        if event_tail:
+            result["event_tail"] = event_tail
+        if _include_trace:
+            result["trace"] = stdout
+        return json.dumps(result, ensure_ascii=False)
+
+    result: dict[str, Any] = {
+        "status": "ok" if process.returncode == 0 and final_text and not fatal_errors else "error",
+        "task": task.strip(),
+        "cwd": resolved_cwd,
+        "exit_code": process.returncode,
+        "elapsed_secs": round(time.monotonic() - started, 3),
+        "final_text": final_text,
+        "usage": usage,
+        "stderr_tail": "\n".join(stderr.splitlines()[-30:]),
+    }
+    if fatal_errors:
+        result["errors"] = fatal_errors
+    if not final_text and not fatal_errors:
+        result["errors"] = ["mesh harness returned no final report"]
+    if _include_trace:
+        result["trace"] = stdout
+    return json.dumps(result, ensure_ascii=False)
+
+
+@tool(
+    name="recursive_harness",
+    description=(
+        "Execute a potentially multi-phase task through bounded recursive decomposition. "
+        "The harness classifies cognitive phases, delegates each atomic phase to local "
+        "Qwen's ReAct executor, independently diagnoses outcomes, and replans after "
+        "partial or failed phases. The interface remains task-in/result-out."
+    ),
+    parameters=[
+        ToolParameter(
+            name="task", type="string", required=True,
+            description="Natural-language task with concrete success criteria.",
+        ),
+        ToolParameter(
+            name="cwd", type="string", required=True,
+            description="Absolute working directory for all delegated phase executions.",
+        ),
+    ],
+)
+async def recursive_harness(task: str, cwd: str) -> str:
+    """Run the drop-in recursive decomposition wrapper around mesh_qwen."""
+    if not isinstance(task, str) or not task.strip():
+        return "[status: failed]\n\nTask was not attempted.\n\n## Issues\ntask must be a non-empty string"
+    if not isinstance(cwd, str) or not cwd.strip() or not os.path.isabs(cwd):
+        return (
+            "[status: failed]\n\nTask was not attempted.\n\n"
+            "## Issues\ncwd must be an existing absolute directory"
+        )
+    try:
+        resolved_cwd = _validate_path(cwd, require_write=True)
+    except (OSError, PermissionError) as exc:
+        return (
+            "[status: failed]\n\nTask was not attempted.\n\n"
+            f"## Issues\ninvalid cwd: {exc}"
+        )
+    if not os.path.isdir(resolved_cwd):
+        return (
+            "[status: failed]\n\nTask was not attempted.\n\n"
+            "## Issues\ncwd must be an existing absolute directory"
+        )
+
+    from .recursive_harness import run
+
+    return await run(task.strip(), resolved_cwd)
+
+
+# =============================================================================
+# STYLE FILTER — synchronous mesh tool
+# =============================================================================
+
+@tool(
+    name="style_filter",
+    description=(
+        "Restyle draft text following the house style guide. "
+        "Give the draft text (and optional tone/audience directions) and "
+        "receive the same content rewritten in house style. For emails, "
+        "announcements, and short prose the router has already drafted."
+    ),
+    parameters=[
+        ToolParameter(
+            name="text", type="string", required=True,
+            description="The draft text to restyle.",
+        ),
+        ToolParameter(
+            name="directions", type="string", required=False,
+            description="Optional audience, tone, or format constraints to apply while restyling.",
+        ),
+        ToolParameter(
+            name="max_length", type="integer", required=False,
+            description="Optional maximum word count.",
+        ),
+    ],
+)
+async def style_filter(
+    text: str,
+    directions: str | None = None,
+    max_length: int | None = None,
+) -> str:
+    """Restyle supplied draft text without task-prompt or tool dependencies."""
+    from mesh.config import MeshConfig, backend_config_to_llm_config
+
+    if not isinstance(text, str) or not text.strip():
+        return "Error: style_filter requires non-empty text."
+
+    repo_root = Path(__file__).resolve().parent.parent
+    try:
+        mesh_config = MeshConfig.load(repo_root / "mesh.yaml")
+        backend_config = mesh_config.llm_backends.get("default")
+        if backend_config is None:
+            return "Error: style_filter default backend is not configured."
+        style_guide = (repo_root / "mesh" / "prompts" / "writing_style.md").read_text(
+            encoding="utf-8"
+        )
+    except (OSError, ValueError) as exc:
+        return f"Error: style_filter configuration is invalid: {exc}"
+
+    resolved_budget = backend_config_to_llm_config(backend_config).thinking_budget
+    backend_model = str(
+        getattr(backend_config, "default_model", "") or ""
+    ).lower()
+    if resolved_budget is None and "qwen" in backend_model:
+        return (
+            "Error: Qwen-backed style_filter requires a positive "
+            "thinking_budget."
+        )
+
+    system_prompt = (
+        "You are a style filter. Rewrite the provided draft text to follow the "
+        "house style guide. Preserve all content, facts, and meaning; change only "
+        "the style — clarity, flow, sentence construction, banned words and punctuation. "
+        "Never invent content and never remove substance. Return only the restyled text."
+    )
+    system_prompt = f"{system_prompt}\n\n<style-guide>\n{style_guide}\n</style-guide>"
+
+    length_note = f"\n\nMaximum length: {max_length} words." if max_length else ""
+    directions_block = (
+        f"## Style directions\n{directions.strip()}"
+        if isinstance(directions, str) and directions.strip()
+        else ""
+    )
+    delegated_prompt = "\n\n".join(
+        part
+        for part in (
+            system_prompt,
+            directions_block,
+            f"## Draft\n{text.strip()}{length_note}",
+        )
+        if part
+    )
+
+    result = await mesh_qwen(
+        task=text.strip(),
+        cwd=str(Path.cwd()),
+        _delegated_prompt=delegated_prompt,
+        _backend_name="default",
+        _timeout_override=300,
+        timeout_secs=300,
+        _thinking_budget_override=resolved_budget,
+        _tools="",
+        _require_write=False,
+    )
+
+    try:
+        parsed = json.loads(result)
+        if parsed.get("status") == "ok":
+            return parsed.get("final_text") or parsed.get("output", "")
+        return f"Error: style_filter returned status {parsed.get('status')}: {parsed.get('error', result)}"
+    except json.JSONDecodeError:
+        return f"Error: style_filter returned non-JSON response: {result[:500]}"
+
+
+def _configured_task_prompt_bundle(task_type: str):
+    """Load one task type's shared prompt bundle from the active mesh config."""
+    from mesh.config import MeshConfig, TaskPromptConfig
+    from mesh.task_prompts import resolve_task_prompt_bundle
+
+    repo_root = Path(__file__).resolve().parent.parent
+    config = MeshConfig.load(repo_root / "mesh.yaml")
+    requested_node = os.environ.get("MESH_NODE_ID", "").strip()
+    node_configs = []
+    if requested_node and requested_node in config.nodes:
+        node_configs.append(config.nodes[requested_node])
+    node_configs.extend(
+        node
+        for node_id, node in config.nodes.items()
+        if node_id != requested_node
+    )
+    for node_config in node_configs:
+        definition = node_config.worker_task_types.get(task_type)
+        if not isinstance(definition, dict):
+            continue
+        prompts = definition.get("prompts")
+        if isinstance(prompts, TaskPromptConfig):
+            return (
+                resolve_task_prompt_bundle(prompts, repo_root),
+                config,
+            )
+    raise ValueError(
+        f"worker task type {task_type!r} has no configured prompt bundle"
+    )
+
+
+@tool(
+    name="math_thinking",
+    description=(
+        "Check an argument, fill a proof gap, formulate a lemma, or solve a "
+        "bounded mathematical reasoning task synchronously. Returns one "
+        "tool-less mathematical response. Dispatch a math-thinking worker "
+        "instead when files, computation, literature, or verification are needed."
+    ),
+    parameters=[
+        ToolParameter(
+            name="prompt",
+            type="string",
+            required=True,
+            description="The mathematical statement, argument, proof gap, or lemma request.",
+        ),
+        ToolParameter(
+            name="thinking_budget",
+            type="integer",
+            required=False,
+            description="Optional positive reasoning-token budget; configured default is 16384.",
+        ),
+    ],
+)
+async def math_thinking(
+    prompt: str,
+    thinking_budget: int | None = None,
+) -> str:
+    """Run the shared math prompt once with no tools or filesystem mutation."""
+    from mesh.config import backend_config_to_llm_config
+    from mesh.task_prompts import compose_task_instructions
+
+    if not isinstance(prompt, str) or not prompt.strip():
+        return "Error: math_thinking requires a non-empty prompt."
+    if thinking_budget is not None:
+        if isinstance(thinking_budget, bool):
+            return "Error: thinking_budget must be a positive integer."
+        try:
+            thinking_budget = int(thinking_budget)
+        except (TypeError, ValueError):
+            return "Error: thinking_budget must be a positive integer."
+        if not 1 <= thinking_budget <= 1_000_000:
+            return "Error: thinking_budget must be between 1 and 1000000."
+
+    try:
+        bundle, mesh_config = _configured_task_prompt_bundle("math-thinking")
+    except (OSError, ValueError) as exc:
+        return f"Error: math_thinking configuration is invalid: {exc}"
+    if not bundle.sync_backend:
+        return "Error: math-thinking prompts.sync_backend is not configured."
+    backend_config = mesh_config.llm_backends.get(bundle.sync_backend)
+    if backend_config is None:
+        return (
+            "Error: math-thinking sync backend "
+            f"{bundle.sync_backend!r} is not configured."
+        )
+
+    resolved_budget = thinking_budget or bundle.thinking_budget
+    if resolved_budget is None:
+        resolved_budget = backend_config_to_llm_config(
+            backend_config
+        ).thinking_budget
+    backend_model = str(
+        getattr(backend_config, "default_model", "") or ""
+    ).lower()
+    if resolved_budget is None and "qwen" in backend_model:
+        return (
+            "Error: Qwen-backed math_thinking requires a positive "
+            "thinking_budget."
+        )
+
+    domain_instructions = compose_task_instructions(
+        base=bundle.base_instructions,
+        plan=bundle.plan_instructions,
+        execute=bundle.execute_instructions,
+        sync=bundle.sync_instructions,
+    )
+    delegated_prompt = "\n\n".join(
+        part
+        for part in (
+            bundle.worker_system_prompt,
+            domain_instructions,
+            f"## Mathematical task\n{prompt.strip()}",
+            (
+                "Return only the complete mathematical response. Do not call "
+                "tools, refer to worker phases, or emit a report envelope."
+            ),
+        )
+        if part
+    )
+    result = await mesh_qwen(
+        task=prompt.strip(),
+        cwd=str(Path.cwd()),
+        _delegated_prompt=delegated_prompt,
+        _backend_name=bundle.sync_backend,
+        _tools="",
+        _require_write=False,
+        _thinking_budget_override=resolved_budget,
+        _timeout_override=300,
+        timeout_secs=300,
+        _node_id="math-thinking-sync",
+    )
+    try:
+        payload = json.loads(result)
+    except json.JSONDecodeError:
+        return f"Error: math_thinking returned non-JSON response: {result[:500]}"
+    if payload.get("status") != "ok":
+        detail = payload.get("errors") or payload.get("error") or result
+        if isinstance(detail, list):
+            detail = "; ".join(str(item) for item in detail)
+        return f"Error: math_thinking failed: {detail}"
+    final_text = payload.get("final_text") or payload.get("output")
+    if not isinstance(final_text, str) or not final_text.strip():
+        return "Error: math_thinking returned an empty response."
+    return final_text
+
+
 # =============================================================================
 # FILE TOOLS
 # =============================================================================
@@ -448,6 +1651,10 @@ def _resolve_path(path: str, require_write: bool = False) -> str:
     else:
         resolved = Path(expanded).resolve()
 
+    # Isolation boundary — independent of the legacy `sandboxed` flag and a
+    # no-op when no policy is installed (every live agent today).
+    _enforce_isolation_path(resolved, path, require_write)
+
     # Apply sandbox validation if enabled
     if _sandboxed:
         allowed = False
@@ -462,8 +1669,8 @@ def _resolve_path(path: str, require_write: bool = False) -> str:
             except ValueError:
                 continue
 
-        # Also allow /tmp
-        if not allowed:
+        # Also allow /tmp — only while unisolated; see _validate_path.
+        if not allowed and _isolation_allows_host_tmp():
             try:
                 resolved.relative_to(Path("/tmp").resolve())
                 allowed = True
@@ -474,7 +1681,7 @@ def _resolve_path(path: str, require_write: bool = False) -> str:
             op = "write to" if require_write else "access"
             raise PermissionError(
                 f"Cannot {op} '{path}': not in allowed directories. "
-                f"Allowed: {_allowed_dirs + ['/tmp']}"
+                f"Allowed: {_allowed_dirs + _host_tmp_suffix()}"
             )
 
     return str(resolved)
@@ -654,6 +1861,145 @@ def file_create(path: str, content: str) -> str:
         return f"Error creating file: {e}"
 
     return f"Successfully created {path}"
+
+
+@tool(
+    name="get_context",
+    description=(
+        "Read a window of lines around a target line in a file, with line numbers. "
+        "Useful for inspecting the neighborhood of a specific line without reading "
+        "the entire file. Returns lines from (line - radius) to (line + radius)."
+    ),
+    parameters=[
+        ToolParameter(
+            name="path",
+            type="string",
+            description="Absolute or relative path to the file",
+            required=True,
+        ),
+        ToolParameter(
+            name="line",
+            type="integer",
+            description="The 1-indexed line number to center the window on",
+            required=True,
+        ),
+        ToolParameter(
+            name="radius",
+            type="integer",
+            description="Number of lines to include above and below the target line (default 20)",
+            required=False,
+            default=20,
+        ),
+    ],
+)
+def get_context(path: str, line: int, radius: int = 20) -> str:
+    """Read a window of lines around a target line, with line numbers."""
+    try:
+        path = _resolve_path(path, require_write=False)
+    except PermissionError as e:
+        return f"Error: {e}"
+    if not os.path.exists(path):
+        return f"Error: file not found: {path}"
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            raw_lines = f.readlines()
+    except Exception as e:
+        return f"Error reading file: {e}"
+    lines = [ln.rstrip('\n') for ln in raw_lines]
+    n = len(lines)
+    start = max(1, line - radius)
+    end = min(n, line + radius)
+    if start > n:
+        return f"Error: line {line} out of range (file has {n} lines)"
+    chunk = lines[start - 1:end]
+    if not chunk:
+        return f"Error: line {line} out of range (file has {n} lines)"
+    result = "\n".join(f"{i}\t{txt}" for i, txt in enumerate(chunk, start=start))
+    return f"Lines {start}-{end} of {n} in {path}:\n\n{result}"
+
+
+@tool(
+    name="count_words",
+    description="Count the number of whitespace-separated words in a text block.",
+    parameters=[
+        ToolParameter(
+            name="text",
+            type="string",
+            description="The text to count words in",
+            required=True,
+        ),
+    ],
+)
+def count_words(text: str) -> str:
+    """Return word count for a text block."""
+    return str(len(text.split()))
+
+
+@tool(
+    name="write_lines",
+    description=(
+        "Replace a range of original lines in a file with new content. "
+        "Line numbers are 1-indexed, inclusive on both ends. The line numbers "
+        "refer to the file as it was before this call; if you need to make "
+        "multiple edits, work in reverse order (higher lines first) so that "
+        "earlier line numbers remain valid."
+    ),
+    parameters=[
+        ToolParameter(
+            name="path",
+            type="string",
+            description="Absolute or relative path to the file to modify",
+            required=True,
+        ),
+        ToolParameter(
+            name="start_line",
+            type="integer",
+            description="1-indexed starting line (inclusive)",
+            required=True,
+        ),
+        ToolParameter(
+            name="end_line",
+            type="integer",
+            description="1-indexed ending line (inclusive)",
+            required=True,
+        ),
+        ToolParameter(
+            name="content",
+            type="string",
+            description="The replacement text (newline-separated lines)",
+            required=True,
+        ),
+    ],
+)
+def write_lines(path: str, start_line: int, end_line: int, content: str) -> str:
+    """Replace original lines [start, end] with content."""
+    try:
+        path = _resolve_path(path, require_write=True)
+    except PermissionError as e:
+        return f"Error: {e}"
+    if not os.path.exists(path):
+        return f"Error: file not found: {path}"
+    try:
+        original_raw = open(path, "r", encoding="utf-8", errors="replace").read()
+    except Exception as e:
+        return f"Error reading file: {e}"
+    had_trailing_newline = original_raw.endswith('\n')
+    raw_lines = original_raw.splitlines(True)
+    lines = [ln.rstrip('\n') for ln in raw_lines]
+    n = len(lines)
+    if not (1 <= start_line <= end_line <= n):
+        return f"Error: line range {start_line}-{end_line} out of bounds (document has {n} lines)"
+    replacement = content.splitlines()
+    lines[start_line - 1:end_line] = replacement
+    try:
+        output = "\n".join(lines)
+        if had_trailing_newline:
+            output += "\n"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(output)
+    except Exception as e:
+        return f"Error writing file: {e}"
+    return f"Replaced original lines {start_line}-{end_line} ({end_line - start_line + 1} lines -> {len(replacement)} lines) in {path}"
 
 
 @tool(
@@ -979,6 +2325,197 @@ def _apply_hunk(lines: list, hunk: dict, offset: int, fuzz: int) -> tuple:
 
 
 # =============================================================================
+# DIRECTORY LISTING TOOL
+# =============================================================================
+
+
+def _list_tree(
+    dir_path: str,
+    depth: int = 2,
+    offset: int = 1,
+    limit: int = 25,
+) -> str:
+    """Build a tree listing of a directory."""
+    root = Path(dir_path).resolve()
+    if not root.is_dir():
+        return f"Error: Not a directory: {dir_path}"
+
+    entries: list[str] = []
+    truncated = False
+
+    def _walk(path: Path, current_depth: int, prefix: str) -> None:
+        nonlocal truncated
+        if current_depth > depth:
+            return
+        if truncated:
+            return
+
+        try:
+            children = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        except PermissionError:
+            entries.append(f"{prefix}[permission denied]")
+            return
+
+        for child in children:
+            if len(entries) >= offset - 1 + limit + 1:
+                truncated = True
+                return
+
+            name = child.name
+            if child.is_symlink():
+                suffix = "@"
+            elif child.is_dir():
+                suffix = "/"
+            elif not child.is_file():
+                suffix = "?"
+            else:
+                suffix = ""
+
+            entries.append(f"{prefix}{name}{suffix}")
+
+            if child.is_dir() and not child.is_symlink() and current_depth < depth:
+                _walk(child, current_depth + 1, prefix + "  ")
+
+    _walk(root, 1, "  ")
+
+    # Apply pagination
+    start_idx = offset - 1
+    page = entries[start_idx:start_idx + limit]
+
+    lines = [f"Absolute path: {root}"]
+    lines.extend(page)
+    if truncated:
+        lines.append(f"  (More than {limit} entries found, use offset to paginate)")
+    return "\n".join(lines)
+
+
+@tool(
+    name="list_dir",
+    description=(
+        "List the contents of a directory as an indented tree. "
+        "Shows files and subdirectories with type suffixes: / for directories, "
+        "@ for symlinks. Supports depth control and pagination via offset/limit."
+    ),
+    parameters=[
+        ToolParameter(
+            name="dir_path",
+            type="string",
+            description="Path to the directory to list",
+            required=True,
+        ),
+        ToolParameter(
+            name="depth",
+            type="integer",
+            description="Maximum depth to recurse (default 2)",
+            required=False,
+            default=2,
+        ),
+        ToolParameter(
+            name="offset",
+            type="integer",
+            description="1-indexed offset for pagination (default 1)",
+            required=False,
+            default=1,
+        ),
+        ToolParameter(
+            name="limit",
+            type="integer",
+            description="Maximum entries to return (default 25)",
+            required=False,
+            default=25,
+        ),
+    ],
+)
+def list_dir(dir_path: str, depth: int = 2, offset: int = 1, limit: int = 25) -> str:
+    """List directory contents as an indented tree."""
+    path = _resolve_path(dir_path)
+    if not os.path.isabs(path):
+        path = os.path.join(os.getcwd(), path)
+    return _list_tree(path, depth=depth, offset=offset, limit=limit)
+
+
+# =============================================================================
+# GREP (SEARCH) TOOL
+# =============================================================================
+
+_GREP_MAX_RESULTS = 100
+
+
+@tool(
+    name="grep",
+    description=(
+        "Search file contents for a regex pattern. Returns matching lines with "
+        "file paths and line numbers. Use this to find functions, classes, imports, "
+        "or any text pattern across the codebase without reading entire files."
+    ),
+    parameters=[
+        ToolParameter(
+            name="pattern",
+            type="string",
+            description="Regex pattern to search for (passed to grep -E)",
+            required=True,
+        ),
+        ToolParameter(
+            name="path",
+            type="string",
+            description="File or directory to search in (default: current directory)",
+            required=False,
+            default=".",
+        ),
+        ToolParameter(
+            name="include",
+            type="string",
+            description="Glob pattern to filter files (e.g. '*.py', '*.js')",
+            required=False,
+        ),
+    ],
+)
+def grep(pattern: str, path: str = ".", include: str | None = None) -> str:
+    """Search files for a regex pattern."""
+    search_path = _resolve_path(path)
+    if not os.path.isabs(search_path):
+        search_path = os.path.join(os.getcwd(), search_path)
+
+    if not os.path.exists(search_path):
+        return f"Error: Path not found: {search_path}"
+
+    cmd = ["grep", "-rn", "-E", "--color=never"]
+    if include:
+        cmd.extend(["--include", include])
+    cmd.extend(["--", pattern, search_path])
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return "Error: Search timed out after 30 seconds. Try a more specific pattern or path."
+    except Exception as e:
+        return f"Error running grep: {e}"
+
+    if result.returncode == 1:
+        return "No matches found."
+    if result.returncode != 0 and result.returncode != 1:
+        err = result.stderr.strip()
+        return f"Error: grep returned exit code {result.returncode}: {err}"
+
+    lines = result.stdout.splitlines()
+    total = len(lines)
+    if total > _GREP_MAX_RESULTS:
+        lines = lines[:_GREP_MAX_RESULTS]
+        output = "\n".join(lines)
+        output += f"\n\n({total} total matches, showing first {_GREP_MAX_RESULTS}. Narrow your search with a more specific pattern or --include.)"
+    else:
+        output = "\n".join(lines)
+        output += f"\n\n({total} matches)"
+
+    return output
+
+
+# =============================================================================
 # EXA (WEB SEARCH) TOOLS
 # =============================================================================
 
@@ -1076,6 +2613,14 @@ def gmail_list_from_date(date: str) -> str:
 )
 def gmail_get_email(message_id: str) -> str:
     """Get full email content."""
+    attachment_dir = None
+    policy, state_paths = current_isolation()
+    if policy is not None:
+        scratch = _scratch_dir(policy, state_paths)
+        if scratch is None:
+            return "Error: isolated Gmail attachment directory is unavailable"
+        attachment_dir = str(scratch / "gmail_attachments")
+
     host = _get_tool_host()
     if host is None:
         return "Error: Gmail not configured"
@@ -1084,7 +2629,7 @@ def gmail_get_email(message_id: str) -> str:
     if not gmail.ready:
         return "Error: Gmail client not initialized"
 
-    result = gmail.get_email(message_id)
+    result = gmail.get_email(message_id, attachment_dir=attachment_dir)
     if result is None:
         return f"Error: Could not fetch email {message_id}"
 
@@ -1136,6 +2681,10 @@ def gmail_get_email(message_id: str) -> str:
 )
 def gmail_send_message(to: str, subject: str, body: str, cc: str = None, attachments: list = None) -> str:
     """Send an email. Confirmation is handled at mesh level via requires_confirmation."""
+    try:
+        attachments = _validated_attachment_paths(attachments, "gmail_send_message")
+    except PermissionError as exc:
+        return f"Error: {exc}"
     host = _get_tool_host()
     if host is None:
         return "Error: Gmail not configured"
@@ -1199,6 +2748,10 @@ def gmail_send_message(to: str, subject: str, body: str, cc: str = None, attachm
 )
 def gmail_reply_to(message_id: str, body: str, cc: str = None, attachments: list = None) -> str:
     """Reply to an email. Confirmation is handled at mesh level via requires_confirmation."""
+    try:
+        attachments = _validated_attachment_paths(attachments, "gmail_reply_to")
+    except PermissionError as exc:
+        return f"Error: {exc}"
     host = _get_tool_host()
     if host is None:
         return "Error: Gmail not configured"
@@ -1301,6 +2854,10 @@ def gmail_reply_to(message_id: str, body: str, cc: str = None, attachments: list
 )
 def gmail_create_draft(to: str, subject: str, body: str, cc: str = None, attachments: list = None) -> str:
     """Create a Gmail draft. No confirmation needed — nothing is sent."""
+    try:
+        attachments = _validated_attachment_paths(attachments, "gmail_create_draft")
+    except PermissionError as exc:
+        return f"Error: {exc}"
     host = _get_tool_host()
     if host is None:
         return "Error: Gmail not configured"
@@ -1366,6 +2923,10 @@ def gmail_create_draft(to: str, subject: str, body: str, cc: str = None, attachm
 )
 def gmail_draft_reply(message_id: str, body: str, cc: str = None, attachments: list = None) -> str:
     """Create a threaded reply draft. No confirmation needed — nothing is sent."""
+    try:
+        attachments = _validated_attachment_paths(attachments, "gmail_draft_reply")
+    except PermissionError as exc:
+        return f"Error: {exc}"
     host = _get_tool_host()
     if host is None:
         return "Error: Gmail not configured"
@@ -1518,7 +3079,10 @@ def gmail_list_unread(limit: int = 20) -> str:
 
 @tool(
     name="calendar_list_on_date",
-    description="List calendar events on a specific date.",
+    description=(
+        "List calendar events on a specific date. Returned start/end times are "
+        "normalized to the requested timezone."
+    ),
     parameters=[
         ToolParameter(
             name="date",
@@ -2765,6 +4329,48 @@ async def browser_back() -> str:
         return json.dumps({"error": str(e)})
 
 
+@tool(
+    name="autonomous_controller_run",
+    description=(
+        "Run one explicitly authorized recursive autonomous-controller pilot on "
+        "the owning live agent. This is one-shot and never schedules a wake."
+    ),
+    parameters=[
+        ToolParameter(
+            name="smoke",
+            type="string",
+            description=(
+                "Authorized smoke name: research_resegmentation on Tron or "
+                "alice_personal_assistant on Alice."
+            ),
+            required=True,
+        ),
+        ToolParameter(
+            name="dry_run",
+            type="boolean",
+            description=(
+                "Run live read-only gathering and planning, but record each leaf "
+                "worker that would be dispatched instead of executing it."
+            ),
+            required=False,
+            default=False,
+        ),
+    ],
+)
+async def autonomous_controller_run(smoke: str, dry_run: bool = False) -> str:
+    """Placeholder; the owning AgentNode supplies the live runtime binding."""
+    return json.dumps(
+        {
+            "status": "error",
+            "message": (
+                "autonomous_controller_run must be routed to its owning live agent"
+            ),
+            "smoke": smoke,
+            "dry_run": dry_run,
+        }
+    )
+
+
 # =============================================================================
 # LITERATURE SEARCH TOOLS
 # =============================================================================
@@ -3254,6 +4860,8 @@ def get_all_tool_names() -> list[str]:
     return [
         # Bash
         "bash_exec",
+        # Local delegated executor and academic writing
+        "mesh_qwen", "recursive_harness", "style_filter", "math_thinking",
         # File
         "file_read", "file_edit", "file_create",
         # Exa
@@ -3281,7 +4889,127 @@ def get_all_tool_names() -> list[str]:
         "pubmed_search", "pubmed_get", "pubmed_fulltext", "pubmed_related",
         "extract_url",
         "openalex_search",
+        # Devices
+        "boox_upload",
+        # Security
+        "security_scan",
     ]
+
+
+# =============================================================================
+# DEVICE TOOLS
+# =============================================================================
+
+@tool(
+    name="boox_upload",
+    description=(
+        "Upload a file to a BOOX e-reader over its WiFi transfer interface. "
+        "Defaults to the local BOOX device at 192.168.50.226:8083."
+    ),
+    parameters=[
+        ToolParameter(
+            name="filepath",
+            type="string",
+            description="Path to the local file to upload.",
+            required=True,
+        ),
+        ToolParameter(
+            name="host",
+            type="string",
+            description="BOOX host or URL.",
+            required=False,
+            default="192.168.50.226",
+        ),
+        ToolParameter(
+            name="port",
+            type="integer",
+            description="BOOX HTTP port.",
+            required=False,
+            default=8083,
+        ),
+    ],
+)
+def boox_upload(filepath: str, host: str = "192.168.50.226", port: int = 8083) -> str:
+    """Upload a local file to a BOOX WiFi transfer server."""
+    if not _allow_network:
+        return "Error: network access is disabled for this agent"
+
+    try:
+        resolved = _validate_path(filepath)
+        from tools.boox_upload import BooxUploadError, upload_file
+
+        result = upload_file(resolved, host=host, port=int(port))
+        return json.dumps(result, ensure_ascii=False, default=str)
+    except BooxUploadError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Error uploading to BOOX: {e}"
+
+
+# =============================================================================
+# SECURITY TOOLS
+# =============================================================================
+
+@tool(
+    name="security_scan",
+    description=(
+        "Use the local Antares vulnerability-localization model to rank source "
+        "files for manual review against one or more CWE classes. Results are "
+        "candidates, not confirmed vulnerabilities."
+    ),
+    parameters=[
+        ToolParameter(
+            name="path",
+            type="string",
+            description="Absolute or working-directory-relative codebase root to scan.",
+            required=True,
+        ),
+        ToolParameter(
+            name="cwe",
+            type="string",
+            description=(
+                "Optional comma-separated CWE IDs; defaults to CWE-89, CWE-79, CWE-78, "
+                "CWE-22, CWE-502, and CWE-94."
+            ),
+            required=False,
+            default="CWE-89,CWE-79,CWE-78,CWE-22,CWE-502,CWE-94",
+        ),
+        ToolParameter(
+            name="model",
+            type="string",
+            description="Optional served model name (default: fdtn-ai/antares-1b).",
+            required=False,
+            default="fdtn-ai/antares-1b",
+        ),
+        ToolParameter(
+            name="api",
+            type="string",
+            description="Optional Antares OpenAI-compatible API base URL.",
+            required=False,
+            default="http://127.0.0.1:8003/v1",
+        ),
+    ],
+)
+def security_scan(
+    path: str,
+    cwe: str = "CWE-89,CWE-79,CWE-78,CWE-22,CWE-502,CWE-94",
+    model: str = "fdtn-ai/antares-1b",
+    api: str = "http://127.0.0.1:8003/v1",
+) -> str:
+    """Run a bounded local CWE localization pass against a codebase."""
+    if not _allow_network:
+        return "Error: network access is disabled for this agent"
+    try:
+        resolved = _validate_path(path)
+        from tools.security_scan import SecurityScanError, scan_repository
+
+        cwes = tuple(part.strip() for part in cwe.split(",") if part.strip())
+        result = scan_repository(resolved, cwes=cwes, model=model, api=api)
+        return json.dumps(result, ensure_ascii=False, default=str)
+    except SecurityScanError as e:
+        return f"Error: {e}"
+    except Exception as e:
+        return f"Error running security scan: {e}"
 
 
 # =============================================================================
@@ -3455,7 +5183,7 @@ def agent_status_tool(target: str, section: str = None) -> str:
             name="to",
             type="string",
             description=(
-                "The recipient node ID. Use 'user:{name}' for users (e.g., 'user:yourname'), "
+                "The recipient node ID. Use 'user:{name}' for users (e.g., 'user:operator'), "
                 "'agent:{type}:{name}' for agents, or 'channel:{name}' for channels."
             ),
             required=True,
@@ -3486,6 +5214,27 @@ def send_message_tool(to: str, content: str, attachments: list[dict] | None = No
     """
     # This should never be called directly - the agent handles it specially
     return "Error: send_message should be handled by the agent, not executed directly"
+
+
+@tool(
+    name="send_report",
+    description=(
+        "Submit your final report to the parent agent. Call this exactly once "
+        "when your task is complete. The report content will be delivered to the "
+        "agent for synthesis — it will NOT be sent directly to the user."
+    ),
+    parameters=[
+        ToolParameter(
+            name="content",
+            type="string",
+            description="Your final report content.",
+            required=True,
+        ),
+    ],
+)
+def send_report_tool(content: str) -> str:
+    """Placeholder — actual execution handled by AgentNode worker path."""
+    return "Error: send_report should be handled by the agent, not executed directly"
 
 
 @tool(
@@ -3565,7 +5314,7 @@ def channel_members_tool(channel_name: str) -> str:
 _plaid_client = None
 
 
-def _get_plaid_client(user_id: str = "default"):
+def _get_plaid_client(user_id: str = "owner"):
     """Get or create PlaidClient instance."""
     global _plaid_client
     if _plaid_client is None:
@@ -4168,6 +5917,13 @@ def memory_get(id: str) -> str:
     """Get all three tiers of a memory entry."""
     if _memory_system is None:
         return "Error: Memory system not initialized."
+    # System prompts hand agents ``[m_xxxx]`` digest/essay references and tell
+    # them to fetch with memory_get, but the store keys on the bare hex ID.
+    # Accept the citation surface; anything unrecognized falls through
+    # unchanged so it still reports as a plain not-found.
+    from .memory.ids import try_normalize_memory_id
+
+    id = try_normalize_memory_id(id) or id
     entry = _memory_system.get_entry(id)
     if entry is None:
         return f"No memory entry found with ID '{id}'."
@@ -4460,12 +6216,506 @@ async def memory_edit(
 
 
 # =============================================================================
+# Entity-link correction (in-process authority only in increment 2a)
+# =============================================================================
+
+
+@tool(
+    name="entity_link_correct",
+    description=(
+        "Transactionally correct one memory's entity links, optionally editing "
+        "the memory source fields in the same commit. New entity keys are "
+        "generated by the registry service. This increment requires a real "
+        "in-process trigger message and fails closed over MCP/socket calls."
+    ),
+    parameters=[
+        ToolParameter(
+            name="memory_id",
+            type="string",
+            description=(
+                "Minted memory ID whose source or entity links need correction. "
+                "Copy the [m_<id>] handle exactly as it was shown to you — the "
+                "m_ prefix and brackets are accepted directly. Never retype or "
+                "hand-transcribe the hex digits: a mistyped ID is rejected, not "
+                "repaired."
+            ),
+            required=True,
+        ),
+        ToolParameter(
+            name="reason",
+            type="string",
+            description="Why this correction is necessary.",
+            required=True,
+        ),
+        ToolParameter(
+            name="remove_entity_key",
+            type="string",
+            description="Existing link to remove. Omit to preserve all current links.",
+            required=False,
+        ),
+        ToolParameter(
+            name="add_entity_key",
+            type="string",
+            description="Existing non-retired registry key to add.",
+            required=False,
+        ),
+        ToolParameter(
+            name="new_entity_type",
+            type="string",
+            description="New entity type: person, project, event, or group.",
+            required=False,
+        ),
+        ToolParameter(
+            name="new_display_name",
+            type="string",
+            description="Display name for a new service-keyed entity.",
+            required=False,
+        ),
+        ToolParameter(
+            name="new_identity_note",
+            type="string",
+            description="Disambiguating note for a new entity.",
+            required=False,
+        ),
+        ToolParameter(
+            name="aliases",
+            type="array",
+            description="Additional display aliases for a new entity.",
+            required=False,
+        ),
+        ToolParameter(
+            name="naming_surface",
+            type="string",
+            description=(
+                "Exact verbatim name surface from the triggering user message; "
+                "required when creating a new entity."
+            ),
+            required=False,
+        ),
+        ToolParameter(
+            name="memory_patch",
+            type="object",
+            description=(
+                "Optional memory_edit patch using summary, reflection, "
+                "retrieval_key, tags, and outcome."
+            ),
+            required=False,
+        ),
+    ],
+)
+async def entity_link_correct(
+    memory_id: str,
+    reason: str,
+    remove_entity_key: str | None = None,
+    add_entity_key: str | None = None,
+    new_entity_type: str | None = None,
+    new_display_name: str | None = None,
+    new_identity_note: str | None = None,
+    aliases: list[str] | None = None,
+    naming_surface: str | None = None,
+    memory_patch: dict | None = None,
+) -> str:
+    """Fail-closed registry handler; AgentNode supplies trusted context in-process."""
+    del (
+        memory_id,
+        reason,
+        remove_entity_key,
+        add_entity_key,
+        new_entity_type,
+        new_display_name,
+        new_identity_note,
+        aliases,
+        naming_surface,
+        memory_patch,
+    )
+    return (
+        "Error: entity_link_correct requires an in-process execution context; "
+        "MCP, worker socket, Codex, Claude Code, harness, and mesh-tool "
+        "subprocess calls are not supported in increment 2a."
+    )
+
+
+# =============================================================================
+# Entity/group self-curation mutations (docs/plans/entity-self-curation.md §3)
+#
+# Every one of these is a fail-closed stub.  The real implementations live in
+# ``AgentNode`` behind a ``CurationExecutionContext`` the model cannot forge:
+# authority metadata (``source_message_id``, ``actor_node``, ``origin``,
+# activation, status, ``replacement_key``) is context- or service-owned and is
+# never a model argument.  Reaching this function body at all means no live
+# curation scope was registered, so the only correct behavior is refusal.
+# =============================================================================
+
+
+_CURATION_FAIL_CLOSED = (
+    "Error: {name} requires a live self-curation execution scope; it is only "
+    "executable inside an internal curation turn. MCP, worker socket, Codex, "
+    "Claude Code, harness, and mesh-tool subprocess calls are rejected."
+)
+
+
+@tool(
+    name="entity_create",
+    description=(
+        "Create a new registry entity during a self-curation turn. The registry "
+        "generates the key and applies the ordinary activation gate; a retired "
+        "entity's alias is rejected so a merged-away entity cannot be silently "
+        "recreated. Use entity_group_create for groups."
+    ),
+    parameters=[
+        ToolParameter(
+            name="entity_type",
+            type="string",
+            description="Entity type: person, project, or event. 'group' is rejected.",
+            required=True,
+        ),
+        ToolParameter(
+            name="display_name",
+            type="string",
+            description="Canonical display name for the new entity.",
+            required=True,
+        ),
+        ToolParameter(
+            name="reason",
+            type="string",
+            description="Why this entity needs to exist.",
+            required=True,
+        ),
+        ToolParameter(
+            name="identity_note",
+            type="string",
+            description="Short disambiguating note (who or what this is).",
+            required=False,
+        ),
+        ToolParameter(
+            name="aliases",
+            type="array",
+            description="Additional display aliases for the new entity.",
+            required=False,
+        ),
+    ],
+)
+async def entity_create(
+    entity_type: str,
+    display_name: str,
+    reason: str,
+    identity_note: str | None = None,
+    aliases: list[str] | None = None,
+) -> str:
+    """Fail-closed registry handler; AgentNode supplies trusted context in-process."""
+    del entity_type, display_name, reason, identity_note, aliases
+    return _CURATION_FAIL_CLOSED.format(name="entity_create")
+
+
+@tool(
+    name="entity_merge",
+    description=(
+        "Merge one entity into another: relink memories, copy aliases, rewrite "
+        "group rows, then retire the loser with replacement_key set to the "
+        "winner. Memories and the loser's historical dossier are preserved."
+    ),
+    parameters=[
+        ToolParameter(
+            name="loser_key",
+            type="string",
+            description="Registry key of the duplicate that is retired.",
+            required=True,
+        ),
+        ToolParameter(
+            name="winner_key",
+            type="string",
+            description="Registry key that survives and absorbs the loser's links.",
+            required=True,
+        ),
+        ToolParameter(
+            name="reason",
+            type="string",
+            description="Evidence that these two keys are the same entity.",
+            required=True,
+        ),
+    ],
+)
+async def entity_merge(loser_key: str, winner_key: str, reason: str) -> str:
+    """Fail-closed registry handler; AgentNode supplies trusted context in-process."""
+    del loser_key, winner_key, reason
+    return _CURATION_FAIL_CLOSED.format(name="entity_merge")
+
+
+@tool(
+    name="entity_edit",
+    description=(
+        "Edit one registry entity: update_details, add_alias, remove_alias, or "
+        "retire. Retirement goes through the service's own retire path; it does "
+        "not set replacement_key (use entity_merge for that)."
+    ),
+    parameters=[
+        ToolParameter(
+            name="entity_key",
+            type="string",
+            description="Registry key to edit.",
+            required=True,
+        ),
+        ToolParameter(
+            name="operation",
+            type="string",
+            description=(
+                "One of: update_details, add_alias, remove_alias, retire."
+            ),
+            required=True,
+        ),
+        ToolParameter(
+            name="reason",
+            type="string",
+            description="Why this edit is necessary.",
+            required=True,
+        ),
+        ToolParameter(
+            name="display_name",
+            type="string",
+            description="New display name (update_details only).",
+            required=False,
+        ),
+        ToolParameter(
+            name="identity_note",
+            type="string",
+            description="New identity note (update_details only).",
+            required=False,
+        ),
+        ToolParameter(
+            name="alias",
+            type="string",
+            description="Alias to add or remove (add_alias / remove_alias only).",
+            required=False,
+        ),
+    ],
+)
+async def entity_edit(
+    entity_key: str,
+    operation: str,
+    reason: str,
+    display_name: str | None = None,
+    identity_note: str | None = None,
+    alias: str | None = None,
+) -> str:
+    """Fail-closed registry handler; AgentNode supplies trusted context in-process."""
+    del entity_key, operation, reason, display_name, identity_note, alias
+    return _CURATION_FAIL_CLOSED.format(name="entity_edit")
+
+
+@tool(
+    name="entity_backfill",
+    description=(
+        "Queue bounded self-curation backfill over older uncurated memories. "
+        "Walks your memories oldest-first, slices the uncurated run into "
+        "fixed-size batches, and queues each one as an ordinary internal "
+        "curation turn. The walk stops at the first already-curated memory, so "
+        "nothing is curated twice and the live-curated era is never crossed. "
+        "Returns immediately with what was queued; the turns run afterwards, "
+        "one at a time, whenever the router is free. Call it again later to "
+        "continue where this run's ceiling stopped."
+    ),
+    parameters=[
+        ToolParameter(
+            name="max_batches",
+            type="integer",
+            description=(
+                "Optional ceiling on slices queued by this call. Defaults to "
+                "entity_self_curation_backfill_max_batches; a larger value is "
+                "clamped to it."
+            ),
+            required=False,
+        ),
+    ],
+)
+async def entity_backfill(max_batches: int | None = None) -> str:
+    """Fail-closed registry handler; AgentNode owns the router curation queue."""
+    del max_batches
+    return (
+        "Error: entity_backfill requires an in-process AgentNode execution "
+        "context with a live curation queue; MCP, worker socket, and "
+        "unauthenticated subprocess calls are rejected."
+    )
+
+
+@tool(
+    name="entity_group_create",
+    description=(
+        "Create a pending entity group with an explicit purpose. Activation is "
+        "deterministic and not this tool's decision: a group activates only "
+        "with two or more active members plus bridge evidence across the "
+        "configured number of distinct formation windows."
+    ),
+    parameters=[
+        ToolParameter(
+            name="display_name",
+            type="string",
+            description="Name of the group.",
+            required=True,
+        ),
+        ToolParameter(
+            name="purpose",
+            type="string",
+            description=(
+                "Non-empty statement of what this group is for; stored as the "
+                "group's identity note and required for activation."
+            ),
+            required=True,
+        ),
+        ToolParameter(
+            name="reason",
+            type="string",
+            description="Why this group needs to exist.",
+            required=True,
+        ),
+        ToolParameter(
+            name="aliases",
+            type="array",
+            description="Additional display aliases for the group.",
+            required=False,
+        ),
+    ],
+)
+async def entity_group_create(
+    display_name: str,
+    purpose: str,
+    reason: str,
+    aliases: list[str] | None = None,
+) -> str:
+    """Fail-closed registry handler; AgentNode supplies trusted context in-process."""
+    del display_name, purpose, reason, aliases
+    return _CURATION_FAIL_CLOSED.format(name="entity_group_create")
+
+
+@tool(
+    name="entity_group_member_add",
+    description=(
+        "Add one member entity to a group. Membership lives in the registry, "
+        "not in dossier prose; this is the only way to change a roster. "
+        "Re-evaluates the deterministic activation gate on return."
+    ),
+    parameters=[
+        ToolParameter(
+            name="group_key",
+            type="string",
+            description="Registry key of the group.",
+            required=True,
+        ),
+        ToolParameter(
+            name="member_key",
+            type="string",
+            description="Registry key of the member entity to add.",
+            required=True,
+        ),
+        ToolParameter(
+            name="reason",
+            type="string",
+            description="Evidence that this entity belongs to this group.",
+            required=True,
+        ),
+        ToolParameter(
+            name="role",
+            type="string",
+            description="Optional role of this member within the group.",
+            required=False,
+        ),
+    ],
+)
+async def entity_group_member_add(
+    group_key: str,
+    member_key: str,
+    reason: str,
+    role: str | None = None,
+) -> str:
+    """Fail-closed registry handler; AgentNode supplies trusted context in-process."""
+    del group_key, member_key, reason, role
+    return _CURATION_FAIL_CLOSED.format(name="entity_group_member_add")
+
+
+@tool(
+    name="entity_group_member_remove",
+    description=(
+        "Remove one member entity from a group. Reconciles that group's "
+        "protected roster block before returning."
+    ),
+    parameters=[
+        ToolParameter(
+            name="group_key",
+            type="string",
+            description="Registry key of the group.",
+            required=True,
+        ),
+        ToolParameter(
+            name="member_key",
+            type="string",
+            description="Registry key of the member entity to remove.",
+            required=True,
+        ),
+        ToolParameter(
+            name="reason",
+            type="string",
+            description="Why this entity no longer belongs to this group.",
+            required=True,
+        ),
+    ],
+)
+async def entity_group_member_remove(
+    group_key: str, member_key: str, reason: str
+) -> str:
+    """Fail-closed registry handler; AgentNode supplies trusted context in-process."""
+    del group_key, member_key, reason
+    return _CURATION_FAIL_CLOSED.format(name="entity_group_member_remove")
+
+
+@tool(
+    name="token_count",
+    description=(
+        "Measure a candidate body with the same tokenizer the budget gate uses. "
+        "Call this before writing a dossier or digest edit: over-ceiling writes "
+        "are refused, never truncated, so measuring first saves a round trip."
+    ),
+    parameters=[
+        ToolParameter(
+            name="text",
+            type="string",
+            description="The text to measure.",
+            required=True,
+        ),
+    ],
+)
+async def token_count(text: str) -> str:
+    """Measure text with ``mesh.llm.estimate_tokens`` (§3.5).
+
+    Unlike the mutation tools this is read-only and safe outside a curation
+    scope, so it has a real implementation here rather than a fail-closed stub.
+    """
+    from .llm import estimate_tokens, _encoder
+
+    if not isinstance(text, str):
+        return "Error: token_count requires a string 'text' argument."
+    return json.dumps(
+        {
+            "tokens": estimate_tokens(text),
+            "chars": len(text),
+            "tokenizer": "tiktoken" if _encoder is not None else "word-heuristic",
+        },
+        sort_keys=True,
+    )
+
+
+# =============================================================================
 # Standing digest tools (interactive correction of the published digest)
 # =============================================================================
 
 
 def _resolve_digest_path() -> str | None:
-    """Return the absolute path to the agent's standing digest, or None."""
+    """Return the absolute path to the agent's standing digest, or None.
+
+    ``MemorySystemV2`` exposes neither ``_config`` nor ``config``, so the
+    config-walk below returns None for every V2 agent.  AgentNode publishes the
+    path directly on init; prefer that and keep the walk as the V1 fallback.
+    """
+    if _standing_digest_path:
+        return os.path.expanduser(_standing_digest_path)
     if _memory_system is None:
         return None
     config = getattr(_memory_system, "_config", None) or getattr(_memory_system, "config", None)
@@ -4490,9 +6740,10 @@ def digest_get() -> str:
     path = _resolve_digest_path()
     if not path:
         return "Error: no standing_digest_path configured for this agent."
+    from .digest_io import read_digest
+
     try:
-        with open(path) as f:
-            content = f.read()
+        content = read_digest(path)
     except FileNotFoundError:
         return f"Error: digest file not found at {path}."
     except OSError as e:
@@ -4535,45 +6786,477 @@ def digest_edit(old_text: str, new_text: str, replace_all: bool = False) -> str:
     path = _resolve_digest_path()
     if not path:
         return "Error: no standing_digest_path configured for this agent."
-    try:
-        content = Path(path).read_text()
-    except FileNotFoundError:
-        return f"Error: digest file not found at {path}."
-    except OSError as e:
-        return f"Error reading digest: {e}"
+    from .digest_io import edit_digest
 
-    count = content.count(old_text)
-    if count == 0:
-        return "Error: old_text not found in digest."
-    if not replace_all and count > 1:
-        return (
-            f"Error: old_text matches {count} locations in digest — "
-            f"provide a more specific string or set replace_all=true."
-        )
+    # The read, match check and write all happen inside one exclusive lock —
+    # a concurrent editor (curation turn, fold driver) must not be able to
+    # slip between our snapshot and our write and lose one of the two edits.
+    ok, error, n_replaced = edit_digest(path, old_text, new_text, replace_all)
+    if not ok:
+        return error
 
-    if replace_all:
-        new_content = content.replace(old_text, new_text)
-    else:
-        new_content = content.replace(old_text, new_text, 1)
-
-    import fcntl
-    try:
-        with open(path, "r+") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            f.seek(0)
-            f.write(new_content)
-            f.truncate()
-            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-    except OSError as e:
-        return f"Error writing digest: {e}"
-
-    n_replaced = count if replace_all else 1
     import logging
     logging.getLogger("mesh.memory.audit").info(
         "digest_edit old=%r new=%r n=%d path=%s",
         old_text[:100], new_text[:100], n_replaced, path,
     )
     return f"Digest updated successfully ({n_replaced} replacement{'s' if n_replaced > 1 else ''})."
+
+
+# =============================================================================
+# Autonomous agent mode: project dossier, session reports, budget ledger
+#
+# Narrow, artifact-scoped tools in the digest_get/digest_edit mould. The path
+# is always derived from the project entity key, never supplied by the model,
+# so these grant no general filesystem authority. All logic lives in
+# mesh/project_dossier.py; these are the registry surface.
+# =============================================================================
+
+
+@tool(
+    name="dossier_read",
+    description=(
+        "Read a project dossier — the durable state artifact for one project "
+        "(Identity, Goals, Tasks, Timeline, Narrative, Standing decisions, "
+        "Open threads). The path is derived from the project entity key."
+    ),
+    parameters=[
+        ToolParameter(
+            name="entity_key",
+            type="string",
+            description="Project entity key, e.g. 'project:mesh-infra'.",
+            required=True,
+        ),
+    ],
+)
+def dossier_read(entity_key: str, state_paths=None) -> str:
+    """Read the project dossier."""
+    from .project_dossier import DossierError, read_dossier
+
+    try:
+        return read_dossier(entity_key, state_paths)
+    except DossierError as e:
+        return f"Error: {e}"
+
+
+@tool(
+    name="dossier_edit",
+    description=(
+        "Edit a project dossier in place by exact string replacement, like "
+        "digest_edit. The edit is validated against the seven-section dossier "
+        "constitution and the token ceiling before it lands; a refused edit "
+        "leaves the dossier byte-identical."
+    ),
+    parameters=[
+        ToolParameter(
+            name="entity_key",
+            type="string",
+            description="Project entity key, e.g. 'project:mesh-infra'.",
+            required=True,
+        ),
+        ToolParameter(
+            name="old_text",
+            type="string",
+            description="Exact text to find (must match uniquely unless replace_all=true).",
+            required=True,
+        ),
+        ToolParameter(
+            name="new_text",
+            type="string",
+            description="Replacement text.",
+            required=True,
+        ),
+        ToolParameter(
+            name="replace_all",
+            type="boolean",
+            description="Replace all occurrences (default false — requires unique match).",
+            required=False,
+        ),
+    ],
+)
+def dossier_edit(
+    entity_key: str,
+    old_text: str,
+    new_text: str,
+    replace_all: bool = False,
+    state_paths=None,
+) -> str:
+    """Exact string replacement in a project dossier."""
+    from .project_dossier import DossierError, edit_dossier
+
+    try:
+        result = edit_dossier(
+            entity_key,
+            old_text,
+            new_text,
+            replace_all=bool(replace_all),
+            state_paths=state_paths,
+        )
+    except DossierError as e:
+        return f"Error: {e}"
+    logging.getLogger("mesh.memory.audit").info(
+        "dossier_edit key=%s old=%r new=%r n=%d path=%s",
+        entity_key, old_text[:100], new_text[:100], result.replacements, result.path,
+    )
+    plural = "s" if result.replacements > 1 else ""
+    return (
+        f"Dossier updated ({result.replacements} replacement{plural}). "
+        f"Now {result.tokens} tokens of {result.token_budget} budget."
+    )
+
+
+@tool(
+    name="dossier_write_report",
+    description=(
+        "Create an immutable autonomous session report and link it from the "
+        "project dossier's Timeline. Create-once: identical content is an "
+        "idempotent success, different content for an existing path is "
+        "refused. Corrections are written as a new report, never an overwrite."
+    ),
+    parameters=[
+        ToolParameter(
+            name="entity_key",
+            type="string",
+            description="Project entity key, e.g. 'project:mesh-infra'.",
+            required=True,
+        ),
+        ToolParameter(
+            name="date",
+            type="string",
+            description="Session date as YYYY-MM-DD.",
+            required=True,
+        ),
+        ToolParameter(
+            name="seq",
+            type="integer",
+            description="Sequence number of the session within that date (1-based).",
+            required=True,
+        ),
+        ToolParameter(
+            name="content",
+            type="string",
+            description="Full markdown body of the session report.",
+            required=True,
+        ),
+    ],
+)
+def dossier_write_report(
+    entity_key: str, date: str, seq: int, content: str, state_paths=None
+) -> str:
+    """Write an immutable session report and link it from the Timeline."""
+    from .project_dossier import DossierError, write_report
+
+    try:
+        path = write_report(entity_key, date, seq, content, state_paths)
+    except DossierError as e:
+        return f"Error: {e}"
+    return f"Session report written to {path} and linked from the dossier Timeline."
+
+
+@tool(
+    name="dossier_check_budget",
+    description=(
+        "Read the autonomous worker budget for a project without spending it. "
+        "Returns JSON with remaining, used, limit, and resets_at."
+    ),
+    parameters=[
+        ToolParameter(
+            name="entity_key",
+            type="string",
+            description="Project entity key, e.g. 'project:mesh-infra'.",
+            required=True,
+        ),
+    ],
+)
+def dossier_check_budget(entity_key: str, state_paths=None) -> str:
+    """Report remaining worker admissions for a project."""
+    from .project_dossier import DossierError, check_budget
+
+    try:
+        return json.dumps(check_budget(entity_key, state_paths), sort_keys=True)
+    except DossierError as e:
+        return f"Error: {e}"
+
+
+@tool(
+    name="dossier_spend_budget",
+    description=(
+        "Charge worker admissions against a project's autonomous budget. An "
+        "autonomous controller must NOT call this around a dispatch: the "
+        "router already charges exactly one admission when it admits the "
+        "worker, so calling it here charges the same worker twice. Use "
+        "dossier_check_budget to read headroom instead. Refuses without "
+        "mutating the ledger when the spend would exceed the limit; do not "
+        "retry with different wording after a refusal."
+    ),
+    parameters=[
+        ToolParameter(
+            name="entity_key",
+            type="string",
+            description="Project entity key, e.g. 'project:mesh-infra'.",
+            required=True,
+        ),
+        ToolParameter(
+            name="count",
+            type="integer",
+            description="Number of admissions to charge (default 1).",
+            required=False,
+        ),
+    ],
+)
+def dossier_spend_budget(entity_key: str, count: int = 1, state_paths=None) -> str:
+    """Charge worker admissions against the project budget."""
+    from .project_dossier import BudgetExhausted, DossierError, spend_budget
+
+    try:
+        return json.dumps(spend_budget(entity_key, count, state_paths), sort_keys=True)
+    except BudgetExhausted as e:
+        return json.dumps(
+            {"status": "autonomous_budget_exhausted", "detail": str(e)}, sort_keys=True
+        )
+    except DossierError as e:
+        return f"Error: {e}"
+
+
+# =============================================================================
+# Interpretive essay tools (standing-digest essay layer)
+#
+# essay_edit: exact string replacement on essay body text. Available to
+#   agents (via router tool set) and mesh-tool CLI.
+# essay_get / essay_list: pull-based retrieval tools (Phase 4). Exposed to
+#   live agents when essays_retrieval_enabled=true in NodeConfig. Added to
+#   the agent's enabled_tools list dynamically in agent_node.py (not in the
+#   static mesh.yaml allowlist) so the gate can be flipped per-agent.
+# All three are available via mesh-tool CLI for testing and ops.
+# =============================================================================
+
+
+def _get_essay_store():
+    """Return the MemoryStore backing the memory system, or None."""
+    if _memory_system is None:
+        return None
+    return getattr(_memory_system, "_store", None)
+
+
+@tool(
+    name="essay_get",
+    description=(
+        "Read an interpretive essay by entity key. Returns the full markdown "
+        "body plus metadata (title, citations, cross-references, patch count). "
+        "Entity keys follow the pattern 'person:name', 'project:name', or "
+        "'event:description'."
+    ),
+    parameters=[
+        ToolParameter(
+            name="key",
+            type="string",
+            description="Entity key (e.g., 'person:kaylee', 'project:novelty-pipeline').",
+            required=True,
+        ),
+    ],
+)
+def essay_get(key: str) -> str:
+    """Read an interpretive essay by entity key."""
+    store = _get_essay_store()
+    if store is None:
+        return "Error: Memory system not initialized."
+    essay = store.get_essay(key)
+    if essay is None:
+        return f"No essay found for key '{key}'."
+    lines = [
+        f"# {essay['title'] or key}",
+        "",
+        essay["body"],
+        "",
+        "---",
+        f"**Entity key:** {essay['entity_key']}",
+        f"**Patch count:** {essay['patch_count']}",
+        f"**Updated:** {essay['updated_at'][:16]}",
+        f"**Created:** {essay['created_at'][:16]}",
+    ]
+    if essay["citations"]:
+        lines.append(f"**Citations:** {', '.join(essay['citations'])}")
+    if essay["cross_refs"]:
+        lines.append(f"**Cross-references:** {', '.join(essay['cross_refs'])}")
+    return "\n".join(lines)
+
+
+@tool(
+    name="essay_list",
+    description=(
+        "List all interpretive essays. Shows entity keys, titles, patch "
+        "counts, and last-updated timestamps."
+    ),
+    parameters=[],
+)
+def essay_list() -> str:
+    """List all interpretive essays."""
+    store = _get_essay_store()
+    if store is None:
+        return "Error: Memory system not initialized."
+    essays = store.list_essays()
+    if not essays:
+        return "No essays."
+    lines = []
+    for e in essays:
+        title_str = f" — {e['title']}" if e["title"] else ""
+        lines.append(
+            f"**{e['entity_key']}**{title_str} | "
+            f"patches: {e['patch_count']} | "
+            f"updated: {e['updated_at'][:16]}"
+        )
+    return f"{len(essays)} essay{'s' if len(essays) != 1 else ''}:\n\n" + "\n".join(lines)
+
+
+@tool(
+    name="essay_edit",
+    description=(
+        "Edit an interpretive essay in place. Exact string replacement "
+        "like digest_edit / file_edit. If the entity key does not exist, "
+        "creates a new essay with new_text as the body (old_text is ignored "
+        "for creation). Use this to maintain, correct, or extend essays. "
+        "Optionally updates citations and cross_refs atomically with the edit."
+    ),
+    parameters=[
+        ToolParameter(
+            name="key",
+            type="string",
+            description="Entity key (e.g., 'person:kaylee', 'project:novelty-pipeline').",
+            required=True,
+        ),
+        ToolParameter(
+            name="old_text",
+            type="string",
+            description=(
+                "Exact text to find in the essay body (must match uniquely "
+                "unless replace_all=true). For new essays, this is ignored."
+            ),
+            required=True,
+        ),
+        ToolParameter(
+            name="new_text",
+            type="string",
+            description="Replacement text (or full body for new essays).",
+            required=True,
+        ),
+        ToolParameter(
+            name="title",
+            type="string",
+            description="Essay title (optional; set on create, updated on edit if provided).",
+            required=False,
+        ),
+        ToolParameter(
+            name="replace_all",
+            type="boolean",
+            description="Replace all occurrences (default false — requires unique match).",
+            required=False,
+        ),
+        ToolParameter(
+            name="citations",
+            type="string",
+            description=(
+                "JSON array of memory IDs this essay cites (e.g., "
+                "'[\"m_abc123\", \"m_def456\"]'). Replaces existing citations."
+            ),
+            required=False,
+        ),
+        ToolParameter(
+            name="cross_refs",
+            type="string",
+            description=(
+                "JSON array of entity keys this essay cross-references (e.g., "
+                "'[\"project:fishing\", \"person:owner\"]'). Replaces existing cross-refs."
+            ),
+            required=False,
+        ),
+    ],
+)
+def essay_edit(
+    key: str,
+    old_text: str,
+    new_text: str,
+    title: str = "",
+    replace_all: bool = False,
+    citations: str = "",
+    cross_refs: str = "",
+) -> str:
+    """Edit or create an interpretive essay."""
+    import json as _json
+    import logging
+
+    store = _get_essay_store()
+    if store is None:
+        return "Error: Memory system not initialized."
+
+    # Parse citations/cross_refs JSON upfront so we fail early on bad input.
+    parsed_citations = None
+    parsed_cross_refs = None
+    if citations:
+        try:
+            parsed_citations = _json.loads(citations)
+            if not isinstance(parsed_citations, list):
+                return "Error: citations must be a JSON array of strings."
+        except _json.JSONDecodeError as e:
+            return f"Error: invalid citations JSON — {e}"
+    if cross_refs:
+        try:
+            parsed_cross_refs = _json.loads(cross_refs)
+            if not isinstance(parsed_cross_refs, list):
+                return "Error: cross_refs must be a JSON array of strings."
+        except _json.JSONDecodeError as e:
+            return f"Error: invalid cross_refs JSON — {e}"
+
+    existing = store.get_essay(key)
+    if existing is None:
+        store.create_essay(
+            key, body=new_text, title=title,
+            citations=parsed_citations, cross_refs=parsed_cross_refs,
+        )
+        logging.getLogger("mesh.memory.audit").info(
+            "essay_create key=%r title=%r body_len=%d",
+            key, title, len(new_text),
+        )
+        return f"Essay '{key}' created ({len(new_text)} chars)."
+
+    # Validate the text replacement FIRST — fail early, mutate nothing.
+    body = existing["body"]
+    count = body.count(old_text)
+    if count == 0:
+        return "Error: old_text not found in essay body."
+    if not replace_all and count > 1:
+        return (
+            f"Error: old_text matches {count} locations — "
+            f"provide a more specific string or set replace_all=true."
+        )
+
+    # Replacement is valid — compute the new body.
+    if replace_all:
+        new_body = body.replace(old_text, new_text)
+    else:
+        new_body = body.replace(old_text, new_text, 1)
+    n_replaced = count if replace_all else 1
+
+    # Apply title + body + citations + cross_refs atomically, gated on the
+    # revision we read above.  The read → compute → write window is now
+    # genuinely concurrent (curation turns no longer serialise behind message
+    # turns), so an unconditional UPDATE would silently drop whichever patch
+    # landed in between.
+    ok, conflict = store.update_essay_if_revision(
+        key,
+        int(existing.get("patch_count") or 0),
+        body=new_body,
+        title=title if title else None,
+        citations=parsed_citations,
+        cross_refs=parsed_cross_refs,
+    )
+    if not ok:
+        return f"Error: {conflict}"
+
+    logging.getLogger("mesh.memory.audit").info(
+        "essay_edit key=%r old=%r new=%r replace_all=%s",
+        key, old_text[:100], new_text[:100], replace_all,
+    )
+    return f"Essay updated ({n_replaced} replacement{'s' if n_replaced > 1 else ''})."
 
 
 # =============================================================================
@@ -4834,64 +7517,310 @@ async def map_review(project_dir: str = "") -> str:
 # =============================================================================
 # These tools are intercepted by AgentNode._execute_all_tools and routed
 # through RouterV2's per-instance _worker_tool_handlers dict BEFORE the
-# global ToolRegistry. Handlers here are None — the real execution path
-# is in router_v2.py's _tool_worker_launch / _tool_worker_status.
-# Registered with None handlers so they appear in tool_help / mesh-tool.
+# global ToolRegistry. The functions here only define schemas; the real
+# execution path is in RouterV2's bound handlers. They are intentionally not
+# included in get_all_tool_names(), because invoking them through mesh-tool
+# would have no RouterV2 instance or worker slot to own.
+
+
+@tool(
+    name="solicitation_scout",
+    description=(
+        "Search for grant solicitations matching a PI's CV and research "
+        "program. Launches a three-phase pipeline: (1) extracts the PI's "
+        "capability profile, (2) searches broadly for currently open "
+        "solicitations, and (3) reads promising solicitations deeply and "
+        "ranks them by fit. For a new run, provide cv and research_threads. "
+        "To continue an existing run, provide run_dir instead; completed "
+        "phases are skipped. Set dry_run=true to inspect the planned phases "
+        "without claiming the worker slot (dry-run and resume are mutually "
+        "exclusive). A real run occupies the worker slot; use worker_status "
+        "for phase progress. On completion it returns ranked opportunities "
+        "with fit scores, deadlines, budget ranges, eligibility, and 'why "
+        "this PI' arguments."
+    ),
+    parameters=[
+        ToolParameter(
+            name="cv",
+            type="string",
+            description=(
+                "Path to the PI's CV file. Accepted source formats are PDF, "
+                "plain text, Markdown, and LaTeX. The file must already exist."
+            ),
+            required=False,
+        ),
+        ToolParameter(
+            name="research_threads",
+            type="string",
+            description=(
+                "Path to a Markdown or text file describing the PI's active "
+                "research threads. The file must already exist."
+            ),
+            required=False,
+        ),
+        ToolParameter(
+            name="pi_papers",
+            type="string",
+            description=(
+                "Optional comma-separated paper identifiers, DOI/arXiv values, "
+                "URLs, titles, or local file paths."
+            ),
+            required=False,
+        ),
+        ToolParameter(
+            name="project_name",
+            type="string",
+            description=(
+                "Optional short, filesystem-safe label for this search and "
+                "its run directory."
+            ),
+            required=False,
+        ),
+        ToolParameter(
+            name="run_dir",
+            type="string",
+            description=(
+                "Path to an existing solicitation-scout run directory to "
+                "resume. Its run-config.json is reused and completed phases "
+                "are skipped. Mutually exclusive with dry_run."
+            ),
+            required=False,
+        ),
+        ToolParameter(
+            name="dry_run",
+            type="boolean",
+            description=(
+                "Print the planned three-phase commands and prompts without "
+                "creating a run or claiming the worker slot. Mutually "
+                "exclusive with run_dir."
+            ),
+            required=False,
+            default=False,
+        ),
+    ],
+)
+async def solicitation_scout(
+    cv: str = "",
+    research_threads: str = "",
+    pi_papers: str = "",
+    project_name: str = "",
+    run_dir: str = "",
+    dry_run: bool = False,
+) -> str:  # pragma: no cover
+    """Placeholder — executed by RouterV2._tool_solicitation_scout."""
+    raise NotImplementedError("solicitation_scout is handled by RouterV2")
+
+
+@tool(
+    name="skill_draft",
+    description=(
+        "Launch a governed drafting worker after completing a procedure the "
+        "user expects to repeat. The worker receives the recent episode, any "
+        "named authoritative source files, the card schema, and a worked "
+        "example. It may create only a validated status=proposed card under "
+        "the calling agent's .proposals directory. It cannot activate a card "
+        "or modify index.yaml. The drafting worker occupies the normal worker "
+        "slot and reports the proposal for human review."
+    ),
+    parameters=[
+        ToolParameter(
+            name="task_summary",
+            type="string",
+            description=(
+                "What recurring procedure the card should capture, including "
+                "the just-completed task and any scope the user specified."
+            ),
+            required=True,
+        ),
+        ToolParameter(
+            name="source_files",
+            type="array",
+            description=(
+                "Optional absolute paths to authoritative local runbooks, "
+                "configuration, tests, or implementation files. Their contents "
+                "and SHA-256 fingerprints are included in the drafting handoff."
+            ),
+            required=False,
+            default=[],
+        ),
+        ToolParameter(
+            name="trace_path",
+            type="string",
+            description=(
+                "Optional absolute path to a specific older completed-worker "
+                "trace. When omitted, the latest completed non-drafting worker "
+                "trace for the calling agent is selected automatically."
+            ),
+            required=False,
+            default="",
+        ),
+    ],
+)
+async def skill_draft(
+    task_summary: str,
+    source_files: list[str] | None = None,
+    trace_path: str = "",
+) -> str:  # pragma: no cover
+    """Placeholder — executed by RouterV2._tool_skill_draft."""
+    raise NotImplementedError("skill_draft is handled by RouterV2")
 
 
 @tool(
     name="worker_launch",
     description=(
-        "Launch a worker to execute a task autonomously. The worker receives "
-        "full conversation context and can use all tools including file edits "
-        "and bash. Returns immediately — the router continues its loop while "
-        "the worker runs. Use this for tasks requiring sustained autonomous "
-        "work: code changes, multi-step investigations, deployments."
+        "Launch a worker to execute a task autonomously. The worker does NOT "
+        "see the conversation — it receives the task text you write here plus "
+        "its standing digest, and nothing else — and can use all tools "
+        "including file edits and bash. Returns immediately: the router "
+        "continues its loop while the worker runs. Use this for tasks "
+        "requiring sustained autonomous work: code changes, multi-step "
+        "investigations, deployments."
     ),
     parameters=[
         ToolParameter(
             name="task",
             type="string",
             description=(
-                "Rich task description for the worker. Be specific about what "
-                "needs to be done, what files/contexts are relevant, and what "
-                "success looks like."
+                "The worker's entire input. It cannot see this conversation, "
+                "so write it self-contained: what needs to be done, the "
+                "relevant file paths, any findings or constraints already "
+                "established, and what success looks like. Resolve every "
+                "pronoun — a task reading 'fix it' gives the worker nothing."
             ),
             required=True,
         ),
+        ToolParameter(
+            name="task_type",
+            type="string",
+            description=(
+                "REQUIRED configured task type (for example simple-code, "
+                "moderate-code, complex-code, writing, research, audit, or "
+                "plan). The type resolves to a backend and workflow through "
+                "mesh.yaml. A dispatch without a task_type is refused and no "
+                "worker runs."
+            ),
+            required=True,
+        ),
+        ToolParameter(
+            name="backend",
+            type="string",
+            description=(
+                "HARD OVERRIDE ONLY: populate this only when the user "
+                "explicitly named a backend in the current instruction, and "
+                "copy that name verbatim. Never choose a backend directly. "
+                "Still requires a task_type, and is refused on a task type "
+                "with a configured Plan-Execute-Verify workflow."
+            ),
+            required=False,
+        ),
+        ToolParameter(
+            name="reason",
+            type="string",
+            description=(
+                "Concise one-line rationale for the selected task_type. "
+                "Omitting it falls back to the configured default with a "
+                "warning, so always supply one."
+            ),
+            required=False,
+        ),
     ],
 )
-async def worker_launch(task: str) -> str:  # pragma: no cover
+async def worker_launch(
+    task: str,
+    task_type: str = "",
+    backend: str = "",
+    reason: str = "",
+) -> str:  # pragma: no cover
     """Placeholder — executed by RouterV2._tool_worker_launch."""
     raise NotImplementedError("worker_launch is handled by RouterV2")
 
 
 @tool(
+    name="worker_list",
+    description=(
+        "List every fixed worker slot, including empty slots, with the current "
+        "slot-table revision, worker IDs, lifecycle states, elapsed time, and "
+        "bounded task/activity previews."
+    ),
+    parameters=[],
+)
+async def worker_list() -> str:  # pragma: no cover
+    """Placeholder — executed by RouterV2._tool_worker_list."""
+    raise NotImplementedError("worker_list is handled by RouterV2")
+
+
+@tool(
     name="worker_status",
     description=(
-        "Check progress of the currently running worker. There is only one "
-        "worker at a time — do NOT pass a worker_id (no such parameter "
-        "exists). The ONLY accepted parameter is max_lines (integer, "
-        "default 100). Returns metadata (elapsed time, task description, "
-        "tool call count, state) plus the worker's activity transcript. "
-        "Set max_lines=0 for the full unbounded transcript."
+        "Check worker progress. Pass worker_id for a detailed transcript. "
+        "Without worker_id, a single active worker is detailed; zero or "
+        "multiple active workers return the compact all-slot view."
     ),
     parameters=[
+        ToolParameter(
+            name="worker_id",
+            type="string",
+            description="Exact worker ID to inspect.",
+            required=False,
+        ),
         ToolParameter(
             name="max_lines",
             type="integer",
             description=(
-                "Maximum activity lines to return. Default 100. Set to 0 "
-                "for the full unbounded transcript."
+                "Maximum activity lines to return. Default 100; values are "
+                "clamped to the safe range 1-500."
             ),
             required=False,
             default=100,
         ),
     ],
 )
-async def worker_status(max_lines: int = 100) -> str:  # pragma: no cover
+async def worker_status(
+    worker_id: str | None = None,
+    max_lines: int = 100,
+) -> str:  # pragma: no cover
     """Placeholder — executed by RouterV2._tool_worker_status."""
     raise NotImplementedError("worker_status is handled by RouterV2")
+
+
+@tool(
+    name="worker_cancel",
+    description=(
+        "Cancel one router-owned worker by exact worker_id, or explicitly "
+        "cancel every active worker with cancel_all=true. If multiple workers "
+        "run and neither target is supplied, returns the slot list and does "
+        "not cancel anything."
+    ),
+    parameters=[
+        ToolParameter(
+            name="worker_id",
+            type="string",
+            description="Exact worker ID to cancel.",
+            required=False,
+        ),
+        ToolParameter(
+            name="cancel_all",
+            type="boolean",
+            description="Explicitly cancel every active worker.",
+            required=False,
+            default=False,
+        ),
+        ToolParameter(
+            name="reason",
+            type="string",
+            description="Optional cancellation reason for diagnostics.",
+            required=False,
+            default="",
+        ),
+    ],
+)
+async def worker_cancel(
+    worker_id: str | None = None,
+    cancel_all: bool = False,
+    reason: str = "",
+) -> str:  # pragma: no cover
+    """Placeholder — executed by RouterV2._tool_worker_cancel."""
+    raise NotImplementedError("worker_cancel is handled by RouterV2")
 
 
 @tool(
@@ -4935,6 +7864,35 @@ async def worker_stop(reason: str = "Worker self-stop") -> str:  # pragma: no co
 )
 async def todo_list(conversation_id: str = None, include_done: bool = True, limit: int = 100) -> str:  # pragma: no cover
     raise NotImplementedError("todo_list is handled by AgentNode")
+
+
+@tool(
+    name="conversation_notes_get",
+    description=(
+        "Get pinned notes for the current conversation, or for an explicit "
+        "conversation_id. These notes usually point to worklog or operations files."
+    ),
+    parameters=[
+        ToolParameter(name="conversation_id", type="string", description="Conversation ID. Defaults to the triggering conversation.", required=False),
+    ],
+)
+async def conversation_notes_get(conversation_id: str = None) -> str:  # pragma: no cover
+    raise NotImplementedError("conversation_notes_get is handled by AgentNode")
+
+
+@tool(
+    name="conversation_notes_set",
+    description=(
+        "Set pinned notes for the current conversation. Keep this short: file "
+        "paths plus one-line descriptions, not the file contents."
+    ),
+    parameters=[
+        ToolParameter(name="content", type="string", description="Pinned note content. Use concise pointers to relevant files.", required=True),
+        ToolParameter(name="conversation_id", type="string", description="Conversation ID. Defaults to the triggering conversation.", required=False),
+    ],
+)
+async def conversation_notes_set(content: str, conversation_id: str = None) -> str:  # pragma: no cover
+    raise NotImplementedError("conversation_notes_set is handled by AgentNode")
 
 
 @tool(
@@ -5069,26 +8027,56 @@ async def scratchpad_read(conversation_id: str) -> str:
 # History Search Tool (read-only, lossless recall over raw conversation history)
 # =============================================================================
 
-def _resolve_history_file() -> "Path | None":
+def _history_dir() -> "Path":
+    """The history root for this call.
+
+    Scoped to ``StatePaths.history_dir`` under an enabled policy, so an
+    isolated agent reads the history inside its own boundary rather than the
+    shared ``~/.mesh/history`` directory that holds every other agent's file.
+    Falls back to the global constant when no policy is installed.
+    """
+    policy, state_paths = current_isolation()
+    if policy is not None and state_paths is not None:
+        return Path(state_paths.history_dir)
+    if policy is not None:
+        return Path(policy.state_root) / "history"
+    from .paths import HISTORY_DIR
+
+    return HISTORY_DIR
+
+
+def _resolve_history_file(node_id: str | None = None) -> "Path | None":
     """Resolve the calling agent's history file.
 
     Identity comes from MESH_NODE_ID (set by AgentNode in its own process
     and inherited by tool subprocesses), matching how mesh-tool identifies
-    the calling agent. Paths come from mesh.paths.HISTORY_DIR — no
+    the calling agent. Paths come from the scoped history root — no
     hardcoded home directories.
-    """
-    from .paths import HISTORY_DIR
 
-    node_id = os.environ.get("MESH_NODE_ID", "")
-    if not node_id:
+    ``node_id`` is accepted only so callers can be checked against the
+    calling identity; under an enabled policy a request for another agent's
+    history raises :class:`PermissionError` rather than reading it.
+    """
+    caller = os.environ.get("MESH_NODE_ID", "")
+    requested = node_id or caller
+    if not requested:
         return None
+
+    policy, _ = current_isolation()
+    if policy is not None and requested != caller:
+        raise PermissionError(
+            f"Cannot read history for '{requested}': an isolated agent may only "
+            f"search its own history ({caller or 'unknown caller'})."
+        )
+
+    history_dir = _history_dir()
     # AgentNode persists to agent-{nickname}.json (nickname = last segment)
-    nickname = node_id.split(":")[-1]
-    candidate = HISTORY_DIR / f"agent-{nickname}.json"
+    nickname = requested.split(":")[-1]
+    candidate = history_dir / f"agent-{nickname}.json"
     if candidate.exists():
         return candidate
     # Fallback: base Node default path uses the full node id
-    fallback = HISTORY_DIR / f"{node_id.replace(':', '-')}.json"
+    fallback = history_dir / f"{requested.replace(':', '-')}.json"
     if fallback.exists():
         return fallback
     return candidate  # Return primary path so the error message names it
@@ -5185,7 +8173,10 @@ def history_search(
     date_to: str = None,
 ) -> str:
     """Deterministic keyword search over the calling agent's raw history file."""
-    history_file = _resolve_history_file()
+    try:
+        history_file = _resolve_history_file()
+    except PermissionError as exc:
+        return f"Error: {exc}"
     if history_file is None:
         return (
             "Error: cannot determine calling agent — MESH_NODE_ID is not set. "
@@ -5663,6 +8654,13 @@ def canvas_create_module(name: str, course_id: int = None, position: int = None)
 )
 def canvas_upload_file(local_path: str, course_id: int = None, folder_path: str = None, name: str = None) -> str:
     try:
+        policy, _ = current_isolation()
+        if policy is not None:
+            from .paths import resolve_path as _rp
+
+            resolved = Path(_rp(local_path)).resolve()
+            _enforce_isolation_path(resolved, local_path, require_write=False)
+            local_path = str(resolved)
         client = _get_canvas_client()
         kwargs: dict[str, Any] = {"local_path": local_path}
         if course_id is not None:

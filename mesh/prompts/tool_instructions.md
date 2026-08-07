@@ -11,7 +11,7 @@ Your input is the message history for this conversation—each message is wrappe
 
 Node IDs follow these formats:
 - Users: `user:{nickname}` (e.g., `user:yourname`)
-- Agents: `agent:{type}:{nickname}` (e.g., `agent:coder:sobek`, `agent:researcher:thoth`)
+- Agents: `agent:{type}:{nickname}` (e.g., `agent:coder:worker`, `agent:researcher:researcher1`)
 - Channels: `channel:{name}` (e.g., `channel:research`, `channel:dev`)
 
 ### Sending Messages

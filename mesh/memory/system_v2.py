@@ -12,6 +12,7 @@ active project persistence across restarts.
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -19,6 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 
@@ -32,6 +34,7 @@ from .selection import (
     try_swap,
 )
 from .store import MemoryEntry, MemoryStore, _deserialize_embedding
+from ..config import normalize_entity_resolution_mode
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +209,7 @@ Which project does this work belong to? Your current projects:
 {known_project_names}
 Use one of these names exactly. If it spans multiple projects, name the
 primary one. If it doesn't match any existing project, suggest a short
-hyphenated name for a new project (e.g., "data-analysis", "llm-eval").
+hyphenated name for a new project (e.g., "rec-fishing", "llm-eval").
 </project>
 
 IMPORTANT: You MUST close every XML tag. Each opening <tag> MUST have
@@ -513,7 +516,10 @@ def _parse_tool_calls(text: str) -> list[tuple[str, str]]:
 
 
 async def _execute_tool_call(
-    tool_name: str, arg: str, project_dir: str | None = None,
+    tool_name: str,
+    arg: str,
+    project_dir: str | None = None,
+    isolation_policy=None,
 ) -> str:
     """Execute a curation tool call (file_read or bash_exec).
 
@@ -526,13 +532,24 @@ async def _execute_tool_call(
             # Resolve relative paths against project_dir
             if not os.path.isabs(path) and project_dir:
                 path = os.path.join(project_dir, path)
-            with open(path, "r", errors="replace") as f:
+            resolved = Path(path).resolve()
+            if isolation_policy is not None:
+                if not isolation_policy.contains(resolved):
+                    return f"Error reading {arg}: path is outside the isolation boundary"
+                if isolation_policy.is_protected_state(resolved):
+                    return f"Error reading {arg}: path is protected agent state"
+            with resolved.open("r", errors="replace") as f:
                 content = f.read(100_000)  # 100KB cap
             return content
         except Exception as e:
             return f"Error reading {arg}: {e}"
     elif tool_name == "bash_exec":
         # Read-only shell command with timeout
+        # A shell string cannot be content-validated.  Until the Phase 4 bwrap
+        # boundary exists, fail closed for isolated map review rather than let
+        # a nominally read-only helper execute `cat /etc/passwd`.
+        if isolation_policy is not None:
+            return "Error executing command: bash_exec is unavailable under isolation"
         try:
             proc = await asyncio.create_subprocess_shell(
                 arg,
@@ -662,11 +679,48 @@ class MemorySystemV2:
         formation_v3_model: str | None = None,
         formation_v3_parse_failure_fallback_threshold: int = 3,
         payload_max_chars: int = 6000,
+        entity_resolution_mode: str = "off",
+        entity_resolution_enabled: bool = False,
+        entity_registry_injection_cap: int = 1000,
+        entity_formation_max_tokens: int = 48_000,
+        entity_activation_window_threshold: int = 3,
         formation_llm_client=None,
+        # Scoped state roots. ``None`` means "use the global mesh.paths
+        # constants", which is the legacy path for an unisolated agent.
+        memory_dir: str | None = None,
+        maps_dir: str | None = None,
+        # Phase 2B: the agent's isolation policy, used to bound the project
+        # directories a map may be built from. ``None`` = unisolated = every
+        # directory is acceptable, exactly as today.
+        isolation_policy=None,
         **kwargs,
     ):
         self._nickname = nickname
+        self._memory_dir = str(memory_dir) if memory_dir else None
+        self._maps_dir = str(maps_dir) if maps_dir else None
+        self._isolation_policy = (
+            isolation_policy
+            if (isolation_policy is not None and getattr(isolation_policy, "enabled", False))
+            else None
+        )
+        self.project_maps_injection_enabled: bool = True
         self._payload_max_chars = payload_max_chars
+        self._entity_resolution_mode = normalize_entity_resolution_mode(
+            entity_resolution_mode,
+            legacy_enabled=entity_resolution_enabled,
+        )
+        self._entity_resolution_enabled = (
+            self._entity_resolution_mode == "write"
+        )
+        if entity_registry_injection_cap < 1:
+            raise ValueError("entity_registry_injection_cap must be at least 1")
+        if entity_formation_max_tokens < 1:
+            raise ValueError("entity_formation_max_tokens must be at least 1")
+        self._entity_registry_injection_cap = entity_registry_injection_cap
+        self._entity_formation_max_tokens = entity_formation_max_tokens
+        self._entity_activation_window_threshold = (
+            entity_activation_window_threshold
+        )
         self._llm_client = llm_client
         self._formation_llm_client = formation_llm_client
         self._pool_max_entries = pool_max_entries
@@ -726,9 +780,69 @@ class MemorySystemV2:
         self._formation_lock: asyncio.Lock | None = None
         # Per-window failure counter, keyed by (cursor_idx, end_idx).
         self._parse_failure_count: dict[tuple[int, int], int] = {}
+        self._last_formation_telemetry: list[dict] = []
         # Optional callback fired after the cursor advances (success or fallback).
         # Used by AgentNode to reset its `_uncommitted_token_count` (§2.7.9).
         self._on_cursor_advance: callable | None = None
+        # Optional post-commit self-curation notification (§4.1).  Invoked
+        # synchronously after the memories and cursor are durable; the callback
+        # must only enqueue and return — awaiting here would hold
+        # ``_formation_lock`` across an LLM call.
+        self._curation_batch_cb: callable | None = None
+
+    def set_curation_batch_callback(self, callback: "callable | None") -> None:
+        """Register (or clear) the post-commit curation notification."""
+        self._curation_batch_cb = callback
+
+    def _emit_curation_batch(
+        self,
+        *,
+        reason: str,
+        new_entries: list["MemoryEntry"],
+        entity_mutations: list[dict] | None,
+        formed_at: str,
+    ) -> None:
+        """Emit exactly one CurationBatch for a non-empty successful commit.
+
+        Post-commit, synchronous, non-blocking, and exception-swallowing: a
+        broken curation pipeline must not make formation look like it failed
+        and must not feed the three-strike parse-failure fallback.
+        """
+        callback = self._curation_batch_cb
+        if callback is None or not new_entries:
+            return
+        try:
+            from .curation import CurationBatch
+
+            batch = CurationBatch(
+                reason=reason,
+                memory_ids=tuple(entry.id for entry in new_entries),
+                entity_keys=tuple(
+                    sorted(self._entity_keys_touched(entity_mutations))
+                ),
+                formed_at=formed_at,
+            )
+            callback(batch)
+        except Exception:
+            logger.exception("curation batch emission failed")
+
+    @staticmethod
+    def _entity_keys_touched(entity_mutations: list[dict] | None) -> set[str]:
+        """Keys formation linked or proposed for the batch's memories."""
+        keys: set[str] = set()
+        for mutation in entity_mutations or []:
+            key = mutation.get("entity_key")
+            if key:
+                keys.add(str(key))
+            display_name = mutation.get("display_name")
+            entity_type = mutation.get("entity_type")
+            if mutation.get("op") == "create_and_link" and display_name:
+                from .entities import make_entity_slug
+
+                slug = make_entity_slug(str(display_name))
+                if slug:
+                    keys.add(f"{entity_type}:{slug}")
+        return keys
 
     @property
     def active_entries(self) -> list[MemoryEntry]:
@@ -737,9 +851,16 @@ class MemorySystemV2:
 
     async def initialize(self) -> None:
         """Open the store, load entries, restore active project."""
-        from ..paths import MAPS_DIR
-        os.makedirs(str(MAPS_DIR), exist_ok=True)
-        self._store = MemoryStore(self._nickname)
+        maps_dir = self._resolve_maps_dir()
+        os.makedirs(maps_dir, exist_ok=True)
+        # db_dir=None keeps MemoryStore on its own global default, so the
+        # disabled path is byte-for-byte what it was before injection.
+        self._store = MemoryStore(self._nickname, db_dir=self._memory_dir)
+        if self._formation_v3_enabled:
+            # This marker is the nightly fold's deployment fence. It is written
+            # only by a live MemorySystemV2 process that has loaded the shared
+            # extraction code, never by schema migration alone.
+            self._store.activate_authoritative_formation_contract()
         self._pool = self._store.load()
         self._personality_cache = self._store.get_personality()
         # Create the formation lock under the running loop.
@@ -786,19 +907,65 @@ class MemorySystemV2:
         # One-time migration: ensure DB maps have files in central directory
         await self._migrate_maps_to_central()
 
+    def _resolve_maps_dir(self) -> str:
+        """The maps root for this agent.
+
+        Returns the injected scoped directory when isolation supplied one,
+        otherwise the global constant so an unisolated agent is unchanged.
+        """
+        if self._isolation_policy is not None:
+            # Fail closed if a caller enabled isolation but omitted or forged
+            # the StatePaths injection.  Falling back to global ~/.mesh, or
+            # following a replaced maps-dir symlink, would put typed map writes
+            # outside the declared workspace.
+            expected = self._isolation_policy.state_root / "memory" / "maps"
+            candidate = Path(self._maps_dir) if self._maps_dir is not None else expected
+            resolved = candidate.resolve()
+            if (
+                resolved != expected.resolve()
+                or not self._isolation_policy.contains(resolved)
+            ):
+                raise PermissionError(
+                    f"isolated maps directory {resolved} is outside scoped state"
+                )
+            return str(candidate)
+        if self._maps_dir is not None:
+            return self._maps_dir
+        from ..paths import MAPS_DIR
+
+        return str(MAPS_DIR)
+
     async def _migrate_maps_to_central(self) -> None:
         """Write DB-only maps to the central maps directory and backfill summaries."""
-        from ..paths import MAPS_DIR
-        maps_dir = str(MAPS_DIR)
+        maps_dir = self._resolve_maps_dir()
         if not self._store:
             return
         for m in self._store.list_maps():
             name = m["project_name"]
+            if (
+                self._isolation_policy is not None
+                and self._safe_map_filename(name) is None
+            ):
+                logger.warning(
+                    "[ISOLATION] %s: skipping unsafe stored map name %r",
+                    self._nickname, name,
+                )
+                continue
             central = os.path.join(maps_dir, f"{name}.md")
             if os.path.exists(central):
                 continue
             # Check old project_dir location
             old_dir = self._store.get_project_dir(name)
+            if (
+                old_dir
+                and self._isolation_policy is not None
+                and not self._isolation_policy.contains(old_dir)
+            ):
+                logger.warning(
+                    "[ISOLATION] %s: skipping out-of-boundary stored map dir %s",
+                    self._nickname, old_dir,
+                )
+                old_dir = None
             if old_dir:
                 old_path = os.path.join(old_dir, "PROJECT_MAP.md")
                 if os.path.exists(old_path):
@@ -828,6 +995,11 @@ class MemorySystemV2:
 
         # Backfill summaries + embeddings for maps that have none
         for name, summary, emb_blob in self._store.list_map_embeddings():
+            if (
+                self._isolation_policy is not None
+                and self._safe_map_filename(name) is None
+            ):
+                continue
             if summary and emb_blob:
                 continue
             content = await self.get_map(name)
@@ -845,8 +1017,18 @@ class MemorySystemV2:
         On first access, migrates from old {project_dir}/PROJECT_MAP.md if
         the central file doesn't exist but the old one does.
         """
-        from ..paths import MAPS_DIR
-        central = os.path.join(str(MAPS_DIR), f"{project_name}.md")
+        # Phase 2B: this is the single funnel every map read/write goes
+        # through, so containment-safe naming is enforced here rather than at
+        # eleven call sites. Only an isolated agent is checked; an unisolated
+        # one keeps today's behaviour for any name.
+        if self._isolation_policy is not None:
+            if self._safe_map_filename(project_name) is None:
+                raise ValueError(
+                    f"unsafe project map name {project_name!r}: names may not "
+                    f"contain path separators, '..', or be absolute"
+                )
+
+        central = os.path.join(self._resolve_maps_dir(), f"{project_name}.md")
         if os.path.exists(central):
             return central
         # Backward-compat: check old project_dir location and migrate
@@ -855,6 +1037,15 @@ class MemorySystemV2:
             old_dir = self._active_project_dir
         if not old_dir and self._store:
             old_dir = self._store.get_project_dir(project_name)
+        # A stored project_dir predating isolation can point outside the
+        # boundary; never migrate from (or fall back to) such a path.
+        if old_dir and self._isolation_policy is not None:
+            if not self._isolation_policy.contains(old_dir):
+                logger.warning(
+                    "[ISOLATION] %s: ignoring out-of-boundary map dir %s",
+                    self._nickname, old_dir,
+                )
+                old_dir = None
         if old_dir:
             old_path = os.path.join(old_dir, "PROJECT_MAP.md")
             if os.path.exists(old_path):
@@ -1190,6 +1381,46 @@ class MemorySystemV2:
         from ..paths import resolve_path
         return resolve_path(path)
 
+    def _isolation_rejects_project_dir(self, project_dir: str) -> str | None:
+        """Return a refusal when ``project_dir`` is outside the boundary.
+
+        ``set_project_context`` scans and reads every file under the directory
+        it is given, so an unvalidated argument is a full read primitive over
+        the host. ``None`` means "allowed" and is the immediate answer for an
+        unisolated agent.
+        """
+        policy = self._isolation_policy
+        if policy is None:
+            return None
+        if policy.contains(project_dir):
+            return None
+        roots = ", ".join(str(p) for p in policy.workspaces)
+        return (
+            f"Error: project directory '{project_dir}' is outside this agent's "
+            f"isolation boundary. Allowed roots: {roots}"
+        )
+
+    @staticmethod
+    def _safe_map_filename(project_name: str) -> str | None:
+        """Validate a project name used as a map filename.
+
+        Map files are written as ``<maps_dir>/<project_name>.md``. A name
+        carrying ``/``, ``..``, a null byte, or an absolute path would let a
+        map write escape the maps directory, so those are rejected outright
+        rather than sanitized — silently rewriting a name would make the
+        stored map and the requested map differ.
+        """
+        name = str(project_name or "").strip()
+        if not name:
+            return None
+        if name in (".", ".."):
+            return None
+        if "/" in name or "\\" in name or "\x00" in name:
+            return None
+        if os.path.isabs(name):
+            return None
+        return name
+
     async def set_project_context(
         self, project_dir: str, reset: bool = False
     ) -> str:
@@ -1210,6 +1441,11 @@ class MemorySystemV2:
         project_name = os.path.basename(os.path.normpath(project_dir))
         if not project_name:
             return "Error: could not derive project name from path"
+        if (
+            self._isolation_policy is not None
+            and self._safe_map_filename(project_name) is None
+        ):
+            return f"Error: unsafe project name derived from path: {project_name!r}"
 
         # If the resolved path isn't a directory, check if it's a known
         # project name with a stored project_dir
@@ -1236,6 +1472,18 @@ class MemorySystemV2:
                         )
                         project_name = raw_name
                         project_dir = stored
+
+        # Validate the *final* directory, after the stored-dir fallback: that
+        # is the path that gets scanned, map-written, and (on reset) deleted
+        # from. Checking the argument alone would miss a stored dir pointing
+        # outside the boundary.
+        refusal = self._isolation_rejects_project_dir(project_dir)
+        if refusal is not None:
+            logger.warning(
+                "[ISOLATION] %s: refused set_project_context for %s",
+                self._nickname, project_dir,
+            )
+            return refusal
 
         logger.info(
             "Project context set: '%s' (reset=%s)", project_name, reset
@@ -1483,6 +1731,15 @@ class MemorySystemV2:
             real = os.path.realpath(f)
             if real in seen or not os.path.isfile(real):
                 continue
+            if self._isolation_policy is not None:
+                if not self._isolation_policy.contains(real):
+                    logger.warning(
+                        "[ISOLATION] %s: skipping escaped project symlink %s",
+                        self._nickname, real,
+                    )
+                    continue
+                if self._isolation_policy.is_protected_state(real):
+                    continue
             if any(f"/{skip}/" in real for skip in skip_dirs):
                 continue
             seen.add(real)
@@ -1530,14 +1787,23 @@ class MemorySystemV2:
                         raw_path,
                     )
                     continue
-            filepath = os.path.normpath(os.path.join(project_dir, rel_path))
+            filepath = os.path.realpath(os.path.join(project_dir, rel_path))
             # Safety: stay within project dir
-            if not filepath.startswith(real_project):
+            try:
+                inside_project = os.path.commonpath((real_project, filepath)) == real_project
+            except ValueError:
+                inside_project = False
+            if not inside_project:
                 logger.debug(
                     "_read_requested_files: path escapes project dir: %s → %s",
                     raw_path, filepath,
                 )
                 continue
+            if self._isolation_policy is not None:
+                if not self._isolation_policy.contains(filepath):
+                    continue
+                if self._isolation_policy.is_protected_state(filepath):
+                    continue
             if not os.path.isfile(filepath):
                 logger.warning(
                     "_read_requested_files: file not found: %s (resolved: %s)",
@@ -1872,6 +2138,7 @@ class MemorySystemV2:
             retrieval_key_embedding=emb_results[1],
             weight=0.0,
             project=project,
+            formation_source="window-drop-reflection-v2",
         )
 
         self._pool.append(entry)
@@ -2067,6 +2334,9 @@ class MemorySystemV2:
         Supports tool calls (file_read, bash_exec) for resolving pre-existing
         contradictions, capped by _curation_audit_max_tool_calls.
         """
+        if not self.project_maps_injection_enabled:
+            return
+
         if not self._active_project:
             return
 
@@ -2217,6 +2487,9 @@ class MemorySystemV2:
         the map with new information. Fire-and-forget — all failures are
         non-fatal (entries are already persisted).
         """
+        if not self.project_maps_injection_enabled:
+            return
+
         by_project: dict[str, list[MemoryEntry]] = {}
         for entry in entries:
             if entry.project:
@@ -2379,6 +2652,13 @@ class MemorySystemV2:
                 ),
             }
         project_dir = resolved_dir
+        refusal = self._isolation_rejects_project_dir(project_dir)
+        if refusal is not None:
+            logger.warning(
+                "[ISOLATION] %s: refused map review for %s",
+                self._nickname, project_dir,
+            )
+            return {"updated": False, "summary": refusal}
         if not os.path.isdir(project_dir):
             return {
                 "updated": False,
@@ -2523,7 +2803,12 @@ class MemorySystemV2:
                     tool_calls_used += 1
                     logger.debug("Review tool call [%d/%d]: %s(%s)",
                                  tool_calls_used, max_calls, tool_name, arg[:200])
-                    result_text = await _execute_tool_call(tool_name, arg, project_dir)
+                    result_text = await _execute_tool_call(
+                        tool_name,
+                        arg,
+                        project_dir,
+                        isolation_policy=self._isolation_policy,
+                    )
                     tool_results.append(
                         f"<tool_result tool=\"{tool_name}\" arg=\"{arg}\">\n"
                         f"{result_text}\n</tool_result>"
@@ -2644,6 +2929,9 @@ class MemorySystemV2:
         Maps are written to the central directory (~/.mesh/memory/maps/),
         so this always proceeds regardless of whether a project_dir exists.
         """
+        if not self.project_maps_injection_enabled:
+            return
+
         prompt = NEW_PROJECT_MAP_PROMPT.format(
             project_name=project_name,
             summary=summary,
@@ -2827,6 +3115,8 @@ class MemorySystemV2:
 
     async def render_maps_block(self) -> str:
         """Render the active project's map as XML (legacy fallback)."""
+        if not self.project_maps_injection_enabled:
+            return ""
         if not self._active_project:
             return ""
         content = await self.get_map(self._active_project)
@@ -2849,6 +3139,8 @@ class MemorySystemV2:
 
         Falls back to render_maps_block() when no embeddings are available.
         """
+        if not self.project_maps_injection_enabled:
+            return ""
         if not context_text.strip():
             return await self.render_maps_block()
 
@@ -3087,9 +3379,16 @@ class MemorySystemV2:
         if not to_remove:
             return 0
         remove_ids = {e.id for e in to_remove}
-        self._pool = [e for e in self._pool if e.id not in remove_ids]
-        for entry_id in remove_ids:
-            self._store.delete(entry_id)
+        # Commit the database cascade first so a failed write cannot make the
+        # in-memory pool disagree with SQLite.
+        deleted_ids = set(
+            self._store.delete_many(
+                sorted(remove_ids),
+                actor_node=f"memory:{self._nickname}",
+                reason="memory pool pruning",
+            )
+        )
+        self._pool = [e for e in self._pool if e.id not in deleted_ids]
         logger.info(
             "Memory pool pruned: removed %d entries (pool size: %d)",
             len(remove_ids), len(self._pool),
@@ -3220,6 +3519,7 @@ class MemorySystemV2:
                 retrieval_key_embedding=emb_results[1],
                 weight=0.0,
                 project=project or (self._active_project or ""),
+                formation_source="completion-reflection-v2",
             )
 
             self._pool.append(entry)
@@ -3320,13 +3620,11 @@ class MemorySystemV2:
           "hybrid"    — reciprocal-rank fusion of embedding + lexical
 
         project semantics:
-          None → active project (default)
+          None → no project filter (all projects)
           ""   → no project filter (all projects)
           str  → that specific project
         """
-        if project is None:
-            project = self._active_project
-        elif project == "":
+        if project == "":
             project = None
 
         if project:
@@ -3438,6 +3736,7 @@ class MemorySystemV2:
             retrieval_key_embedding=embs[1],
             weight=0.0,
             project=self._active_project or "",
+            formation_source="manual-entry-v2",
         )
         self._pool.append(entry)
         self._store.insert(entry)
@@ -3454,8 +3753,14 @@ class MemorySystemV2:
         if idx is None:
             return False
         was_active = entry_id in self._active_ids
+        deleted = self._store.delete(
+            entry_id,
+            actor_node=f"memory:{self._nickname}",
+            reason="memory_delete tool",
+        )
+        if not deleted:
+            return False
         self._pool.pop(idx)
-        self._store.delete(entry_id)
         if was_active:
             self._active_ids.discard(entry_id)
             if entry_id in self._active_weights:
@@ -3478,56 +3783,193 @@ class MemorySystemV2:
         Re-embeds the changed fields so search stays consistent.
         Returns a confirmation or error message.
         """
-        entry = self._find_entry(entry_id)
-        if entry is None:
+        if self._find_entry(entry_id) is None:
             return f"Error: no memory entry with ID '{entry_id}'."
 
-        before_summary = entry.summary
-        before_retrieval_key = entry.retrieval_key
+        from .entities import EntityExecutionContext, EntityService
 
-        if summary is not None:
-            entry.summary = summary
-        if reflection is not None:
-            entry.reflection = reflection
-        if retrieval_key is not None:
-            entry.retrieval_key = retrieval_key
-        if tags is not None:
-            entry.tags = tags
-        if outcome is not None:
-            entry.outcome = outcome
-
-        reembed = (
-            (summary is not None and summary != before_summary)
-            or (retrieval_key is not None and retrieval_key != before_retrieval_key)
-            or (reflection is not None)
+        service = EntityService(
+            self._store._conn,
+            actor_node=f"memory:{self._nickname}",
+            activation_window_threshold=self._entity_activation_window_threshold,
+            mutations_enabled=self._entity_resolution_enabled,
         )
-        if reembed:
+        prepared_snapshot = service._memory_snapshot(entry_id)
+        if prepared_snapshot is None:
+            return f"Error: no memory entry with ID '{entry_id}'."
+        patch = {
+            key: value
+            for key, value in {
+                "summary": summary,
+                "reflection": reflection,
+                "retrieval_key": retrieval_key,
+                "tags": tags,
+                "outcome": outcome,
+            }.items()
+            if value is not None
+        }
+        changed_fields = {
+            key for key, value in patch.items()
+            if value != prepared_snapshot[key]
+        }
+        if not changed_fields:
+            return f"Memory entry '{entry_id}' unchanged (changed=false)."
+
+        text_changed = bool(
+            changed_fields & {"summary", "reflection", "retrieval_key"}
+        )
+        reflection_emb = None
+        retrieval_emb = None
+        if text_changed:
+            candidate_summary = patch.get("summary", prepared_snapshot["summary"])
+            candidate_reflection = patch.get(
+                "reflection", prepared_snapshot["reflection"]
+            )
+            candidate_retrieval = patch.get(
+                "retrieval_key", prepared_snapshot["retrieval_key"]
+            )
             try:
                 emb_texts = [
-                    entry.reflection or entry.summary,
-                    entry.retrieval_key or entry.summary,
+                    candidate_reflection or candidate_summary,
+                    candidate_retrieval or candidate_summary,
                 ]
                 embs = await asyncio.wait_for(
                     self._embedder.embed_batch_to_arrays(emb_texts),
                     timeout=30,
                 )
-                entry.reflection_embedding = embs[0]
-                entry.retrieval_key_embedding = embs[1]
+                reflection_emb, retrieval_emb = embs[0], embs[1]
             except Exception:
-                logger.warning("Re-embedding failed for entry %s; keeping old embeddings", entry_id)
+                # Superseded text must never retain a stale vector.
+                logger.warning(
+                    "Re-embedding failed for entry %s; clearing embeddings",
+                    entry_id,
+                )
 
-        from .store import _SENTINEL
-        self._store.update_entry(
+        result = service.edit_memory_transactional(
             entry_id,
-            summary=summary,
-            reflection=reflection,
-            retrieval_key=retrieval_key,
-            tags=tags,
-            outcome=outcome,
-            reflection_embedding=entry.reflection_embedding if reembed else _SENTINEL,
-            retrieval_key_embedding=entry.retrieval_key_embedding if reembed else _SENTINEL,
+            patch,
+            prepared_snapshot=prepared_snapshot,
+            reflection_embedding=reflection_emb,
+            retrieval_key_embedding=retrieval_emb,
+            embeddings_prepared=text_changed,
+            context=EntityExecutionContext(
+                actor_node=f"memory:{self._nickname}"
+            ),
+            reason="memory_edit tool",
         )
-        return f"Memory entry '{entry_id}' updated successfully."
+        # Synchronize the in-memory object only after the transaction commits.
+        updated = self._store.get(entry_id)
+        if updated is not None:
+            for index, current in enumerate(self._pool):
+                if current.id == entry_id:
+                    self._pool[index] = updated
+                    break
+        if text_changed:
+            self._reselect_active_set()
+        return (
+            f"Memory entry '{entry_id}' updated successfully "
+            f"(changed=true; fields={','.join(result['changed_fields'])})."
+        )
+
+    async def correct_entity_link(
+        self,
+        *,
+        memory_id: str,
+        reason: str,
+        context,
+        remove_entity_key: str | None = None,
+        add_entity_key: str | None = None,
+        new_entity_type: str | None = None,
+        new_display_name: str | None = None,
+        new_identity_note: str = "",
+        aliases: list[str] | None = None,
+        naming_surface: str | None = None,
+        memory_patch: dict | None = None,
+    ) -> dict:
+        """Prepare embeddings, commit one correction, then sync the pool."""
+        from .entities import EntityService
+        from .ids import normalize_memory_id
+
+        # Curation renders memories to the model as ``[m_<id>]`` and tells it to
+        # copy the handle exactly, so the argument arrives in citation form while
+        # every lookup below is an exact match against the bare stored ID.
+        # Normalize once here and use the bare form for the whole call.
+        memory_id = normalize_memory_id(memory_id)
+
+        service = EntityService(
+            self._store._conn,
+            actor_node=context.actor_node,
+            activation_window_threshold=self._entity_activation_window_threshold,
+            mutations_enabled=self._entity_resolution_enabled,
+        )
+        prepared_snapshot = service._memory_snapshot(memory_id)
+        if prepared_snapshot is None:
+            raise ValueError(f"unknown memory ID {memory_id!r}")
+        # Resolve existing link targets before any embedding work.  A missing
+        # key is a deterministic registry error, not a reason to spend an LLM
+        # embedding call and then fail inside the transactional mutation.
+        for entity_key in (remove_entity_key, add_entity_key):
+            if entity_key and service.get_entity(entity_key) is None:
+                raise ValueError(f"unknown entity key {entity_key!r}")
+        patch = memory_patch or {}
+        text_changed = any(
+            field in patch and patch[field] != prepared_snapshot[field]
+            for field in ("summary", "reflection", "retrieval_key")
+        )
+        reflection_emb = None
+        retrieval_emb = None
+        if text_changed:
+            candidate_summary = patch.get("summary", prepared_snapshot["summary"])
+            candidate_reflection = patch.get(
+                "reflection", prepared_snapshot["reflection"]
+            )
+            candidate_retrieval = patch.get(
+                "retrieval_key", prepared_snapshot["retrieval_key"]
+            )
+            try:
+                embs = await asyncio.wait_for(
+                    self._embedder.embed_batch_to_arrays(
+                        [
+                            candidate_reflection or candidate_summary,
+                            candidate_retrieval or candidate_summary,
+                        ]
+                    ),
+                    timeout=30,
+                )
+                reflection_emb, retrieval_emb = embs
+            except Exception:
+                logger.warning(
+                    "Correction embedding failed for %s; clearing embeddings",
+                    memory_id,
+                )
+
+        result = service.correct_link_transactional(
+            memory_id,
+            reason=reason,
+            context=context,
+            prepared_snapshot=prepared_snapshot,
+            memory_patch=patch,
+            remove_entity_key=remove_entity_key,
+            add_entity_key=add_entity_key,
+            new_entity_type=new_entity_type,
+            new_display_name=new_display_name,
+            new_identity_note=new_identity_note or "",
+            aliases=aliases or (),
+            naming_surface=naming_surface,
+            reflection_embedding=reflection_emb,
+            retrieval_key_embedding=retrieval_emb,
+            embeddings_prepared=text_changed,
+        )
+        if result.get("memory_changed"):
+            updated = self._store.get(memory_id)
+            if updated is not None:
+                for index, current in enumerate(self._pool):
+                    if current.id == memory_id:
+                        self._pool[index] = updated
+                        break
+            if text_changed:
+                self._reselect_active_set()
+        return result
 
     def _find_entry(self, entry_id: str) -> MemoryEntry | None:
         for e in self._pool:
@@ -3572,6 +4014,36 @@ class MemorySystemV2:
         if not self._store:
             return (0, "")
         return self._store.get_formation_cursor()
+
+    @property
+    def entity_formation_telemetry_path(self) -> Path:
+        """JSONL telemetry beside the SQLite DB that owns the formation log."""
+        if self._store is None:
+            raise RuntimeError("memory store is not initialized")
+        return Path(self._store._db_path).with_suffix(
+            ".entity-formation.jsonl"
+        )
+
+    def _write_entity_formation_telemetry(self) -> None:
+        if self._entity_resolution_mode == "off":
+            return
+        path = self.entity_formation_telemetry_path
+        try:
+            with path.open("a", encoding="utf-8") as handle:
+                for record in self._last_formation_telemetry:
+                    handle.write(
+                        json.dumps(
+                            record,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        + "\n"
+                    )
+        except OSError:
+            logger.exception(
+                "Could not append entity formation telemetry to %s", path
+            )
 
     async def form_un_formed(
         self, history: list, reason: str,
@@ -3639,6 +4111,7 @@ class MemorySystemV2:
                         segments=seg_result,
                         new_cursor=new_cursor,
                         new_ts_utc=new_ts_utc,
+                        reason=reason,
                     )
                     cursor_advanced = True
                 except Exception as e:
@@ -3674,6 +4147,8 @@ class MemorySystemV2:
                 self._parse_failure_count.pop(window_key, None)
                 # Reset agent-node token counter on cursor advance (§2.7.9).
                 self._notify_cursor_advance()
+
+            self._write_entity_formation_telemetry()
 
             # New-project bootstrap (rev 5 / Alice Issue 1).
             for entry in new_entries:
@@ -3728,41 +4203,214 @@ class MemorySystemV2:
         their global indices because we pass the full `turns` slice.
         """
         from .formation_v3 import LLMSegmenterV3
+        from .entities import EntityService
 
+        self._last_formation_telemetry = []
+        registry = None
+        if self._entity_resolution_mode in {"shadow", "write"}:
+            registry = EntityService(
+                self._store._conn,
+                actor_node=f"memory:{self._nickname}",
+                activation_window_threshold=(
+                    self._entity_activation_window_threshold
+                ),
+                mutations_enabled=False,
+                active_entity_cap=self._entity_registry_injection_cap,
+            ).serialize_registry_for_injection(
+                self._entity_registry_injection_cap
+            )
         segmenter = LLMSegmenterV3(
             self._formation_llm_client or self._llm_client,
             window_size=self._formation_v3_window_size,
             overlap=self._formation_v3_overlap,
             defer_tail_turns=self._formation_v3_defer_tail,
             model=self._formation_v3_model,
+            agent_label=f"mesh agent '{self._nickname}'",
+            entity_resolution_mode=self._entity_resolution_mode,
+            entity_registry=registry,
+            entity_formation_max_tokens=self._entity_formation_max_tokens,
         )
         # Constrain the segmenter to known project names to prevent
         # hallucinated identifiers (e.g. "class-sp26" vs real "sp26-221").
         known_projects = self._known_project_names()
-        return await segmenter.segment(turns, known_projects=known_projects)
+        try:
+            return await segmenter.segment(
+                turns,
+                known_projects=known_projects,
+                cursor_start=base_offset,
+            )
+        finally:
+            self._last_formation_telemetry = list(
+                segmenter.window_telemetry
+            )
+
+    def _record_entity_validation_failure(
+        self,
+        window_key: str,
+        reason: str,
+    ) -> None:
+        for telemetry in self._last_formation_telemetry:
+            if telemetry.get("window_key") != window_key:
+                continue
+            telemetry["validation_failures"] = (
+                int(telemetry.get("validation_failures") or 0) + 1
+            )
+            telemetry.setdefault(
+                "validation_failure_reasons", []
+            ).append(reason)
+            return
+
+    def _translate_formation_entity_mutations(
+        self,
+        segments: list,
+        entries: list[MemoryEntry],
+    ) -> list[dict]:
+        """Translate validated model metadata into Increment 2a mutations."""
+        if self._entity_resolution_mode == "off":
+            return []
+        from .entities import ENTITY_TYPES, EntityService
+
+        service = EntityService(self._store._conn)
+        mutations: list[dict] = []
+        for segment, entry in zip(segments, entries, strict=True):
+            metadata = segment.metadata
+            window_key = str(metadata.get("window_key") or "")
+            entity_metadata = metadata.get("entity") or {}
+            for entity_key in entity_metadata.get("existing_keys") or []:
+                entity = service.get_entity(entity_key)
+                if entity is None:
+                    self._record_entity_validation_failure(
+                        window_key,
+                        f"unknown entity key {entity_key!r} during translation",
+                    )
+                    continue
+                if entity["status"] == "retired":
+                    self._record_entity_validation_failure(
+                        window_key,
+                        f"retired entity key {entity_key!r} during translation",
+                    )
+                    continue
+                if entity["status"] not in {"active", "pending"}:
+                    self._record_entity_validation_failure(
+                        window_key,
+                        f"invalid entity status for {entity_key!r}",
+                    )
+                    continue
+                mutations.append({
+                    "op": "link",
+                    "memory_id": entry.id,
+                    "entity_key": entity_key,
+                    "window_key": window_key,
+                    "assignment_source": "formation",
+                })
+
+            for proposal in entity_metadata.get("new_entities") or []:
+                entity_type = proposal.get("entity_type")
+                display_name = proposal.get("display_name")
+                aliases = proposal.get("aliases")
+                identity_note = proposal.get("identity_note")
+                if entity_type not in ENTITY_TYPES:
+                    self._record_entity_validation_failure(
+                        window_key,
+                        f"invalid entity_type {entity_type!r} during translation",
+                    )
+                    continue
+                if not isinstance(display_name, str) or not display_name.strip():
+                    self._record_entity_validation_failure(
+                        window_key,
+                        "empty entity display_name during translation",
+                    )
+                    continue
+                if (
+                    not isinstance(aliases, list)
+                    or not all(isinstance(alias, str) for alias in aliases)
+                    or not isinstance(identity_note, str)
+                ):
+                    self._record_entity_validation_failure(
+                        window_key,
+                        f"invalid proposal metadata for {display_name!r}",
+                    )
+                    continue
+                mutations.append({
+                    "op": "create_and_link",
+                    "memory_id": entry.id,
+                    "entity_type": entity_type,
+                    "display_name": display_name.strip(),
+                    "identity_note": identity_note.strip(),
+                    "aliases": [
+                        alias.strip() for alias in aliases if alias.strip()
+                    ],
+                    "origin": "formation",
+                    "window_key": window_key,
+                    "assignment_source": "formation",
+                })
+
+            for unresolved in entity_metadata.get("unresolved") or []:
+                surface = unresolved.get("surface")
+                reason = unresolved.get("reason")
+                candidates = unresolved.get("candidates")
+                if (
+                    not isinstance(surface, str)
+                    or not surface.strip()
+                    or not isinstance(reason, str)
+                    or not reason.strip()
+                    or not isinstance(candidates, list)
+                ):
+                    self._record_entity_validation_failure(
+                        window_key,
+                        "invalid unresolved entity metadata during translation",
+                    )
+                    continue
+                valid_candidates: list[str] = []
+                for candidate in candidates:
+                    entity = (
+                        service.get_entity(candidate)
+                        if isinstance(candidate, str)
+                        else None
+                    )
+                    if entity and entity["status"] in {"active", "pending"}:
+                        valid_candidates.append(candidate)
+                    else:
+                        self._record_entity_validation_failure(
+                            window_key,
+                            f"invalid unresolved candidate {candidate!r}",
+                        )
+                mutations.append({
+                    "op": "record_unresolved",
+                    "memory_id": entry.id,
+                    "window_key": window_key,
+                    "reason": reason.strip(),
+                    "details": {
+                        "surface": surface.strip(),
+                        "candidates": valid_candidates,
+                    },
+                })
+        return mutations
 
     async def _persist_v3_entries_atomic(
         self,
         segments: list,
         new_cursor: int,
         new_ts_utc: str,
+        reason: str = "",
     ) -> tuple[int, list[MemoryEntry]]:
-        """Persist worthwhile segments + advance cursor in one transaction."""
-        worthwhile = [
-            s for s in segments
-            if s.metadata.get("worthwhile", False)
-        ]
+        """Persist extracted records + advance the authoritative cursor atomically."""
+        extracted = list(segments)
 
-        if not worthwhile:
+        if not extracted:
             # No memory entries; still advance cursor (the un-formed range
-            # was processed — segmenter found nothing worth persisting).
-            self._store.set_formation_cursor(new_cursor, new_ts_utc)
+            # was processed and the extractor found no persistent facts).
+            self._store.insert_entry_and_advance_cursor(
+                entries=[],
+                new_cursor=new_cursor,
+                new_ts_utc=new_ts_utc,
+            )
             return 0, []
 
         # Compute embeddings in batch (cheaper than per-entry).
         emb_targets_reflection: list[str] = []
         emb_targets_retrieval: list[str] = []
-        for seg in worthwhile:
+        for seg in extracted:
             md = seg.metadata
             summary = md.get("summary", "") or ""
             retrieval_key = md.get("retrieval_key", "") or ""
@@ -3777,7 +4425,7 @@ class MemorySystemV2:
             )
         except Exception as e:
             logger.warning("v3 reflection embedding failed: %s", e)
-            reflection_embs = [None] * len(worthwhile)
+            reflection_embs = [None] * len(extracted)
 
         try:
             retrieval_embs = await asyncio.wait_for(
@@ -3786,58 +4434,68 @@ class MemorySystemV2:
             )
         except Exception as e:
             logger.warning("v3 retrieval embedding failed: %s", e)
-            retrieval_embs = [None] * len(worthwhile)
+            retrieval_embs = [None] * len(extracted)
 
         new_entries: list[MemoryEntry] = []
-        for i, seg in enumerate(worthwhile):
+        for i, seg in enumerate(extracted):
             md = seg.metadata
-            seg_turns = seg.turns
-            first_user_text = ""
-            for t in seg_turns:
-                role = getattr(t, "role", "")
-                from_node = getattr(t, "from_node", "")
-                if role == "user" or from_node.startswith("user:"):
-                    first_user_text = str(getattr(t, "content", ""))
-                    break
-
-            outcome = md.get("outcome") or "partial"
-            if outcome not in ("success", "partial", "failure"):
-                outcome = "partial"
-
-            score = int(md.get("score", 0))
-            score = max(0, min(10, score))
             tags = list(md.get("tags") or [])
-            tags.append(f"score:{score}")
-
-            raw_project = md.get("project")
-            project = raw_project if raw_project else ""
-
             topic_label = md.get("topic_label", "") or seg.topic_label or "untitled"
-            trigger = f"[TOPIC: {topic_label}] {first_user_text[:500]}"
+            trace = md.get("trace", "") or ""
+            trigger = f"[TOPIC: {topic_label}] {trace[:500]}"
 
             entry = MemoryEntry(
                 id=MemoryEntry.new_id(),
                 created_at=datetime.now(timezone.utc),
                 summary=md.get("summary", "") or "",
-                reflection="",
-                trace=self._format_turns_as_trace(seg_turns)[: self._trace_max_tokens * 4],
+                reflection=md.get("reflection", "") or "",
+                trace=trace,
                 trigger=trigger,
                 retrieval_key=md.get("retrieval_key", "") or "",
                 topic_label=topic_label,
                 tags=tags,
-                outcome=outcome,
-                project=project,
+                outcome=md.get("outcome", "") or "",
+                project=md.get("project", "") or "",
                 reflection_embedding=reflection_embs[i],
                 retrieval_key_embedding=retrieval_embs[i],
                 weight=0.0,
+                digest_candidate=bool(md["digest_candidate"]),
+                event_date=md.get("event_date", "") or "",
+                formation_source="live-extraction",
             )
             new_entries.append(entry)
+
+        entity_mutations = self._translate_formation_entity_mutations(
+            extracted,
+            new_entries,
+        )
+        window_keys = [
+            str(segment.metadata.get("window_key") or "")
+            for segment in extracted
+            if segment.metadata.get("window_key")
+        ]
+        entity_run_key = (
+            f"formation:{window_keys[0]}:{window_keys[-1]}"
+            if window_keys
+            else None
+        )
 
         # Atomic insert + cursor advance.
         self._store.insert_entry_and_advance_cursor(
             entries=new_entries,
             new_cursor=new_cursor,
             new_ts_utc=new_ts_utc,
+            entity_mutations=(
+                entity_mutations
+                if self._entity_resolution_mode == "write"
+                else None
+            ),
+            entity_actor_node=f"memory:{self._nickname}",
+            entity_resolution_enabled=self._entity_resolution_enabled,
+            entity_activation_window_threshold=(
+                self._entity_activation_window_threshold
+            ),
+            entity_run_key=entity_run_key,
         )
 
         # In-memory pool / FLMI bookkeeping.
@@ -3848,6 +4506,15 @@ class MemorySystemV2:
         elif new_entries:
             self._incremental_active_update(new_entries[0])
         self._prune_pool()
+
+        # Post-commit self-curation notification (§4.1).  The memories and the
+        # cursor are already durable; nothing below can roll them back.
+        self._emit_curation_batch(
+            reason=reason,
+            new_entries=new_entries,
+            entity_mutations=entity_mutations,
+            formed_at=new_ts_utc,
+        )
 
         return len(new_entries), new_entries
 
@@ -3879,6 +4546,9 @@ class MemorySystemV2:
             reflection_embedding=None,
             retrieval_key_embedding=None,
             weight=0.0,
+            digest_candidate=False,
+            event_date=(new_ts_utc or "")[:10],
+            formation_source="live-extraction-fallback",
         )
 
         self._store.insert_entry_and_advance_cursor(

@@ -5382,7 +5382,7 @@
 
         getDisplayName(nodeId) {
             if (!nodeId) return 'Unknown';
-            // Handle composite DM keys like "agent:coder:claude-sobek,user:yourname"
+            // Handle composite DM keys like "agent:coder:worker,user:yourname"
             if (nodeId.includes(',')) {
                 const parts = nodeId.split(',');
                 for (const part of parts) {

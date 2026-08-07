@@ -64,7 +64,7 @@ if [[ -n "${PYTHON:-}" && -x "$PYTHON" ]]; then
 elif [[ -x "$SCRIPT_DIR/.venv/bin/python3" ]]; then
     PYTHON="$SCRIPT_DIR/.venv/bin/python3"
 else
-    # Search for any .venv-* directory (e.g., .venv-mira, .venv-sobek)
+    # Search for any .venv-* directory (e.g., .venv-alpha, .venv-worker)
     for vdir in "$SCRIPT_DIR"/.venv-*/bin/python3; do
         if [[ -x "$vdir" ]]; then
             PYTHON="$vdir"

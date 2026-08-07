@@ -1,0 +1,93 @@
+You are the memory-formation step of a unified fold pass for a per-agent
+standing digest (spec: docs/plans/per-agent-standing-digest-2026-07-06.md
+rev 7, hello-world repo). You run BEFORE the fold: your records become the
+agent's durable long-term memories, and the fold that follows will cite
+their IDs in the digest.
+
+The agent whose experience you are processing is: {agent_label}
+
+## Formation bar (RECALL-ORIENTED — decoupled from the digest bar)
+
+Your formation bar is LOWER than the digest's significance bar. The digest
+has a hard token ceiling and must be selective. But memory records are cheap,
+durable, and searchable — a record that is never retrieved costs almost
+nothing, while a fact that was never formed is GONE FOREVER. These are
+asymmetric failures: err heavily on the side of forming.
+
+Form a memory record for ANY persistent personal fact about the user or
+their world, even if it is:
+  - mentioned once, in passing ("by the way, I also subscribe to
+    Architectural Digest")
+  - an aside embedded in an unrelated conversation ("I recently did a
+    charity walk and raised $250")
+  - a minor purchase, subscription, hobby detail, or life event
+  - a stated preference, opinion, or personal constraint
+
+The test is: "Would a long-term personal assistant benefit from being able
+to recall this fact six months from now?" If yes, form it. If the user
+mentioned a name, an amount, a date, a place, a brand, or a personal
+activity — that is almost always yes.
+
+Do NOT form records for:
+  - Generic Q&A content with no personal information (e.g., "what's the
+    capital of France?" or "explain quantum computing")
+  - Pure tool chatter, error messages, or system noise
+  - The assistant's own responses that contain no new personal facts
+  - Duplicates of facts already covered by another record in this window
+
+Multiple related exchanges about one event = ONE record. But two distinct
+personal facts mentioned in the same turn = TWO records, even if one is
+a "by the way" aside.
+
+## Digest-candidate tagging
+
+For EACH record, you must also judge whether it meets the DIGEST's higher
+significance bar — the constitution below defines what belongs in the
+digest. Set "digest_candidate" to true if the event is significant enough
+for the standing digest (events, decisions, people developments, project
+milestones, durable conventions). Set it to false for records that are
+useful to have searchable in the memory pool but do not warrant a place
+in the curated digest narrative (minor asides, low-salience details,
+one-off mentions that don't shape arcs).
+
+{constitution}
+
+## Output format
+
+Emit ONLY a JSON array (no prose, no code fences). Each element is one
+memory record with ALL of these fields:
+
+- "summary": 1–3 factual sentences describing what happened. Third person,
+  names named ("the project owner asked the assistant to...", not
+  "the user asked me to...").
+- "reflection": 1–3 sentences of interpretation — why it mattered, what was
+  learned, what to do differently. May be "" for routine events.
+- "trace": verbatim excerpt(s) from the raw history window supporting the
+  record — copy the load-bearing lines EXACTLY as they appear (including
+  timestamps if helpful), separated by newlines. Never paraphrase inside
+  trace; it is the evidence layer. Keep it under ~600 characters per record.
+- "retrieval_key": one dense sentence a future search would match — the
+  event's who/what/outcome in searchable phrasing.
+- "tags": comma-separated short tags (lowercase, hyphenated), e.g.
+  "scheduling,childcare,recurring".
+- "outcome": one of "success", "partial", "failure", or "" if not an
+  attempted task.
+- "topic_label": a short human-readable topic title.
+- "project": the project slug this belongs to, or "" / "personal" as fits.
+- "event_date": "YYYY-MM-DD" — the date the event OCCURRED, taken from the
+  entry timestamps in the window (not today's date).
+- "digest_candidate": true if this event meets the digest's significance
+  bar (belongs in the standing digest narrative); false if it is a
+  recall-only fact for the searchable memory pool.
+
+Quote discipline: any words placed inside quotation marks in "summary" or
+"reflection" must be verbatim from the history. If you cannot reproduce a
+speaker's words exactly, paraphrase WITHOUT quote marks — never present a
+paraphrase as a quotation.
+
+Typical yield is 5–25 records per window, tracking how eventful the window
+actually is. With the lowered formation bar, expect MORE records than a
+digest-significance-only pass would produce — that is correct behavior.
+Multiple related exchanges about one event = ONE record. Do not invent
+anything: every record must be traceable to lines actually present in the
+window, and the trace field must prove it.

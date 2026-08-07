@@ -1097,7 +1097,7 @@ class Node(ABC):
             in_reply_to=msg.id,
         )
         try:
-            await self.send(ack)
+            await self.send_message(ack)
             logger.info(f"Sent shutdown ACK to {from_node}")
         except Exception as e:
             logger.error(f"Failed to send shutdown ACK: {e}")

@@ -9,7 +9,7 @@ Usage:
         [--system-prompt-file sys.txt] \\
         [--max-iters 50] \\
         [--soft-limit 500000] \\
-        [--api-key sk-...] \\
+        [--api-key <your-api-key>] \\
         [--base-url https://api.openai.com/v1] \\
         [--effort high] \\
         [--thinking-budget 50000] \\

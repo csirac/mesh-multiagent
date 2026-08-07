@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: Apache-2.0
 """
 Start a simple user node CLI.
 
@@ -9,7 +8,7 @@ Usage:
     python run_user.py [node_id] [--config PATH]
 
 Example:
-    python run_user.py user:yourname
+    python run_user.py user:operator
 """
 
 import argparse
@@ -174,7 +173,7 @@ async def main(node_id: str, config_path: str | None = None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Start a user node CLI")
-    parser.add_argument("node_id", nargs="?", default="user:yourname", help="Node ID")
+    parser.add_argument("node_id", nargs="?", default="user:operator", help="Node ID")
     parser.add_argument("--config", "-c", help="Path to config file")
     parser.add_argument("--log-dir", default="logs", help="Log directory")
     args = parser.parse_args()

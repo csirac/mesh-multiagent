@@ -105,7 +105,7 @@ worker dispatch needed. Use this for:
 - Follow-up clarification questions like "what do you mean?", "show me the
   table again", "what prompt changes would fix this?", or design discussion
   where the needed evidence is already in the rolling window/retrieved context
-- Conceptual "why" questions and design corrections where Alan is steering the
+- Conceptual "why" questions and design corrections where Project Owner is steering the
   architecture, e.g. "why isn't the pipeline pulling fulltexts" or "all novelty
   assessment should use fulltext", unless he explicitly says to implement/fix.
 - Messages that quote or relay a prior task, especially "this task: ...", when
@@ -212,7 +212,7 @@ pass already has fresh tool results in `classify_history`. A user asking
 not a summary from memory.
 
 Examples that REQUIRE tool_call:
-- "Status?" / "Is sobek running?" / "Check disk space"
+- "Status?" / "Is the worker running?" / "Check disk space"
 - "What happened with the smoke run?" / "Is the build done?"
 - "How's alice doing?" / "Any errors in the logs?"
 

@@ -1,4 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
 """
 Configuration loading for the mesh.
 
@@ -8,6 +7,7 @@ Designed with future authentication in mind (placeholder fields).
 
 from __future__ import annotations
 
+import copy
 import os
 from dataclasses import dataclass, field
 from enum import Enum
@@ -15,6 +15,35 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+from .isolation import IsolationConfig, IsolationConfigError, IsolationPolicy
+
+
+# Open/closed model access classification for named LLM backends.
+#
+# BACKEND_ACCESS_OPEN     — open-weight model (self-hosted, or an open-weight
+#                           model served over someone else's API).
+# BACKEND_ACCESS_CLOSED   — closed-weight/vendor model.
+# ""                      — UNCLASSIFIED.  Every consumer treats this as closed:
+#                           the access gate is fail-closed, so forgetting to
+#                           classify a new backend can only ever be restrictive.
+BACKEND_ACCESS_OPEN = "open"
+BACKEND_ACCESS_CLOSED = "closed"
+BACKEND_ACCESS_VALUES = frozenset({"", BACKEND_ACCESS_OPEN, BACKEND_ACCESS_CLOSED})
+
+
+def classify_backend_access(access: Any) -> str:
+    """Normalize a raw ``access`` value to ``open`` or ``closed``.
+
+    Fail-closed: anything that is not exactly ``open`` — missing, empty,
+    misspelled, or a non-string — classifies as ``closed``.
+    """
+    value = str(access or "").strip().lower()
+    return (
+        BACKEND_ACCESS_OPEN
+        if value == BACKEND_ACCESS_OPEN
+        else BACKEND_ACCESS_CLOSED
+    )
 
 
 class EffortPreset(str, Enum):
@@ -119,6 +148,35 @@ def load_prompt_file(filename: str, prompts_dir: Path | None = None) -> str:
     return content
 
 
+def load_raw_prompt_file(filename: str, prompts_dir: Path | None = None) -> str:
+    """Load a prompt file's raw text *without* appending shared includes.
+
+    ``load_prompt_file`` automatically appends ``channel_policy.md``,
+    ``memory.md``, and ``mesh_tools.md`` to any non-shared prompt.  Those
+    includes are already part of an agent's standing system prompt (loaded the
+    same way from ``system_prompt_file``), so using the include-appending loader
+    for text that is injected *in addition to* the system prompt — most notably
+    the autonomous-controller operating mandate (plan §10.1) — would duplicate
+    ~3K tokens of shared context on every autonomous turn.  Use this loader for
+    such per-turn-injected text.
+
+    Args:
+        filename: Filename (e.g., "autonomous_controller.txt") or relative path.
+        prompts_dir: Override prompts directory (defaults to mesh/prompts/).
+
+    Returns:
+        The raw prompt content as a string, or empty string if file not found.
+    """
+    if prompts_dir is None:
+        prompts_dir = PROMPTS_DIR
+
+    prompt_path = prompts_dir / filename
+    if not prompt_path.exists():
+        return ""
+
+    return prompt_path.read_text().strip()
+
+
 @dataclass
 class RelevanceRouterConfig:
     """
@@ -138,6 +196,9 @@ class RelevanceRouterConfig:
     # LLM settings for relevance scoring
     model: str = "gpt-4o-mini"     # Small/fast model for scoring
     backend: str = "openai"
+    base_url: str | None = None    # Optional OpenAI-compatible endpoint override
+    api_key: str | None = None     # None = use env; "" = no Authorization header
+    max_tokens: int = 1024         # Local Qwen may emit hidden-style analysis before final SCORE
 
 
 @dataclass
@@ -169,6 +230,11 @@ class RouterConfig:
     fcm_enabled: bool = False
     fcm_credentials_file: str | None = None  # Path to service account JSON
 
+    # Claude Code account-usage polling is an optional operator dashboard
+    # feature.  It must never discover local credentials or make network
+    # requests merely because a router was started.
+    cc_usage_monitor_enabled: bool = False
+
     def __post_init__(self):
         from .paths import resolve_path
         self.storage_path = resolve_path(self.storage_path)
@@ -187,6 +253,30 @@ class RouterConfig:
         # Expand path for FCM credentials
         if self.fcm_credentials_file:
             self.fcm_credentials_file = resolve_path(self.fcm_credentials_file)
+
+
+@dataclass(frozen=True)
+class FixedToolParameter:
+    """One typed CLI parameter exposed by a router fixed tool."""
+
+    name: str
+    type: str = "string"
+    description: str = ""
+    required: bool = False
+    cli_flag: str = ""
+
+
+@dataclass(frozen=True)
+class FixedToolConfig:
+    """Configuration for an external pipeline launched in a worker slot."""
+
+    name: str
+    command: str
+    description: str = ""
+    timeout_hours: float = 24.0
+    parameters: list[FixedToolParameter] = field(default_factory=list)
+    phase_markers: list[str] = field(default_factory=list)
+    artifacts: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -213,6 +303,10 @@ class LLMBackendConfig:
     default_model: str = "gpt-4"
     max_tokens: int = 4096
     temperature: float = 0.7
+    # Worker completion/report synthesis timeout, in seconds.  This is kept
+    # backend-specific because local vLLM routers can spend much longer in
+    # cold long-context prefill than API-hosted routers.
+    synthesis_timeout: int = 180
 
     # Claude Code / Z.AI settings
     cc_allowed_tools: list[str] = field(default_factory=lambda: ["Read", "Edit", "Bash"])
@@ -229,9 +323,11 @@ class LLMBackendConfig:
     anthropic_thinking_budget: int | None = None  # budget_tokens for Anthropic extended thinking
     include_thoughts: bool = False           # Include thinking content in response
     auto_detect_reasoning: bool = True       # Auto-detect reasoning models
+    chat_template_kwargs: dict[str, Any] | None = None  # vLLM/OpenAI-compatible chat template controls
 
-    # Cookie-based auth (e.g., TAMU Cloudflare Access)
-    cookie_source: str = ""  # "tamu" → inject CF cookies from ~/.mesh/tamu_cookies.json
+    # Reserved for optional cookie-based auth providers. The public release
+    # intentionally ships no site-specific cookie adapter.
+    cookie_source: str = ""
 
     # Claude Code subprocess environment overrides
     # Merged into CC subprocess env (e.g., ANTHROPIC_BASE_URL, ANTHROPIC_API_KEY
@@ -270,6 +366,11 @@ class LLMBackendConfig:
     # Codex CLI settings (backend_type: codex)
     codex_binary: str = ""  # Path to codex binary; empty = shutil.which("codex")
 
+    # Codex subprocess environment overrides.  This is intentionally separate
+    # from cc_env: Codex may need its own endpoint and API-key settings when
+    # routed through an OpenAI-compatible local provider.
+    codex_env: dict[str, str] | None = None
+
     # Codex idle timeout in seconds.  Codex can spend long stretches in internal
     # turns without writing to stdout, so idle-timeout watchdogs are usually wrong.
     # 0 = disabled (recommended).  Use only as a last-resort runaway guard.
@@ -306,7 +407,22 @@ class LLMBackendConfig:
     harness_codex_assessor_model: str = "o3"
     harness_codex_assessor_effort: str = "high"
 
+    # Open/closed model classification, the model-level twin of the isolation
+    # network gate.  "open" means an open-weight model (self-hosted, or an open
+    # -weight model served by an API); "closed" means a closed-weight/vendor
+    # model.  Classify by the MODEL's provider, not the transport client: a
+    # Claude Code or Codex binary pointed at a local open-weight server is
+    # "open".  An empty value is UNCLASSIFIED and is treated as closed by
+    # every consumer — the gate fails closed by construction.
+    access: str = ""
+
     def __post_init__(self):
+        if self.access not in BACKEND_ACCESS_VALUES:
+            raise ValueError(
+                "llm_backends access must be one of: "
+                f"{', '.join(sorted(v for v in BACKEND_ACCESS_VALUES if v))} "
+                f"(got {self.access!r})"
+            )
         # Expand environment variable references in api_key
         if self.api_key.startswith("${") and self.api_key.endswith("}"):
             env_var = self.api_key[2:-1]
@@ -457,6 +573,16 @@ class CCSessionConfig:
         from .paths import resolve_path
         self.session_dir = resolve_path(self.session_dir)
 
+    def scoped_session_dir(self, state_paths=None) -> str:
+        """Session directory for this agent.
+
+        Returns the scoped ``cc_sessions_dir`` when an isolation policy
+        supplied one, otherwise the configured/global path unchanged.
+        """
+        if state_paths is not None:
+            return str(state_paths.cc_sessions_dir)
+        return self.session_dir
+
 
 @dataclass
 class MemoryProfileConfig:
@@ -476,10 +602,571 @@ class MemoryProfileConfig:
     similarity_floor: float | None = None
 
 
+@dataclass(frozen=True)
+class PevTaskConfig:
+    """Resolved phase backends for a phase-selective PEV worker.
+
+    This is intentionally task-type metadata, rather than a backend definition:
+    the dispatch layer selects it once and the PEV harness receives only these
+    already-resolved backend names.  Phase presence determines the workflow:
+    Plan + Execute is full PEV, Plan alone is plan-only, and Execute (with
+    optional Verify) is execute mode.
+
+    Optional fields ``worker_system_prompt_file`` and ``worker_instructions_file``
+    let a task type carry type-specific prompt content that the agent node
+    loads and appends to the assembled system prompt / worker instructions.
+
+    Optional field ``compose_backend`` lets a task type carry a backend name
+    for the synchronous ``style_filter`` mesh tool.
+    """
+
+    plan: str | None
+    execute: str | None
+    verify: str | None = None
+    worker_system_prompt_file: str | None = None
+    worker_instructions_file: str | None = None
+    compose_backend: str | None = None
+
+    def as_dict(self) -> dict[str, str | None]:
+        return {
+            "plan": self.plan,
+            "execute": self.execute,
+            "verify": self.verify,
+            "worker_system_prompt_file": self.worker_system_prompt_file,
+            "worker_instructions_file": self.worker_instructions_file,
+            "compose_backend": self.compose_backend,
+        }
+
+    @property
+    def mode(self) -> str:
+        """Infer and validate the harness mode encoded by phase presence."""
+        if self.verify and not self.execute:
+            raise ValueError(
+                "worker task type pev cannot configure verify without execute"
+            )
+        if self.plan and self.execute:
+            return "full"
+        if self.plan:
+            return "plan"
+        if self.execute:
+            return "execute"
+        raise ValueError(
+            "worker task type pev requires at least one of plan or execute"
+        )
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "PevTaskConfig":
+        """Construct and validate a dict (e.g. custom-launch metadata)."""
+        normalized = normalize_pev_task_config(raw)
+        if normalized is None:  # Defensive: a dict never normalizes to no policy.
+            raise ValueError("worker task type pev must be a mapping")
+        return normalized
+
+
+
+_TASK_PROMPT_PHASES = frozenset({"plan", "execute", "verify"})
+
+
+def _normalize_phase_tool_config(
+    raw_tools: Any,
+    *,
+    field_name: str,
+    allow_empty_lists: bool,
+    reject_commas: bool = False,
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """Validate and freeze one per-phase prompt tool mapping."""
+    if raw_tools is None:
+        raw_tools = {}
+    if not isinstance(raw_tools, dict):
+        raise ValueError(f"prompts.{field_name} must be a mapping")
+
+    phases: list[tuple[str, tuple[str, ...]]] = []
+    for raw_phase, raw_names in raw_tools.items():
+        phase = str(raw_phase or "").strip().lower()
+        if phase not in _TASK_PROMPT_PHASES:
+            raise ValueError(
+                f"prompts.{field_name} phases must be plan, execute, or verify"
+            )
+        if not isinstance(raw_names, (list, tuple)):
+            raise ValueError(f"prompts.{field_name}.{phase} must be a list")
+
+        names: list[str] = []
+        for raw_name in raw_names:
+            if not isinstance(raw_name, str):
+                raise ValueError(
+                    f"prompts.{field_name}.{phase} entries must be strings"
+                )
+            name = raw_name.strip()
+            if not name:
+                raise ValueError(
+                    f"prompts.{field_name}.{phase} contains an empty tool name"
+                )
+            if reject_commas and "," in name:
+                raise ValueError(
+                    f"prompts.{field_name}.{phase} tool names cannot contain commas"
+                )
+            if name not in names:
+                names.append(name)
+        if not names and not allow_empty_lists:
+            raise ValueError(
+                f"prompts.{field_name}.{phase} must name at least one tool"
+            )
+        phases.append((phase, tuple(names)))
+    return tuple(sorted(phases))
+
+
+def _normalize_prompt_thinking_budget(raw_budget: Any) -> int | None:
+    if raw_budget is None:
+        return None
+    if isinstance(raw_budget, bool):
+        raise ValueError("prompts.thinking_budget must be a positive integer")
+    try:
+        thinking_budget = int(raw_budget)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("prompts.thinking_budget must be a positive integer") from exc
+    if not 1 <= thinking_budget <= 1_000_000:
+        raise ValueError("prompts.thinking_budget must be between 1 and 1000000")
+    return thinking_budget
+
+
+@dataclass(frozen=True)
+class TaskPromptConfig:
+    """Task-level prompt bundle shared by direct, synchronous, and PEV paths.
+
+    Prompt configuration deliberately lives beside ``pev`` rather than inside
+    it: ordinary workers and synchronous tools must be able to consume the
+    same canonical domain instructions without opting into PEV.
+    """
+
+    worker_system_prompt_file: str | None = None
+    base_instructions_file: str | None = None
+    sync_instructions_file: str | None = None
+    plan_instructions_file: str | None = None
+    execute_instructions_file: str | None = None
+    verify_instructions_file: str | None = None
+    sync_backend: str | None = None
+    thinking_budget: int | None = None
+    phase_mesh_tools: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    phase_harness_tools: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    verify_read_only: bool = False
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "worker_system_prompt_file": self.worker_system_prompt_file,
+            "base_instructions_file": self.base_instructions_file,
+            "sync_instructions_file": self.sync_instructions_file,
+            "plan_instructions_file": self.plan_instructions_file,
+            "execute_instructions_file": self.execute_instructions_file,
+            "verify_instructions_file": self.verify_instructions_file,
+            "sync_backend": self.sync_backend,
+            "thinking_budget": self.thinking_budget,
+            "phase_mesh_tools": {
+                phase: list(tool_names)
+                for phase, tool_names in self.phase_mesh_tools
+            },
+            "phase_harness_tools": {
+                phase: list(tool_names)
+                for phase, tool_names in self.phase_harness_tools
+            },
+            "verify_read_only": self.verify_read_only,
+        }
+    @classmethod
+    def from_dict(cls, raw: dict) -> "TaskPromptConfig":
+        """Construct from a dict (e.g. custom-launch metadata)."""
+        def _opt(s: str | None) -> str | None:
+            if s is None:
+                return None
+            v = str(s).strip()
+            return v or None
+        budget = _normalize_prompt_thinking_budget(raw.get("thinking_budget"))
+        phase_mesh_tools = _normalize_phase_tool_config(
+            raw.get("phase_mesh_tools"),
+            field_name="phase_mesh_tools",
+            allow_empty_lists=True,
+        )
+        phase_harness_tools = _normalize_phase_tool_config(
+            raw.get("phase_harness_tools"),
+            field_name="phase_harness_tools",
+            allow_empty_lists=False,
+            reject_commas=True,
+        )
+        verify_read_only = raw.get("verify_read_only", False)
+        if not isinstance(verify_read_only, bool):
+            raise ValueError("prompts.verify_read_only must be a boolean")
+        return cls(
+            worker_system_prompt_file=_opt(raw.get("worker_system_prompt_file")),
+            base_instructions_file=_opt(raw.get("base_instructions_file")),
+            sync_instructions_file=_opt(raw.get("sync_instructions_file")),
+            plan_instructions_file=_opt(raw.get("plan_instructions_file")),
+            execute_instructions_file=_opt(raw.get("execute_instructions_file")),
+            verify_instructions_file=_opt(raw.get("verify_instructions_file")),
+            sync_backend=_opt(raw.get("sync_backend")),
+            thinking_budget=budget,
+            phase_mesh_tools=phase_mesh_tools,
+            phase_harness_tools=phase_harness_tools,
+            verify_read_only=verify_read_only,
+        )
+
+    def tools_for_phase(self, phase: str) -> tuple[str, ...]:
+        for configured_phase, tool_names in self.phase_mesh_tools:
+            if configured_phase == phase:
+                return tool_names
+        return ()
+
+    def harness_tools_for_phase(self, phase: str) -> tuple[str, ...]:
+        for configured_phase, tool_names in self.phase_harness_tools:
+            if configured_phase == phase:
+                return tool_names
+        return ()
+
+
+WorkerTaskTypeDefinition = dict[str, Any]
+
+
+def normalize_pev_task_config(raw_pev: Any) -> PevTaskConfig | None:
+    """Validate an optional ``worker_task_types.<type>.pev`` block.
+
+    ``verify: null`` (and the legacy string ``"none"``) deliberately means
+    that an Execute-capable worker ends after Execute.  Valid phase shapes are
+    Plan + Execute (full PEV), Plan only, or Execute with optional Verify.
+    Silently degrading an empty or Verify-only policy into an ordinary worker
+    would be an unsafe configuration error.
+    """
+    if raw_pev is None:
+        return None
+    if isinstance(raw_pev, PevTaskConfig):
+        raw_pev = raw_pev.as_dict()
+    if not isinstance(raw_pev, dict):
+        raise ValueError("worker task type pev must be a mapping")
+
+    plan = str(raw_pev.get("plan") or "").strip() or None
+    execute = str(raw_pev.get("execute") or "").strip() or None
+
+    raw_verify = raw_pev.get("verify")
+    if raw_verify is None:
+        verify = None
+    else:
+        verify_text = str(raw_verify).strip()
+        verify = None if not verify_text or verify_text.lower() == "none" else verify_text
+
+    raw_wsp = raw_pev.get("worker_system_prompt_file")
+    worker_system_prompt_file = str(raw_wsp).strip() if raw_wsp else None
+    raw_wi = raw_pev.get("worker_instructions_file")
+    worker_instructions_file = str(raw_wi).strip() if raw_wi else None
+
+    raw_cb = raw_pev.get("compose_backend")
+    compose_backend = str(raw_cb).strip() if raw_cb else None
+
+    normalized = PevTaskConfig(
+        plan=plan, execute=execute, verify=verify,
+        worker_system_prompt_file=worker_system_prompt_file,
+        worker_instructions_file=worker_instructions_file,
+        compose_backend=compose_backend,
+    )
+    # Keep one canonical validity rule for YAML, trusted custom launches, and
+    # AgentNode's defensive mode selection.
+    normalized.mode
+    return normalized
+
+
+def normalize_task_prompt_config(raw_prompts: Any) -> TaskPromptConfig | None:
+    """Validate an optional ``worker_task_types.<type>.prompts`` block."""
+    if raw_prompts is None:
+        return None
+    if isinstance(raw_prompts, TaskPromptConfig):
+        raw_prompts = raw_prompts.as_dict()
+    if not isinstance(raw_prompts, dict):
+        raise ValueError("worker task type prompts must be a mapping")
+    return TaskPromptConfig.from_dict(raw_prompts)
+
+
+def _promote_legacy_prompt_config(
+    prompts: TaskPromptConfig | None,
+    pev: PevTaskConfig | None,
+) -> TaskPromptConfig | None:
+    """Map legacy writing prompt fields into the task-level prompt bundle."""
+    if pev is None or not any((
+        pev.worker_system_prompt_file,
+        pev.worker_instructions_file,
+        pev.compose_backend,
+    )):
+        return prompts
+
+    legacy_values = {
+        "worker_system_prompt_file": pev.worker_system_prompt_file,
+        "execute_instructions_file": pev.worker_instructions_file,
+        "sync_backend": pev.compose_backend,
+    }
+    if prompts is not None:
+        for field_name, legacy_value in legacy_values.items():
+            configured_value = getattr(prompts, field_name)
+            if (
+                legacy_value is not None
+                and configured_value is not None
+                and legacy_value != configured_value
+            ):
+                raise ValueError(
+                    f"legacy pev.{field_name} conflicts with prompts.{field_name}"
+                )
+
+    base = prompts or TaskPromptConfig()
+    return TaskPromptConfig(
+        worker_system_prompt_file=(
+            base.worker_system_prompt_file or pev.worker_system_prompt_file
+        ),
+        base_instructions_file=base.base_instructions_file,
+        sync_instructions_file=base.sync_instructions_file,
+        plan_instructions_file=base.plan_instructions_file,
+        execute_instructions_file=(
+            base.execute_instructions_file or pev.worker_instructions_file
+        ),
+        verify_instructions_file=base.verify_instructions_file,
+        sync_backend=base.sync_backend or pev.compose_backend,
+        thinking_budget=base.thinking_budget,
+        phase_mesh_tools=base.phase_mesh_tools,
+        phase_harness_tools=base.phase_harness_tools,
+        verify_read_only=base.verify_read_only,
+    )
+
+
+def _merge_task_type_value(base: Any, override: Any) -> Any:
+    """Merge one override value over its default, recursing into mappings.
+
+    ``None`` in the override means "not specified — inherit".  This is what
+    makes a partial declaration work at field granularity: an agent block that
+    says only ``{backend: X}`` for a type leaves ``description``/``pev``/
+    ``prompts`` untouched, and an explicit ``backend: null`` falls back to the
+    default backend for that type rather than blanking it.
+    """
+    if override is None:
+        return base
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = dict(base)
+        for key, value in override.items():
+            merged[key] = _merge_task_type_value(merged.get(key), value)
+        return merged
+    return override
+
+
+def merge_worker_task_types(
+    defaults: Any,
+    declared: Any,
+) -> dict[str, Any]:
+    """Deep-merge an agent's declared task types over the fleet defaults.
+
+    YAML anchor merge is shallow: a ``worker_task_types`` key in an agent block
+    shadows the anchor's entire map, so an agent that wants to change one
+    backend has to restate every type.  This merge restores inheritance at two
+    levels — per type (an undeclared type keeps its default entry) and per
+    field within a type (an undeclared field keeps its default value).
+
+    Both arguments are RAW pre-normalization mappings, and the result is a new
+    mapping: neither input is mutated.  That matters because the YAML alias
+    ``worker_task_types: *worker_task_types_defaults`` makes an inheriting
+    node's declared map the *same object* as the defaults.
+    """
+    if not isinstance(defaults, dict) or not defaults:
+        return dict(declared) if isinstance(declared, dict) else {}
+    if not isinstance(declared, dict):
+        return copy.deepcopy(defaults)
+
+    merged: dict[str, Any] = copy.deepcopy(defaults)
+    for task_type, definition in declared.items():
+        base = merged.get(task_type)
+        # A string binding (``name: backend``) is the legacy shorthand and
+        # carries no fields to merge — it replaces the entry outright.
+        if isinstance(definition, dict) and isinstance(base, dict):
+            merged[task_type] = _merge_task_type_value(base, definition)
+        elif definition is None:
+            continue
+        else:
+            merged[task_type] = copy.deepcopy(definition)
+    return merged
+
+
+def normalize_worker_task_types(
+    raw_task_types: Any,
+) -> dict[str, WorkerTaskTypeDefinition]:
+    """Normalize task-type bindings to the rich config representation.
+
+    The preferred YAML form is ``name: {backend, description}``.  Plain
+    ``name: backend`` entries remain accepted so older configs and callers can
+    upgrade without a flag day; they receive an empty description and render
+    in router guidance by name only.
+    """
+    if not isinstance(raw_task_types, dict):
+        return {}
+
+    normalized: dict[str, WorkerTaskTypeDefinition] = {}
+    for raw_name, raw_definition in raw_task_types.items():
+        name = str(raw_name or "").strip()
+        if not name:
+            continue
+
+        if isinstance(raw_definition, str):
+            backend = raw_definition.strip()
+            description = ""
+            pev = None
+            prompts = None
+        elif isinstance(raw_definition, dict):
+            backend = str(raw_definition.get("backend") or "").strip()
+            description = str(raw_definition.get("description") or "").strip()
+            try:
+                pev = normalize_pev_task_config(raw_definition.get("pev"))
+                prompts = normalize_task_prompt_config(
+                    raw_definition.get("prompts")
+                )
+                prompts = _promote_legacy_prompt_config(prompts, pev)
+            except ValueError as exc:
+                raise ValueError(f"worker_task_types.{name}: {exc}") from exc
+        else:
+            continue
+
+        if not backend:
+            continue
+        definition: WorkerTaskTypeDefinition = {
+            "backend": backend,
+            "description": description,
+        }
+        if pev is not None:
+            definition["pev"] = pev
+        if prompts is not None:
+            definition["prompts"] = prompts
+        normalized[name] = definition
+    return normalized
+
+
+ENTITY_RESOLUTION_MODES = frozenset({"off", "shadow", "write"})
+
+
+def normalize_entity_resolution_mode(
+    mode: str | None,
+    *,
+    legacy_enabled: bool = False,
+) -> str:
+    """Normalize the Increment 3 entity authority mode.
+
+    ``entity_resolution_enabled`` remains accepted for old YAML and callers.
+    A true legacy flag promotes the default/off mode to ``write``; an explicit
+    ``shadow`` or ``write`` mode takes precedence.
+    """
+    normalized = str(mode or "off").strip().lower()
+    if normalized not in ENTITY_RESOLUTION_MODES:
+        raise ValueError(
+            "entity_resolution_mode must be one of: off, shadow, write"
+        )
+    if normalized == "off" and legacy_enabled:
+        return "write"
+    return normalized
+
+
+def resolve_self_curation_mode(node: "NodeConfig") -> str:
+    """Return the effective curation authority for ``node``.
+
+    ``entity_resolution_mode="off"`` always wins over the master flag, and the
+    master flag off means no curation turn regardless of mode.
+    """
+    resolution = normalize_entity_resolution_mode(
+        getattr(node, "entity_resolution_mode", "off"),
+        legacy_enabled=bool(getattr(node, "entity_resolution_enabled", False)),
+    )
+    if resolution == "off":
+        return "off"
+    if not getattr(node, "entity_self_curation_enabled", False):
+        return "off"
+    requested = str(
+        getattr(node, "entity_self_curation_mode", "") or ""
+    ).strip().lower()
+    if not requested:
+        return resolution
+    if requested not in ENTITY_RESOLUTION_MODES:
+        raise ValueError(
+            "entity_self_curation_mode must be one of: off, shadow, write"
+        )
+    if requested == "write" and resolution != "write":
+        # Never escalate beyond the registry's own authority.
+        return resolution
+    return requested
+
+
+def validate_self_curation_enrollment(node: "NodeConfig") -> list[str]:
+    """Return one error string per unmet self-curation enrollment condition.
+
+    Enrollment requires Memory Formation v3 plus a rolling-window full router,
+    an existing standing digest containing all seven constitutional sections, a
+    tiktoken-backed ``estimate_tokens()``, and ``project_maps_enabled=false``
+    so the legacy map writer does not become a second post-formation curator.
+    """
+    if resolve_self_curation_mode(node) == "off":
+        return []
+
+    errors: list[str] = []
+    if not getattr(node, "memory_formation_v3_enabled", False):
+        errors.append(
+            "entity self-curation requires memory_formation_v3_enabled=true"
+        )
+    if str(getattr(node, "context_mode", "rolling-window")) != "rolling-window":
+        errors.append(
+            "entity self-curation requires context_mode=rolling-window "
+            "(cc-session/RouterCC has no _call_router_full path)"
+        )
+    if str(getattr(node, "router_mode", "classifier")) != "full":
+        errors.append(
+            "entity self-curation requires router_mode=full"
+        )
+    if getattr(node, "project_maps_enabled", True):
+        errors.append(
+            "entity self-curation requires project_maps_enabled=false "
+            "(the legacy map writer would be a second post-formation curator)"
+        )
+    if not getattr(node, "standing_digest_enabled", False):
+        errors.append(
+            "entity self-curation requires standing_digest_enabled=true"
+        )
+    if int(getattr(node, "standing_digest_budget_tokens", 0)) < 1:
+        errors.append("standing_digest_budget_tokens must be at least 1")
+
+    digest_path = str(getattr(node, "standing_digest_path", "") or "")
+    if not digest_path:
+        errors.append(
+            "entity self-curation requires standing_digest_path"
+        )
+    else:
+        expanded = os.path.expanduser(digest_path)
+        if not os.path.exists(expanded):
+            errors.append(
+                f"standing digest file not found at {expanded}"
+            )
+        else:
+            try:
+                from .memory.curation import digest_section_errors
+
+                with open(expanded) as handle:
+                    section_errors = digest_section_errors(handle.read())
+            except OSError as exc:
+                section_errors = [f"digest unreadable: {exc}"]
+            errors.extend(
+                f"standing digest: {item}" for item in section_errors
+            )
+
+    if resolve_self_curation_mode(node) == "write":
+        try:
+            from .llm import _encoder
+        except Exception:  # pragma: no cover - import-time backend problems
+            _encoder = None
+        if _encoder is None:
+            errors.append(
+                "write-mode self-curation requires a tiktoken encoder; the "
+                "word-heuristic estimate_tokens() fallback is not a true "
+                "token limit"
+            )
+    return errors
+
+
 @dataclass
 class NodeConfig:
     """Configuration for a node (user or agent)."""
-    id: str                          # e.g., "user:yourname" or "agent:researcher"
+    id: str                          # e.g., "user:operator" or "agent:researcher"
     router_host: str = "127.0.0.1"
     router_port: int = 7700
     router_ws_port: int = 8765          # WebSocket port (for MCP server connections)
@@ -516,9 +1203,16 @@ class NodeConfig:
     pref_extraction_backend: str | None = None   # Backend for extraction (default: claude-code)
 
     # Sandbox settings (restrict file/bash access)
+    # DEPRECATED flat form — superseded by the nested ``isolation`` block below.
+    # Retained for one deprecation cycle; setting both forms is a config error.
     sandboxed: bool = False                       # Enable bwrap sandboxing
     allowed_dirs: list[str] = field(default_factory=list)  # Writable directories
     allow_network: bool = True                    # Allow network access in sandbox
+
+    # Per-agent filesystem/capability isolation (see mesh/isolation.py).
+    # Absent or ``enabled: false`` selects the legacy path: ~/.mesh state,
+    # unfiltered tools, and no policy checks.
+    isolation: "IsolationConfig | None" = None
 
     # Controller settings (task routing and workflow management)
     # Supports both v0.1 (ControllerConfig) and v0.2 (ControllerConfigV02)
@@ -537,6 +1231,7 @@ class NodeConfig:
     # - Isolates worker context from router-level messages
     use_router_v2: bool = True
     use_router_v3: bool = False   # RouterV3: adds planning pipeline (subclasses V2)
+    use_relevance_router_for_channels: bool = False  # RouterV2 channel gate: LLM relevance instead of hard @mention
 
     # Router V2 LLM: When enabled, router uses LLM for classification
     # - Decides needs_worker (true/false) for incoming messages
@@ -551,6 +1246,11 @@ class NodeConfig:
     router_v2_llm_backend: str | None = None   # e.g., "default" for gpt-4o
     router_v2_llm_model: str | None = None     # e.g., "gpt-4o-mini"
 
+    # Optional direct-router client used only for an explicit leading @deep
+    # override. Phase 1 has no model-driven escalation or harness support.
+    router_deep_backend: str | None = None
+    router_deep_enabled: bool = False
+
     # History management — unified fields for both router and worker.
     # When summarization is disabled, history is a simple rolling window:
     # oldest turns are dropped when the window exceeds hard_limit_tokens.
@@ -558,9 +1258,41 @@ class NodeConfig:
     history_soft_limit_tokens: int = 70_000           # rolling window cap
     history_hard_limit_tokens: int = 90_000           # hard cap (drop oldest turns)
     history_window_tokens: int | None = None           # rolling window budget W (default: soft_limit // 2)
-    watchdog_interval_minutes: int = 15               # worker watchdog check-in interval (0 = disabled)
+    watchdog_interval_minutes: int = 0                # worker watchdog check-in interval (0 = disabled)
     worker_context_window_tokens: int = 25_000         # token budget for worker context snapshot
     worker_in_flight_token_limit: int = 150_000       # safety valve for tool loops (independent)
+    max_concurrent_workers: int = 1                   # worker slots per agent; 1 preserves legacy behavior
+    # Fail closed on missing/degenerate router briefs.  Provenance validation
+    # rejects trigger-content fallback independently of this length backstop.
+    min_worker_brief_chars: int = 120
+    # Deprecated compatibility fields. Router LLMs cannot create sticky
+    # backend overrides, and stale allowlists are accepted only so older YAML
+    # still loads. Ordinary per-launch routing uses ``worker_task_types``.
+    worker_backend_override_enabled: bool = False
+    worker_backends_allowed: list[str] = field(default_factory=list)
+    # Task-shape indirection for worker launches. Routers select a type; this
+    # configuration maps it to the backend. The configured ``llm_backend`` is
+    # still the fallback/default, while explicit user backend requests are the
+    # only route that bypasses this mapping.
+    worker_task_types: dict[str, WorkerTaskTypeDefinition] = field(
+        default_factory=dict
+    )
+    # Open/closed model access gate — the model-level twin of the isolation
+    # network gate.  True (the default) is today's behaviour: this agent may
+    # dispatch a worker to any configured backend.  False makes the agent
+    # structurally incapable of running a closed-weight model: every dispatch
+    # branch (task type, verbatim user override, custom staged selection) and
+    # every phase backend (pev.plan/execute/verify/compose_backend,
+    # prompts.sync_backend) is checked, and a closed backend is REFUSED rather
+    # than silently replaced by the configured default.
+    worker_closed_models: bool = True
+    # Inject the agent's published standing digest into every worker briefing.
+    # The digest is background/index context; workers retrieve full records and
+    # essays through memory tools.  Token-sensitive agents may disable this.
+    worker_digest_injection: bool = True
+    # Persist full completed-worker traces privately for skill_draft evidence.
+    # This archive is separate from router history and prompt-capture logs.
+    worker_trace_persist: bool = True
 
     # Router history settings (deprecated — unified fields above take precedence)
     router_history_soft_limit_tokens: int = 70_000   # deprecated: use history_soft_limit_tokens
@@ -631,18 +1363,69 @@ class NodeConfig:
     memory_formation_interval_seconds: int = 1800    # time-based trigger interval
     memory_formation_defer_tail_seconds: int = 300   # turns younger than this skipped by time-based
     memory_formation_shutdown_timeout: float = 30.0  # cap on blocking shutdown formation
-    memory_v3_window_size: int = 60                  # segmenter window
+    memory_v3_window_size: int = 60                  # extractor window
     memory_v3_overlap: int = 20                      # window overlap
     memory_v3_defer_tail: int = 10                   # in-window trailing turns deferred
-    memory_v3_model: str = "deepseek-v4-flash"       # segmenter model
+    memory_v3_model: str = "deepseek-v4-flash"       # extraction model
     memory_v3_parse_failure_fallback_threshold: int = 3  # placeholder after N consecutive failures
 
-    # Phase 1: lowered formation bar (decoupled from digest bar).
-    # When True, the fold driver uses the recall-oriented formation prompt
-    # and tags each minted record with digest_candidate (True/False) based
-    # on the unchanged high digest significance bar. The fold injection
-    # filter shows only digest_candidate=True rows to the fold.
-    memory_formation_lowbar: bool = False
+    # Deprecated compatibility flag. Option A-prime made recall-oriented
+    # extraction the sole formation contract; live and fold paths ignore false.
+    memory_formation_lowbar: bool = True
+
+    # Durable entity registry / correction API. Schema migration is always
+    # additive. ``shadow`` enables formation parsing/telemetry without writes;
+    # only ``write`` exposes mutation tools and authorizes persistence.
+    entity_resolution_mode: str = "off"
+    entity_registry_injection_cap: int = 1000
+    # Output ceiling for one entity-enabled formation request. This bounds
+    # reasoning tokens AND content on a reasoning backend, so it must cover
+    # both. The original 1,200 was content-only planning arithmetic: measured
+    # against a real 60-turn Bob window on deepseek-v4-flash, one call spends
+    # ~31.6K reasoning + ~8.4K content (18 records). At 1,200 the whole budget
+    # went to reasoning, the API returned an empty completion, and every
+    # formation run failed contract parsing. Formation floors this at the core
+    # memory_v3 max_tokens; see LLMExtractorV1.request_max_tokens.
+    entity_formation_max_tokens: int = 48000
+    # Deprecated compatibility input/output. __post_init__ derives this from
+    # entity_resolution_mode after accepting old boolean-only configurations.
+    entity_resolution_enabled: bool = False
+    entity_activation_window_threshold: int = 3
+
+    # Entity/group/digest self-curation (docs/plans/entity-self-curation.md).
+    # The master trigger gate: when True, every successful formation batch
+    # enqueues one internal curation turn on the agent's own router backend.
+    # An agent in entity_resolution_mode="write" with this flag off keeps
+    # interactive entity_link_correct and loses only the automatic turn.
+    entity_self_curation_enabled: bool = False
+    # Authority for the curation turn.  Empty string inherits
+    # entity_resolution_mode; "off" always wins over the master flag.
+    entity_self_curation_mode: str = ""
+    # Phase 2: group tools + deterministic bridge-evidence activation.
+    entity_self_curation_groups_enabled: bool = False
+    # Hard digest ceiling, measured with mesh.llm.estimate_tokens().
+    standing_digest_budget_tokens: int = 32000
+    # Report-only stale pending-group threshold (consecutive curation batches).
+    curation_stale_group_batches: int = 50
+    # Consecutive failed curation turns before ERROR/agent_status alert.
+    curation_failure_alert_threshold: int = 5
+    # Phase 3 agent-driven backfill.  Fires once after the startup formation
+    # chain when there is uncurated history; also reachable on demand through
+    # the entity_backfill tool.  Both knobs are bounded on purpose: one
+    # invocation must never be able to curate the whole history.
+    entity_self_curation_backfill_on_startup: bool = True
+    entity_self_curation_backfill_max_batches: int = 50
+    # Memories per backfill slice ("fixed-size slices", §9 Phase 3).
+    entity_self_curation_backfill_slice_size: int = 10
+    # Essay generation folded into curation: after a curation turn commits,
+    # write the essay for any entity that is active and has none.  Default OFF
+    # so enabling is a deliberate per-agent act; the post-hoc batch script
+    # stays the behaviour when this is off.  Honours entity_self_curation_mode
+    # — "shadow" validates the essay and rolls back instead of writing.
+    entity_self_curation_essays_enabled: bool = False
+    # Essays written per curation turn.  Bounded on purpose: a backlog drains
+    # over successive turns instead of stalling one turn behind N LLM calls.
+    entity_self_curation_essays_max_per_turn: int = 1
 
     # Memory retrieval redesign (see docs/plans/memory-retrieval-redesign-2026-04-27.md)
     memory_retrieval_redesign_enabled: bool = False
@@ -656,11 +1439,67 @@ class NodeConfig:
     standing_digest_enabled: bool = False
     standing_digest_path: str = ""  # published digest file (see fold_driver/alice)
 
+    # Project-map injection: when False, render_relevant_maps_block() and
+    # render_maps_block() return "" — no map content enters any prompt pathway.
+    # Maps remain in the DB; only injection is suppressed.  (Decision 29:
+    # project maps deprecated in favour of the essay layer.)
+    project_maps_enabled: bool = True
+
     memory_search_mode: str = "hybrid"  # "embedding" | "lexical" | "hybrid"
+
+    # Essay layer (Phase 2, per-agent-standing-digest spec decisions 26-32):
+    # essay_fold_enabled gates essay-edit tooling in the fold driver.
+    # essay_recurrence_threshold: entity must appear in this many distinct
+    # fold windows before a new essay is created (tuning knob §10b.1).
+    # essay_token_budget: max tokens per individual essay (§10b.4).
+    essay_fold_enabled: bool = False
+    essay_recurrence_threshold: int = 3
+    essay_token_budget: int = 4000
+
+    # Essay retrieval (Phase 4): when True, essay_get and essay_list are
+    # dynamically added to the agent's enabled_tools at startup, giving
+    # live agents pull-based access to curated essays.  essay_edit is
+    # NEVER exposed — it remains fold-engine-only.
+    essays_retrieval_enabled: bool = False
+
+    # Essay auto-maintain: when True, the nightly fold autonomously runs
+    # essay CREATE/PATCH/hygiene after digest finalization.  Defaults OFF
+    # so the first pass is human-gated via run_meta_review.py --apply.
+    essay_auto_maintain: bool = False
 
     # Fold driver LLM backend (standing-digest offline fold).
     # Resolved by _resolve_fold_backend() in the fold driver.
-    fold_backend: str = "deepseek-direct"
+    fold_backend: str = "mesh-harness-qwen"
+
+    # Autonomous agent mode.  When True the agent may act as an autonomous
+    # project controller: the dossier tools are added to enabled_tools and the
+    # autonomous_controller prompt becomes available for per-turn injection.
+    # The mandate is injected only on turns whose trigger carries trusted
+    # autonomous-session metadata (plan §10.1) — enrollment alone does not put
+    # ordinary conversation turns under the autonomous operating mandate.
+    autonomous_agent_mode_enabled: bool = False
+    autonomous_controller_prompt_file: str = "autonomous_controller.txt"
+    # Optional execute-only mandate for worker-report continuations.  Empty
+    # retains the full wake mandate for backwards-compatible deployments.
+    autonomous_controller_continuation_prompt_file: str = ""
+    # Initial autonomous PLAN turns may use the deep router; report-driven
+    # execute/close continuations always remain on the light router.
+    autonomous_plan_backend: str = "light"
+    # Project entity keys this agent controls, e.g. ["project:mesh-infra"].
+    autonomous_projects: list[str] = field(default_factory=list)
+    autonomous_max_workers_per_session: int = 2
+    # Active-mode pacing.  A project armed with `/auto active <project> on`
+    # schedules its next session automatically at closeout; this is the minimum
+    # gap between one session ending and the next beginning, and also the
+    # minimum separation enforced between wakes across an agent's projects so
+    # two of its sessions never overlap.  Paced, not continuous.
+    autonomous_active_gap_minutes: int = 60
+    # The recursive autonomous controller (mesh/autonomous_controller.py) is a
+    # separate pilot harness, not the control path.  Plan §10.3 forbids a
+    # second planner competing with the agent's own ReAct loop, so the
+    # autonomous_controller_run tool is unreachable unless an operator opts a
+    # single agent into it explicitly.
+    autonomous_recursive_controller_enabled: bool = False
 
     memory_get_payload_max_chars: int = 6000
     memory_search_default_k: int = 5
@@ -668,7 +1507,7 @@ class NodeConfig:
     # Router V2 full mode settings
     # "full" = conversational agent with tools; "classifier" = legacy thin classifier
     router_mode: str = "classifier"
-    router_max_iters: int = 10  # Max tool-loop iterations for full router
+    router_max_iters: int = 50  # Max tool-loop iterations for full router
     pipeline_backend: str = "deepseek"
     pipeline_plan_path: str = ""
 
@@ -706,10 +1545,192 @@ class NodeConfig:
     harness_session_backend: str = ""
 
     def __post_init__(self):
+        self.worker_task_types = normalize_worker_task_types(
+            self.worker_task_types
+        )
+        # A truthy string ("false") would silently disable the gate, so demand
+        # a real bool rather than coercing.
+        if not isinstance(self.worker_closed_models, bool):
+            raise ValueError(
+                "worker_closed_models must be a boolean "
+                f"(got {self.worker_closed_models!r})"
+            )
+        self.entity_resolution_mode = normalize_entity_resolution_mode(
+            self.entity_resolution_mode,
+            legacy_enabled=self.entity_resolution_enabled,
+        )
+        self.entity_resolution_enabled = (
+            self.entity_resolution_mode == "write"
+        )
+        if self.entity_registry_injection_cap < 1:
+            raise ValueError("entity_registry_injection_cap must be at least 1")
+        if self.entity_formation_max_tokens < 1:
+            raise ValueError("entity_formation_max_tokens must be at least 1")
+        requested_curation = str(self.entity_self_curation_mode or "").strip().lower()
+        if requested_curation and requested_curation not in ENTITY_RESOLUTION_MODES:
+            raise ValueError(
+                "entity_self_curation_mode must be one of: off, shadow, write"
+            )
+        self.entity_self_curation_mode = requested_curation
+        if self.standing_digest_budget_tokens < 1:
+            raise ValueError("standing_digest_budget_tokens must be at least 1")
+        if self.curation_stale_group_batches < 1:
+            raise ValueError("curation_stale_group_batches must be at least 1")
+        if self.curation_failure_alert_threshold < 1:
+            raise ValueError(
+                "curation_failure_alert_threshold must be at least 1"
+            )
+        if self.entity_self_curation_backfill_max_batches < 1:
+            raise ValueError(
+                "entity_self_curation_backfill_max_batches must be at least 1"
+            )
+        if self.entity_self_curation_backfill_slice_size < 1:
+            raise ValueError(
+                "entity_self_curation_backfill_slice_size must be at least 1"
+            )
+        if self.entity_self_curation_essays_max_per_turn < 1:
+            raise ValueError(
+                "entity_self_curation_essays_max_per_turn must be at least 1"
+            )
+        requested_plan_backend = str(
+            self.autonomous_plan_backend or ""
+        ).strip().lower()
+        self.autonomous_plan_backend = (
+            requested_plan_backend
+            if requested_plan_backend in {"light", "deep"}
+            else "light"
+        )
         # Expand environment variable references in auth_token
         if self.auth_token and self.auth_token.startswith("${") and self.auth_token.endswith("}"):
             env_var = self.auth_token[2:-1]
             self.auth_token = os.environ.get(env_var, "")
+        # Accept a plain mapping for ``isolation`` so directly-constructed
+        # NodeConfig objects (tests, programmatic callers) behave like YAML.
+        if self.isolation is not None and not isinstance(self.isolation, IsolationConfig):
+            self.isolation = IsolationConfig.from_dict(self.isolation)
+
+    def resolve_isolation_policy(self) -> IsolationPolicy:
+        """Normalize this node's isolation settings into one policy.
+
+        Precedence and conflict rules:
+
+        * A nested ``isolation`` block is authoritative.
+        * Setting both the nested block and the deprecated flat
+          ``sandboxed``/``allowed_dirs`` fields is rejected rather than
+          resolved, because either guess would silently be someone's
+          security boundary.
+        * With only the flat fields set, they are normalized into a
+          compatibility policy so the old configuration keeps working.
+        * With neither, the legacy (disabled) policy is returned and no
+          filesystem work is done.
+        """
+        legacy_flat_set = bool(self.sandboxed) or bool(self.allowed_dirs)
+
+        if self.isolation is not None and self.isolation.enabled:
+            if legacy_flat_set:
+                raise IsolationConfigError(
+                    f"{self.id}: both the nested 'isolation' block and the "
+                    "deprecated flat 'sandboxed'/'allowed_dirs' fields are set — "
+                    "remove the flat fields; they are superseded by 'isolation'"
+                )
+            return IsolationPolicy.from_config(
+                self.isolation, source=f"config:{self.id}"
+            )
+
+        if self.isolation is not None and legacy_flat_set:
+            raise IsolationConfigError(
+                f"{self.id}: both the nested 'isolation' block and the "
+                "deprecated flat 'sandboxed'/'allowed_dirs' fields are set — "
+                "remove the flat fields; they are superseded by 'isolation'"
+            )
+
+        if legacy_flat_set:
+            return self._legacy_flat_policy()
+
+        return IsolationPolicy.legacy(source=f"config:{self.id}")
+
+    def _legacy_flat_policy(self) -> IsolationPolicy:
+        """Normalize deprecated flat sandbox fields into a policy.
+
+        The flat form never relocated state, so ``state_root`` stays at the
+        historical global root and the declared roots only constrain tools.
+        """
+        from .isolation import FilesystemMode, resolve_workspace_path
+        from .paths import MESH_DIR
+
+        roots: list[Path] = []
+        for raw in self.allowed_dirs or []:
+            try:
+                resolved = resolve_workspace_path(raw)
+            except (OSError, RuntimeError) as exc:
+                raise IsolationConfigError(
+                    f"{self.id}: allowed_dirs entry {raw!r} cannot be resolved: {exc}"
+                ) from exc
+            if resolved not in roots:
+                roots.append(resolved)
+
+        return IsolationPolicy(
+            enabled=bool(self.sandboxed),
+            workspace=roots[0] if roots else None,
+            workspaces=tuple(roots),
+            state_root=Path(MESH_DIR),
+            filesystem_mode=FilesystemMode.WORKSPACE_WRITE,
+            protect_state=False,
+            allow_network=bool(self.allow_network),
+            allowed_network_tools=None,
+            allowed_credential_tools=None,
+            source=f"legacy-flat:{self.id}",
+        )
+
+
+def _load_merged_config_data(path: str | Path) -> dict[str, Any]:
+    """Load mesh YAML and apply the split-backend overlay."""
+    path = Path(path)
+    if not path.exists():
+        return {}
+
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a YAML mapping")
+
+    backends_path = path.parent / "backends.yaml"
+    if backends_path.exists():
+        with open(backends_path) as f:
+            backends_data = yaml.safe_load(f) or {}
+        if not isinstance(backends_data, dict):
+            raise ValueError(
+                f"{backends_path} must contain a YAML mapping of backend names"
+            )
+        mesh_backends = data.get("llm_backends", {}) or {}
+        if not isinstance(mesh_backends, dict):
+            raise ValueError(
+                f"{path} llm_backends must contain a YAML mapping of backend names"
+            )
+        merged = dict(backends_data)
+        # Local entries in mesh.yaml intentionally override shared split-file
+        # definitions. This preserves the old single-file precedence model.
+        merged.update(mesh_backends)
+        data["llm_backends"] = merged
+    return data
+
+
+def load_llm_backends(path: str | Path) -> dict[str, LLMBackendConfig]:
+    """Load named backends without constructing node configuration.
+
+    Harness launchers use this path because they need only one backend.  Keeping
+    node parsing out of backend lookup also lets a long-lived PEV parent launch
+    Verify after Execute changes ``NodeConfig`` or adds new node YAML fields.
+    """
+    raw_backends = _load_merged_config_data(path).get("llm_backends", {}) or {}
+    if not isinstance(raw_backends, dict):
+        raise ValueError(
+            f"{Path(path)} llm_backends must contain a YAML mapping of backend names"
+        )
+    return {
+        backend_id: LLMBackendConfig(**(backend_data or {}))
+        for backend_id, backend_data in raw_backends.items()
+    }
 
 
 @dataclass
@@ -718,18 +1739,18 @@ class MeshConfig:
     router: RouterConfig = field(default_factory=RouterConfig)
     nodes: dict[str, NodeConfig] = field(default_factory=dict)
     llm_backends: dict[str, LLMBackendConfig] = field(default_factory=dict)
+    fixed_tools: dict[str, FixedToolConfig] = field(default_factory=dict)
+    # The fleet-wide ``worker_task_types_defaults`` anchor, normalized.  Each
+    # node's effective map is this map deep-merged under whatever the node
+    # declares; kept here so the merge is inspectable after load.
+    worker_task_types_defaults: dict[str, WorkerTaskTypeDefinition] = field(
+        default_factory=dict
+    )
 
     @classmethod
     def load(cls, path: str | Path) -> MeshConfig:
         """Load configuration from a YAML file."""
-        path = Path(path)
-        if not path.exists():
-            return cls()
-
-        with open(path) as f:
-            data = yaml.safe_load(f) or {}
-
-        return cls.from_dict(data)
+        return cls.from_dict(_load_merged_config_data(path))
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MeshConfig:
@@ -742,12 +1763,45 @@ class MeshConfig:
         for backend_id, backend_data in data.get("llm_backends", {}).items():
             llm_backends[backend_id] = LLMBackendConfig(**backend_data)
 
+        fixed_tools: dict[str, FixedToolConfig] = {}
+        for tool_name, tool_data in data.get("fixed_tools", {}).items():
+            tool_data = dict(tool_data or {})
+            parameter_data = tool_data.pop("parameters", {}) or {}
+            parameters = [
+                FixedToolParameter(name=parameter_name, **(details or {}))
+                for parameter_name, details in parameter_data.items()
+            ]
+            fixed_tools[tool_name] = FixedToolConfig(
+                name=tool_name,
+                parameters=parameters,
+                **tool_data,
+            )
+
+        # Fleet-wide worker task-type defaults.  A node that declares no
+        # worker_task_types keeps today's behaviour exactly (empty map, or
+        # whatever a YAML anchor copied in); a node that declares a PARTIAL
+        # block inherits every type and field it did not name.
+        raw_task_type_defaults = data.get("worker_task_types_defaults") or {}
+        if not isinstance(raw_task_type_defaults, dict):
+            raise ValueError(
+                "worker_task_types_defaults must be a YAML mapping of task types"
+            )
+
         nodes = {}
         for node_id, node_data in data.get("nodes", {}).items():
             # Handle nodes defined with no properties (value is None)
             if node_data is None:
                 node_data = {}
             node_data["id"] = node_id
+
+            # Merge only when the node actually declares the key.  Merging
+            # unconditionally would hand the fleet map to lightweight nodes
+            # that deliberately have none today.
+            if "worker_task_types" in node_data:
+                node_data["worker_task_types"] = merge_worker_task_types(
+                    raw_task_type_defaults,
+                    node_data.get("worker_task_types"),
+                )
             # Inherit router settings if not specified
             node_data.setdefault("router_host", router.host)
             node_data.setdefault("router_port", router.port)
@@ -773,6 +1827,29 @@ class MeshConfig:
             if "cc_session" in node_data and isinstance(node_data["cc_session"], dict):
                 node_data["cc_session"] = CCSessionConfig(**node_data["cc_session"])
 
+            # Parse the nested isolation block. Reject the nested/flat conflict
+            # here as well as in resolve_isolation_policy() so a bad file fails
+            # at load time rather than at agent start.
+            if "isolation" in node_data and node_data["isolation"] is not None:
+                legacy_isolation_keys = [
+                    key for key in ("sandboxed", "allowed_dirs")
+                    if key in node_data
+                ]
+                if not isinstance(node_data["isolation"], IsolationConfig):
+                    try:
+                        node_data["isolation"] = IsolationConfig.from_dict(
+                            node_data["isolation"]
+                        )
+                    except IsolationConfigError as exc:
+                        raise IsolationConfigError(f"{node_id}: {exc}") from exc
+                if legacy_isolation_keys:
+                    raise IsolationConfigError(
+                        f"{node_id}: both the nested 'isolation' block and the "
+                        "deprecated flat 'sandboxed'/'allowed_dirs' fields are "
+                        "set — remove the flat fields; they are superseded by "
+                        "'isolation'"
+                    )
+
             # Parse controller config if present
             if "controller" in node_data and node_data["controller"] is not None:
                 controller_data = node_data["controller"]
@@ -788,7 +1865,30 @@ class MeshConfig:
 
             nodes[node_id] = NodeConfig(**node_data)
 
-        return cls(router=router, nodes=nodes, llm_backends=llm_backends)
+        for node_id, node in nodes.items():
+            if not node.router_deep_enabled:
+                continue
+            if not node.router_deep_backend:
+                raise ValueError(
+                    f"{node_id}: router_deep_backend is required when "
+                    "router_deep_enabled is true"
+                )
+            if node.router_deep_backend not in llm_backends:
+                raise ValueError(
+                    f"{node_id}: router_deep_backend "
+                    f"{node.router_deep_backend!r} is not present in "
+                    "llm_backends"
+                )
+
+        return cls(
+            router=router,
+            nodes=nodes,
+            llm_backends=llm_backends,
+            fixed_tools=fixed_tools,
+            worker_task_types_defaults=normalize_worker_task_types(
+                raw_task_type_defaults
+            ),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -810,14 +1910,35 @@ class MeshConfig:
             "llm_backends": {
                 backend_id: {
                     "backend_type": backend.backend_type,
+                    "access": backend.access,
                     "api_key": backend.api_key,
                     "base_url": backend.base_url,
                     "default_model": backend.default_model,
                     "max_tokens": backend.max_tokens,
                     "temperature": backend.temperature,
+                    "synthesis_timeout": backend.synthesis_timeout,
                     "cc_allowed_tools": backend.cc_allowed_tools,
                 }
                 for backend_id, backend in self.llm_backends.items()
+            },
+            "fixed_tools": {
+                tool_name: {
+                    "command": tool.command,
+                    "description": tool.description,
+                    "timeout_hours": tool.timeout_hours,
+                    "parameters": {
+                        parameter.name: {
+                            "type": parameter.type,
+                            "description": parameter.description,
+                            "required": parameter.required,
+                            "cli_flag": parameter.cli_flag,
+                        }
+                        for parameter in tool.parameters
+                    },
+                    "phase_markers": list(tool.phase_markers),
+                    "artifacts": list(tool.artifacts),
+                }
+                for tool_name, tool in self.fixed_tools.items()
             },
             "nodes": {
                 node_id: {
@@ -827,9 +1948,16 @@ class MeshConfig:
                     "auth_token": node.auth_token,
                     "llm_model": node.llm_model,
                     "llm_backend": node.llm_backend,
+                    "router_deep_backend": node.router_deep_backend,
+                    "router_deep_enabled": node.router_deep_enabled,
                     "fold_backend": node.fold_backend,
                     "system_prompt": node.system_prompt,
                     "tools": node.tools,
+                    **(
+                        {"isolation": node.isolation.to_dict()}
+                        if node.isolation is not None
+                        else {}
+                    ),
                 }
                 for node_id, node in self.nodes.items()
             },
@@ -866,9 +1994,11 @@ def backend_config_to_llm_config(backend: LLMBackendConfig):
 
     return LLMConfig(
         backend=backend.backend_type,  # type: ignore
+        access=backend.access,
         model=backend.default_model,
         max_tokens=backend.max_tokens,
         temperature=backend.temperature,
+        synthesis_timeout=backend.synthesis_timeout,
         api_key=backend.api_key,
         base_url=backend.base_url,
         cc_allowed_tools=backend.cc_allowed_tools,
@@ -884,6 +2014,7 @@ def backend_config_to_llm_config(backend: LLMBackendConfig):
         thinking_budget=backend.thinking_budget,
         include_thoughts=backend.include_thoughts,
         auto_detect_reasoning=backend.auto_detect_reasoning,
+        chat_template_kwargs=backend.chat_template_kwargs,
         cookie_source=backend.cookie_source,
         # CC subprocess env overrides, thinking mode, binary path, and effort
         cc_env=backend.cc_env,
@@ -894,6 +2025,7 @@ def backend_config_to_llm_config(backend: LLMBackendConfig):
         cc_worker_briefing=backend.cc_worker_briefing,
         # Codex settings
         codex_binary=backend.codex_binary,
+        codex_env=backend.codex_env,
         codex_subprocess_idle_timeout=backend.codex_subprocess_idle_timeout,
         codex_extra_args=list(backend.codex_extra_args),
         # Mesh harness settings
