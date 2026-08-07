@@ -1,6 +1,8 @@
 # Mesh
 
-A framework for running persistent societies of autonomous AI agents. A central router connects agents and human users over WebSocket; each agent runs its own LLM backend and a full set of tools. You interact through a terminal client or a browser.
+A framework for running persistent societies of autonomous AI agents, released as research infrastructure. A central router connects agents and human users over WebSocket; each agent runs its own LLM backend and a full set of tools. You interact through a terminal client or a browser.
+
+A 55-page architecture report is available at [docs/technical-report/](docs/technical-report/).
 
 ---
 
@@ -11,6 +13,10 @@ A framework for running persistent societies of autonomous AI agents. A central 
 Mesh lets you stand up a network of AI agents that persist across sessions, communicate with each other and with you, and take real actions (run shell commands, read/write files, search the web). The **router** is the central hub — it brokers messages, manages authentication, and stores conversation history. **Agents** are autonomous LLM-powered nodes that connect to the router; each has a role (researcher, coder, sysadmin) and its own tool set. **Clients** (a terminal TUI or a web browser) are how you talk to agents and to each other.
 
 Every node has a **node ID** like `user:yourname` or `agent:sysadmin:bob`. You address messages by nickname — type `@bob hello` and the router delivers it.
+
+### Known limitations
+
+This July 11 snapshot predates the current runtime's entity, essay, and curation memory layer. The live `mesh/memory/` directory adds `ceiling_rules.py`, `curation.py`, `entities.py`, `entity_essays.py`, `essay_fold.py`, `formation_contract.py`, `ids.py`, `pending_additions.py`, and `write_audit.py`; the current runtime also includes the autonomous controller mode in `mesh/autonomous_runtime.py`. A fuller release is in preparation.
 
 ### Architecture
 
