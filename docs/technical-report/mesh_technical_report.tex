@@ -44,7 +44,7 @@
 
 \begin{abstract}
 This document describes the architecture of the \code{hello-world} mesh
-agent system---a multi-agent coordination framework built around
+agent system: a multi-agent coordination framework built around
 heterogeneous LLM backends, bounded execution controllers, durable
 project autonomy, and governed long-term memory. The report covers LLM
 backend dispatch; tool routing through \code{complete\_with\_tools}; the
@@ -83,15 +83,15 @@ fixed tool set, the mesh is designed around four principles:
 
 \begin{enumerate}
   \item \textbf{Heterogeneous backends.} Each agent can use a different
-        LLM backend---OpenAI, Anthropic, Claude Code, Z.ai, Codex, or a
-        standalone harness subprocess---selected per-agent via
+        LLM backend (OpenAI, Anthropic, Claude Code, Z.ai, Codex, or a
+        standalone harness subprocess), selected per-agent via
         configuration. This enables cost/capability tradeoffs: a cheap
         local model for routine tasks, an expensive API model for hard
         problems, and a dedicated assessor LLM for orchestration.
 
   \item \textbf{Shared tool surface.} All agents access the same
-        tools---email, calendar, notes, web search, literature, memory,
-        finance, and inter-agent communication---through a unified
+        tools (email, calendar, notes, web search, literature, memory,
+        finance, and inter-agent communication) through a unified
         \code{mesh-tool} CLI. Tool routing adapts to each backend's
         capabilities: native function calling for OpenAI/Anthropic, shell
         invocation for Claude Code/Codex, and structured XML for legacy
@@ -113,7 +113,7 @@ fixed tool set, the mesh is designed around four principles:
 \end{enumerate}
 
 The system has been in continuous operation since January 2026, running
-9~agents across multiple hosts. This report documents the architecture
+9 agents across multiple hosts. This report documents the architecture
 as implemented, including the plan-and-execute controller that
 orchestrates multi-phase code editing tasks, the native multi-turn
 executor loop that eliminates redundant file reads across phase
@@ -164,7 +164,7 @@ For manual use, run it directly:
 \section{Minimal Configuration}
 
 All configuration lives in \code{mesh.yaml} at the repository root.
-The production deployment defines 46~backends and 9~agents, but a
+The production deployment defines 46 backends and 9 agents, but a
 minimal setup needs only the router section and one backend.
 
 \paragraph{Environment variables.}
@@ -292,7 +292,7 @@ Chapter~\ref{ch:backends} for backend configuration details.
 
 \section{Notes for Public Release}
 
-The production \code{mesh.yaml} contains 46~backends with paths
+The production \code{mesh.yaml} contains 46 backends with paths
 hardcoded to absolute paths and API keys referenced via
 environment variables. To prepare the repository for public release:
 
@@ -439,7 +439,7 @@ indicates legacy paths.}
 \label{fig:overview}
 \end{figure}
 
-Version~2 adds two durable control planes around this message path. The
+Version 2 adds two durable control planes around this message path. The
 memory plane turns successful formation batches into internal curation
 turns that maintain the digest and entity essays without holding the
 message-processing lock. The autonomous plane accepts only runtime-stamped
@@ -450,8 +450,8 @@ project dossiers and immutable session reports.
 \paragraph{Router states.}
 RouterV2 exposes three observable states:
 \begin{description}[nosep, leftmargin=1.5em, labelwidth=1.2em]
-  \item[IDLE] Incoming message $\to$ LLM classification call $\to$
-    \code{\{needs\_response, needs\_worker\}}.  If
+  \item[IDLE] Incoming message triggers an LLM classification call that
+    produces \code{\{needs\_response, needs\_worker\}}.  If
     \code{needs\_worker} is false, the router generates a direct
     response and stays IDLE.  If true, the router sends an immediate
     acknowledgment, injects relevant memories, and spawns a worker.
@@ -465,7 +465,7 @@ RouterV2 exposes three observable states:
 
 \paragraph{Unified harness-backend dispatch.}
 When the router's own LLM backend is itself a harness-type backend
-(Claude Code, Codex, or \code{mesh-harness}---enumerated in
+(Claude Code, Codex, or \code{mesh-harness}, enumerated in
 \code{HARNESS\_BACKENDS} in \code{router\_v2.py}), the router cannot
 use native tool calls to launch workers. Instead, these backends share a
 unified dispatch contract: router-only tools (\code{worker\_launch},
@@ -750,14 +750,14 @@ converters for each backend:
 
 The \code{mesh-tool} CLI provides shell-based access to mesh tools,
 replacing the MCP sidecar for all backends with shell access. Any agent
-that can execute shell commands can call mesh tools directly---no schema
+that can execute shell commands can call mesh tools directly, with no schema
 injection, XML parsing, or MCP plumbing required.
 
 \paragraph{Architecture.}
 \code{mesh-tool} is a bash wrapper at the repository root that activates
 the virtualenv and runs \code{python -m mesh.cli.mesh\_tool}. It imports
 the same \code{tool\_implementations.py} functions used by the
-\code{ToolRegistry}---no reimplementation.
+\code{ToolRegistry} (no reimplementation).
 
 \begin{lstlisting}
 mesh-tool (bash wrapper, repo root)
@@ -812,7 +812,7 @@ the \code{load\_prompt\_file()} auto-include mechanism (same pattern as
 concise instructions on discovering and calling mesh-tool from the shell.
 
 \paragraph{Tool surface.}
-53~tools across Gmail, web search, notes, literature,
+53 tools across Gmail, web search, notes, literature,
 calendar, memory, maps, mesh info, finance, and utility categories.
 Plus \code{send\_message} for agent communication.
 
@@ -852,9 +852,9 @@ EOF
 
 Without this mechanism, \code{\$550} would be interpolated as the shell
 variable \code{\$5} concatenated with \code{50}, producing a mangled
-message. The fix is a three-layer approach: (1)~stdin mode in the CLI
-parser (\code{mesh\_tool.py}), (2)~shell-safety instruction sections in
-agent prompts documenting the \code{<<'EOF'} convention, and (3)~the
+message. The fix is a three-layer approach: (1) stdin mode in the CLI
+parser (\code{mesh\_tool.py}), (2) shell-safety instruction sections in
+agent prompts documenting the \code{<<'EOF'} convention, and (3) the
 documented convention in \code{mesh/prompts/mesh\_tools.md}.
 
 \paragraph{Map tool socket routing.}
@@ -1422,7 +1422,7 @@ the final response.}
 
 The assessor is a separate LLM client (\code{assessor\_llm\_client}),
 defaulting to the primary \code{llm\_client} if not provided.
-In production, this is typically DeepSeek-v4-pro.
+In production this is typically DeepSeek-v4-pro.
 
 \subsection{Controller Invocation}
 
@@ -1444,7 +1444,7 @@ controller_output = await run_loop(
 \end{lstlisting}
 
 The controller sees a fresh single-message history containing only the
-evaluator context---it does not share the executor's conversation history.
+evaluator context; it does not share the executor's conversation history.
 
 \subsection{Controller Template}
 
@@ -1497,7 +1497,7 @@ Files modified are tracked by matching
 \textbf{Note:} Triage is \emph{not} currently invoked by the P\&E
 controller loop. \code{\_TRIAGE\_TEMPLATE} and
 \code{parse\_triage()} exist in the codebase but
-the P\&E loop does not call them---the first phase simply goes to the
+the P\&E loop does not call them; the first phase simply goes to the
 controller for an intent decision. The controller template's guidelines
 (``If the task is a simple factual question you can answer now, terminate
 immediately'') serve the same purpose implicitly.
@@ -1552,7 +1552,7 @@ tool-name filter.
 \label{sec:plan}
 
 When the controller selects \code{plan}, the plan is extracted
-inline from the controller's own output---no separate LLM call is made.
+inline from the controller's own output; no separate LLM call is made.
 The plan is stored in \code{current\_plan} and injected into subsequent
 executor phases via \code{\_EXECUTOR\_FRAMING} and
 into assessments via \code{\_ASSESSMENT\_TEMPLATE}.
@@ -1636,16 +1636,16 @@ is lifetime, not per-segment.
 \section{Safety Properties}
 
 \begin{itemize}[nosep]
-  \item \textbf{Observe cap}: After 2~observe phases, the observe
+  \item \textbf{Observe cap}: After 2 observe phases, the observe
         intent is permanently removed from the controller's option set
         for the remainder of the task.
-  \item \textbf{Observe checkpoints}: Every 5~iterations starting at
-        iteration~8, the assessor is asked whether to continue or
+  \item \textbf{Observe checkpoints}: Every 5 iterations starting at
+        iteration 8, the assessor is asked whether to continue or
         complete the phase.
   \item \textbf{History carryover}: Observe-phase tool results
         (file reads, searches) are preserved in the shared
         \code{history} list for subsequent phases. No compaction fires
-        between observe and execute---only between consecutive execute
+        between observe and execute; only between consecutive execute
         phases.
   \item \textbf{Read-only observe}: The \code{MESH\_READ\_ONLY\_TOOLS}
         whitelist ensures the observe phase cannot send emails, create
@@ -1697,10 +1697,10 @@ native API tool results. The executor model treats them as someone else's
 notes and re-reads the same files, duplicating context and accelerating
 compaction.
 
-The \textbf{native executor loop} (\code{run\_native\_loop}) solves this
+The native executor loop (\code{run\_native\_loop}) solves this
 by maintaining the conversation as a native OpenAI \code{messages:
 list[dict]} instead of \code{list[HistoryMessage]}. Tool results are
-stored as \code{\{"role": "tool", "tool\_call\_id": "..."\}} messages---the
+stored as \code{\{"role": "tool", "tool\_call\_id": "..."\}} messages; the
 executor treats them as its own prior work and builds on them across phase
 boundaries.
 
@@ -1718,7 +1718,7 @@ boundaries.
     Completions call that accepts pre-built \code{messages} and skips
     XML serialization entirely.
   \item[\code{mesh/tools.py}]
-    \code{ToolCall.call\_id} field---preserves the API-returned tool call
+    \code{ToolCall.call\_id} field, which preserves the API-returned tool call
     ID for native message linking.
 \end{description}
 
@@ -1727,7 +1727,7 @@ boundaries.
 Native mode activates when \code{backend == "openai"} inside
 \code{\_run\_plan\_and\_execute\_loop()}. Non-OpenAI backends
 (CC, zai, mesh-harness XML) fall back to the existing XML path. The
-dispatch is purely conditional---no configuration flag required.
+dispatch is purely conditional, requiring no configuration flag.
 
 \section{Message Format}
 
@@ -1847,7 +1847,7 @@ The native loop emits the same protocol events as the XML loop:
 The v2 autonomous controller is distinct from the harness P\&E controller.
 P\&E chooses phases inside one execution task; autonomous agent mode advances
 a durable project across bounded sessions. It uses the ordinary router and
-worker-dispatch machinery, but adds trusted project scope, a project dossier,
+worker-dispatch machinery but adds trusted project scope, a project dossier,
 immutable session reports, persistent attempt budgets, and deterministic
 wake scheduling.
 
@@ -2003,7 +2003,7 @@ TUI exposes:
   active flags, pending wakes, and current session. \\
 \code{/auto wake <agent> [<project>] [<time>]} & Schedule a bounded project
   session; omitting time means immediate. \\
-\code{/auto budget <project> <n>} & Set the daily worker ceiling (1--50). \\
+\code{/auto budget <project> <n>} & Set the daily worker ceiling (1 to 50). \\
 \code{/auto budget <project> reset} & Clear today's spent-attempt count while
   retaining the ceiling. \\
 \code{/auto active <project> on|off} & Arm or disarm paced automatic
@@ -2100,7 +2100,7 @@ actions attempted, successes and key facts, failures with verbatim error
 messages, artifacts produced, and open sub-questions.
 
 \noindent\textbf{Failure mode.}
-If the compaction LLM call fails, the first 2000~characters of
+If the compaction LLM call fails, the first 2000 characters of
 \code{executor\_output} are preserved as a fallback.
 
 
@@ -2245,7 +2245,7 @@ This is implemented in \code{\_run\_codex\_assessor()} in
 
 \paragraph{Motivation.}
 The codex CLI provides built-in reasoning (via OpenAI's \code{o3} or
-similar models) with a simpler interface---no tool schema management or
+similar models) with a simpler interface, requiring no tool schema management or
 XML parsing required. It was introduced as a second attempt after a
 clean revert (commit \code{54a33f8a}) of the original implementation.
 
@@ -2258,7 +2258,7 @@ codex exec --model <model> -s read-only --ephemeral --json \
 Flags: \code{-{}-ephemeral} (no persistent state), \code{-{}-json}
 (JSONL output), \code{-s read-only} (sandbox), and \code{-} (read
 prompt from stdin). The prompt is the concatenation of the evaluator
-context XML and the controller instructions template---the same
+context XML and the controller instructions template; the same
 \code{\_CONTROLLER\_TEMPLATE} used by the LLM assessor.
 
 \paragraph{Execution.}
@@ -2277,7 +2277,7 @@ for two event patterns:
         message content from the nested \code{response.output} array.
 \end{enumerate}
 If neither yields structured content, the parser falls back to raw
-stdout---checking for \code{<intent>} tags directly in the output.
+stdout, checking for \code{<intent>} tags directly in the output.
 
 \paragraph{Failure handling.}
 On timeout or non-zero exit code, the function returns a synthetic
@@ -2325,7 +2325,7 @@ default: \code{"\textasciitilde/.local/bin/codex"}).
 
   \item \textbf{Compaction uses primary LLM, not assessor.}
     \code{\_compact\_history()} calls the executor's LLM, not the
-    assessor---potentially using an expensive model for summarization.
+    assessor, potentially using an expensive model for summarization.
 
   \item \textbf{400 treated as transient.}
     \code{TRANSIENT\_HTTP\_CODES} includes 400 (Bad Request),
@@ -2459,7 +2459,7 @@ searchable beneath the curated text hierarchy.}
 \toprule
 \textbf{Tier} & \textbf{Name} & \textbf{Content} \\
 \midrule
-1 & Summary   & Short retrieval key (1--2 sentences). Always visible
+1 & Summary   & Short retrieval key (1 to 2 sentences). Always visible
                 in the TOC. \\
 2 & Reflection & Detailed analysis: what happened, why it matters,
                   lessons learned. Fetched via \code{memory\_get(id)}. \\
@@ -2522,14 +2522,14 @@ contract. Each record contains:
 
 \paragraph{Two bars.}
 Formation is deliberately recall-oriented: it does not require or filter on a
-1--10 ``worthiness score.'' Broadly useful events enter the episodic pool.
+1 to 10 ``worthiness score.'' Broadly useful events enter the episodic pool.
 The higher precision bar is the boolean \code{digest\_candidate}; curation
 uses it to decide which records may change always-on narrative context. This
 separates ``worth remembering'' from ``worth occupying every future prompt.''
 
 \paragraph{Cursor mechanics.}
 A cursor index tracks which conversation turns have been processed.
-Entry persistence and cursor advancement are atomic---if persistence
+Entry persistence and cursor advancement are atomic: if persistence
 fails, the cursor stays put and the window is retried on the next
 trigger. A cursor clamp prevents the cursor from advancing past the actual
 history length after restarts. Empty-but-valid extraction may advance the
@@ -2659,7 +2659,7 @@ Chapter~\ref{ch:maps-toc}.
 
 \paragraph{On-Demand Tools.}
 \begin{itemize}[nosep]
-  \item \code{memory\_get(id)} --- fetches the full reflection (Tier~2)
+  \item \code{memory\_get(id)} --- fetches the full reflection (Tier 2)
         of a specific entry. The result persists in conversation history
         for the rest of the session.
   \item \code{memory\_search(query, project=...)} --- defaults to hybrid
@@ -2709,7 +2709,7 @@ competing for the same role.
 The standing digest extends the memory system with a dense, continuously
 updated summary document per agent. Where the episodic memory pool
 stores individual entries with three-tier retrieval, the standing digest
-is a single coherent narrative---a ``standing briefing''---that captures
+is a single coherent narrative (a ``standing briefing'') that captures
 the agent's full operational history, key decisions, project context, and
 relationship knowledge in one document.
 
@@ -2896,7 +2896,7 @@ Every path first checks the map-injection feature gate; disabled means an
 empty block, not an active-project fallback.
 
 \paragraph{Summary embeddings.}
-Each project map maintains a 1--2 sentence summary in the
+Each project map maintains a 1 to 2 sentence summary in the
 \code{project\_maps.summary} column, extracted deterministically from
 the map's \code{\#\# Summary} section after every content change.
 The summary is embedded via \code{text-embedding-3-small} and stored in
@@ -2908,8 +2908,8 @@ embedding quality.
 
 \paragraph{Design rationale.}
 The static \code{\_active\_project} approach had two limitations:
-(1)~only one map was ever injected, even when conversations spanned
-multiple projects, and (2)~workers received no project context at all.
+(1) only one map was ever injected, even when conversations spanned
+multiple projects, and (2) workers received no project context at all.
 Relevance-based selection aligns map injection with the same principle
 used for memory entry retrieval.
 
@@ -2929,7 +2929,7 @@ the current conversational context.
 From the top-100 candidates, the \code{lazy\_greedy\_fl()} function
 (in \code{mesh/memory/selection.py}) selects 30 entries using a
 submodular Facility Location objective. This maximizes embedding
-diversity---ensuring broad coverage of the agent's topic history rather
+diversity, ensuring broad coverage of the agent's topic history rather
 than clustering around a single recent topic.
 
 \paragraph{Representative-set distinction.}
@@ -2942,13 +2942,13 @@ legacy active set as the whole memory hierarchy.
 
 \paragraph{Summary maintenance.}
 When the optional subsystem is enabled, each project map has a short summary
-(1--2 sentences) stored alongside
+(1 to 2 sentences) stored alongside
 an embedding vector in the \code{project\_maps} table. Summaries are
-extracted deterministically after every map content change---via
-integration, tool edits, or manual curation---by parsing the canonical
+extracted deterministically after every map content change (via
+integration, tool edits, or manual curation) by parsing the canonical
 \code{\#\# Summary} section from the map content (no LLM call needed).
 If no \code{\#\# Summary} section exists, the first non-heading
-paragraph (up to 500~characters) is used as a fallback. The embedding
+paragraph (up to 500 characters) is used as a fallback. The embedding
 is recomputed from the updated summary and cached in memory. The update
 runs as a fire-and-forget \code{asyncio.create\_task}.
 
@@ -3055,7 +3055,7 @@ custom API keys).
 The \code{\_mask\_cmd()} helper in \code{mesh/llm.py} masks sensitive
 values in subprocess command logs. It handles both two-token
 (\code{-{}-api-key VALUE}) and single-token (\code{-{}-api-key=VALUE})
-forms, replacing values with \code{***} plus the last 4~characters.
+forms, replacing values with \code{***} plus the last 4 characters.
 Only log output is affected; the actual subprocess command is unchanged.
 
 \section{Socket Path Hardening}
@@ -3109,7 +3109,7 @@ Two mechanisms allow tool calls to skip interactive confirmation:
     confirmation-required tool (e.g., \code{gmail\_send\_message}) via
     the agent socket, the socket handler executes it with
     \code{skip\_confirmation=True}. The rationale is that the user already
-    authorized the work by dispatching the worker---re-prompting for
+    authorized the work by dispatching the worker; re-prompting for
     confirmation on each sub-action would make the worker unusable.
 
   \item \textbf{\code{auto\_confirm\_tools} config}: Per-agent YAML
@@ -3202,7 +3202,7 @@ include:
         with DS-pro API assessor, GLM-5.1 executor with DS-pro assessor,
         and monolithic API-only configurations.
   \item \textbf{Wall time and cost analysis}: standard + thinking at
-        82~min vs.\ P\&E at 220~min for similar accuracy on a free local
+        82 min vs.\ P\&E at 220 min for similar accuracy on a free local
         model.
 \end{itemize}
 
@@ -3241,7 +3241,7 @@ system in production across multiple agents for 5+ months.
         (Section~\ref{sec:standing-digest}) resolved this by replacing
         the entry-level TOC with a single coherent narrative, trading
         per-entry granularity for holistic context while retaining hybrid
-        search and exact memory handles underneath it.
+        search and exact memory handles underneath.
   \item \textbf{Harness-backend router dispatch}: When the router itself
         runs on a harness backend (Claude Code, Codex), the native
         tool-call dispatch path is unavailable. The unified dispatch
