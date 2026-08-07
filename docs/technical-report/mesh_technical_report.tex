@@ -37,7 +37,7 @@
 \title{Mesh Agent System:\\Architecture, Control, and Memory\\[0.5em]
 \large Technical Report}
 \author{Project Owner}
-\date{May 2026}
+\date{August 2026 --- Version 2}
 
 \begin{document}
 \maketitle
@@ -45,16 +45,21 @@
 \begin{abstract}
 This document describes the architecture of the \code{hello-world} mesh
 agent system---a multi-agent coordination framework built around
-heterogeneous LLM backends, a plan-and-execute controller, and an
-episodic memory system. The report covers five layers: LLM backend
-dispatch, tool routing through \code{complete\_with\_tools}, the
-plan-and-execute controller with its native multi-turn executor loop,
-security hardening of subprocess and credential handling, and the
-episodic memory system (formation, curation, and retrieval).
+heterogeneous LLM backends, bounded execution controllers, durable
+project autonomy, and governed long-term memory. The report covers LLM
+backend dispatch; tool routing through \code{complete\_with\_tools}; the
+plan-and-execute harness and its native multi-turn executor; the v2
+autonomous project controller, dossiers, admission budgets, and paced
+wakes; security hardening of subprocess and credential handling; and the
+full memory hierarchy. That hierarchy spans raw conversation history,
+three-tier episodic records, an always-on standing digest, cited entity
+essays, edit-based curation with durable refusal recovery, and a separate
+human-governed procedural-memory layer.
 Configuration lives in \code{mesh.yaml}; runtime dispatch lives in
-\code{mesh/llm.py}; the controller lives in
-\code{mesh/harness/loop.py}; memory state lives in
-\code{\textasciitilde/.mesh/memory/}.
+\code{mesh/llm.py} and \code{mesh/router\_v2.py}; the two controller
+paths live in \code{mesh/harness/loop.py} and the autonomous runtime in
+\code{mesh/agent\_node.py}; memory and project state live beneath
+\code{\textasciitilde/.mesh/}.
 \end{abstract}
 
 \tableofcontents
@@ -74,7 +79,7 @@ Configuration lives in \code{mesh.yaml}; runtime dispatch lives in
 The mesh system is a process-based multi-agent coordination framework
 where users and AI agents communicate through a central message router.
 Unlike monolithic agent architectures that pair a single LLM with a
-fixed tool set, the mesh is designed around three principles:
+fixed tool set, the mesh is designed around four principles:
 
 \begin{enumerate}
   \item \textbf{Heterogeneous backends.} Each agent can use a different
@@ -92,11 +97,19 @@ fixed tool set, the mesh is designed around three principles:
         invocation for Claude Code/Codex, and structured XML for legacy
         paths.
 
-  \item \textbf{Persistent, project-organized memory.} Agents build
-        episodic memory over their lifetimes through an automated
-        formation pipeline. Memories are organized by project, curated
-        into living project maps, and surfaced via a two-stage
-        table-of-contents pipeline that balances relevance and diversity.
+  \item \textbf{Persistent, curated memory.} Agents form broad-recall
+        episodic records from durable conversation history, then maintain
+        a standing digest and cited entity essays through a bounded
+        edit-based curation turn. Semantic and lexical retrieval remain
+        available underneath those curated narratives. Governed skill
+        cards hold procedures in a separate, human-approved lifecycle.
+
+  \item \textbf{Bounded project autonomy.} An enrolled controller advances
+        one configured project at a time from a durable seven-section
+        dossier. The router meters worker attempts through a persistent
+        daily budget; immutable reports, verified task transitions, and
+        paced one-shot wakes make autonomous progress auditable and
+        restart-resilient.
 \end{enumerate}
 
 The system has been in continuous operation since January 2026, running
@@ -104,7 +117,8 @@ The system has been in continuous operation since January 2026, running
 as implemented, including the plan-and-execute controller that
 orchestrates multi-phase code editing tasks, the native multi-turn
 executor loop that eliminates redundant file reads across phase
-boundaries, and the benchmark infrastructure used to evaluate
+boundaries, the autonomous project controller, the v2 memory-curation
+hierarchy, and the benchmark infrastructure used to evaluate
 configurations.
 
 
@@ -158,7 +172,7 @@ Create an \code{env.bash} file exporting the API keys referenced by
 \code{mesh.yaml}. At minimum:
 
 \begin{lstlisting}[language=bash]
-# env.bash — DO NOT commit this file
+# env.bash -- DO NOT commit this file
 export OPENAI_API_KEY="<your-api-key>"
 export MESH_AUTH_TOKEN="$(openssl rand -hex 32)"
 \end{lstlisting}
@@ -311,7 +325,11 @@ Each agent node has:
 \begin{itemize}[nosep]
   \item An \textbf{LLM backend} (how it calls language models),
   \item A \textbf{tool surface} (what tools are available),
-  \item An optional \textbf{harness layer} (plan-and-execute controller).
+  \item A \textbf{persistent memory context} (digest, essays, and episodic
+        retrieval),
+  \item An optional \textbf{harness layer} (plan-and-execute controller),
+  \item Optional enrollment as an \textbf{autonomous project controller}
+        for an explicit list of \code{project:*} keys.
 \end{itemize}
 
 \begin{figure}[h]
@@ -421,8 +439,16 @@ indicates legacy paths.}
 \label{fig:overview}
 \end{figure}
 
+Version~2 adds two durable control planes around this message path. The
+memory plane turns successful formation batches into internal curation
+turns that maintain the digest and entity essays without holding the
+message-processing lock. The autonomous plane accepts only runtime-stamped
+project wakes, carries a compact \code{SESSION PLAN} across worker-report
+continuations, meters dispatch attempts in the router, and commits state to
+project dossiers and immutable session reports.
+
 \paragraph{Router states.}
-RouterV2 operates a two-state machine:
+RouterV2 exposes three observable states:
 \begin{description}[nosep, leftmargin=1.5em, labelwidth=1.2em]
   \item[IDLE] Incoming message $\to$ LLM classification call $\to$
     \code{\{needs\_response, needs\_worker\}}.  If
@@ -432,6 +458,9 @@ RouterV2 operates a two-state machine:
   \item[BUSY] Worker is running.  New messages are handled by the
     router's own LLM, which peeks at the worker's in-progress
     context to generate contextual interim responses.
+  \item[AUTO] An autonomous controller session or one of its scoped worker
+    slots is active. The state is derived from trusted session metadata;
+    ordinary interactive workers remain BUSY.
 \end{description}
 
 \paragraph{Unified harness-backend dispatch.}
@@ -833,8 +862,8 @@ The tools \code{map\_edit}, \code{map\_create}, \code{map\_review}, and
 \code{set\_project\_context} are routed through the agent socket via a
 prefix-matching check in \code{\_execute()} (not via
 \code{AGENT\_ROUTED\_TOOLS}, which is reserved for placeholder-handler
-tools). This ensures that worker subprocesses
-can modify project maps via the parent agent's initialized memory system
+tools). This ensures that worker subprocesses can modify the optional
+legacy project-map subsystem via the parent agent's initialized memory system
 rather than attempting to initialize their own (which would fail with
 ``memory not initialized'' errors).
 
@@ -1811,6 +1840,187 @@ The native loop emits the same protocol events as the XML loop:
 
 
 %----------------------------------------------------------------------
+\chapter{Autonomous Project Controller}
+\label{ch:autonomous-controller}
+%----------------------------------------------------------------------
+
+The v2 autonomous controller is distinct from the harness P\&E controller.
+P\&E chooses phases inside one execution task; autonomous agent mode advances
+a durable project across bounded sessions. It uses the ordinary router and
+worker-dispatch machinery, but adds trusted project scope, a project dossier,
+immutable session reports, persistent attempt budgets, and deterministic
+wake scheduling.
+
+\section{Enrollment and Trusted Session Scope}
+
+Enrollment is explicit in \code{mesh.yaml}. A node enables
+\code{autonomous\_agent\_mode\_enabled}, lists the exact
+\code{autonomous\_projects} it controls, and sets a per-session worker
+ceiling and active-mode pacing gap. The public example configuration shows
+the surface without shipping a live deployment.
+
+The controller mandate is not placed unconditionally in every prompt.
+\code{AgentNode.autonomous\_wake\_metadata()} recognizes the canonical
+\code{[AUTONOMOUS PROJECT SESSION]} header, validates the named
+\code{project:*} key against that node's enrollment, caps the requested
+session limit to configuration, and mints a session ID. Only this
+runtime-stamped metadata activates the planning mandate. A user message that
+merely imitates the header cannot enroll a project or mint a trusted session.
+Worker-report continuations receive the execute-and-close mandate rather than
+restarting the planning phase.
+
+\section{Durable Project Dossier}
+
+\code{mesh/project\_dossier.py} defines the project state authority. Each
+dossier is a Markdown document under \code{\textasciitilde/.mesh/digests/}
+with frontmatter and exactly seven ordered, non-empty sections:
+
+\begin{enumerate}[nosep]
+  \item Identity,
+  \item Goals,
+  \item Tasks,
+  \item Timeline,
+  \item Narrative,
+  \item Standing decisions, and
+  \item Open threads.
+\end{enumerate}
+
+Task rows live inside a schema-marked block and carry stable task IDs,
+pending/in-progress/done status, priority, goal linkage, and completion
+evidence. A validator checks identity, structure, the optional project-model
+block, and the global token ceiling before an exact-string edit lands.
+Writes use a same-directory temporary file, \code{fsync}, and rename; a
+failed validation leaves the prior dossier byte-identical. Initialization is
+create-once and never overwrites an existing dossier.
+
+The controller is the sole routine dossier writer. Workers receive the
+dossier as read-only project context and return claims plus artifacts; they do
+not edit project state, write reports, or schedule more work. This separates
+execution evidence from the component that decides task transitions.
+
+\section{One Bounded Session}
+
+The shipped mandates
+(\code{mesh/prompts/autonomous\_controller.txt} and
+\code{autonomous\_controller\_execute.txt}) define a two-phase protocol:
+
+\begin{enumerate}
+  \item \textbf{Plan.} Check the daily ledger, read the dossier, follow only
+        relevant report/memory links, repair the task roster, and write a
+        bounded \code{SESSION PLAN}. The plan names a goal, ordered task IDs,
+        completion evidence, and the first action before any worker launch.
+  \item \textbf{Execute and close.} Mark the selected task in progress,
+        dispatch a self-contained worker brief, verify the resulting artifacts
+        and tests, and continue only while both session and daily headroom
+        remain. Direction-changing evidence is recorded in the dossier before
+        another dispatch. Closeout writes the immutable report, indexes a
+        compact memory pointer, updates live dossier state and the standing
+        digest, relays the scheduler decision, and stops.
+\end{enumerate}
+
+The router captures a schema-valid \code{SESSION PLAN} (four required fields,
+at most ten lines and 4,000 characters) on the outgoing planning turn. It
+stamps that bounded copy into trusted session metadata, then carries it on
+worker completion even if rolling conversation history has been summarized or
+dropped. A continuation without a valid carrier receives an explicit
+\code{SESSION PLAN UNAVAILABLE} recovery instruction rather than an invented
+plan.
+
+\section{Immutable Reports and Audit Chain}
+
+\code{dossier\_write\_report} creates a dated, sequenced report beneath
+\code{\textasciitilde/.mesh/reports/} and links it from the dossier Timeline.
+An identical retry is idempotent; different bytes at an existing report path
+are refused, so corrections require a later amendment report. The mandate
+requires the session plan, worker reports verbatim, controller verification,
+decisions, artifacts, issues, budget use, and next-wake intent. The report is
+the audit authority; the dossier is the current-state authority; episodic
+memory stores only a compact pointer back to the canonical report.
+
+\section{Admission Budgets and Single-Writer Boundaries}
+
+The daily project ledger is a JSON file beneath
+\code{\textasciitilde/.mesh/budget/}. Its limit comes from dossier
+frontmatter; the dated \code{used} counter rolls over on a new day. The
+central dispatch seam in \code{RouterV2} is the sole normal-path charger:
+
+\begin{enumerate}[nosep]
+  \item trusted session scope mechanically supplies a
+        \code{[PROJECT: project:...]} tag when the model omitted it;
+  \item duplicate, capacity, and selection refusals run before the budget
+        check and consume nothing;
+  \item an admitted dispatch is charged exactly once at reservation, before
+        worker startup; and
+  \item a failed start is deliberately not refunded, because budgets bound
+        attempts and must also bound retry storms.
+\end{enumerate}
+
+The controller therefore reads \code{dossier\_check\_budget} but must never
+call \code{dossier\_spend\_budget}; doing so would double-charge the same
+attempt. Exhaustion returns a structured, final refusal. A ledger-write
+failure after admission is logged as an understated count, and a missing tag
+or unreadable budget ledger fails open with a warning. Thus ``one charge per
+attempt'' is the validated normal path, while infrastructure failure is made
+observable rather than falsely represented as enforcement.
+
+The operator can change the configured daily ceiling through the brokered
+control surface. The sibling \code{budget-reset} operation clears only the
+current day's \code{used} count; it does not change the limit. Dossier files,
+immutable reports, ledgers, and scheduled wakes are all stored on disk, so a
+process restart reloads rather than reconstructs project state.
+
+\section{Active Mode and Scheduled Wakes}
+
+Active mode is opt-in per project. After a successful report write,
+\code{AgentNode} calls the pure decision function in
+\code{mesh/autonomous\_active.py}. It schedules no wake unless the dossier's
+active flag is true, daily budget remains, the last report is non-terminal,
+and no wake for that project is already pending. A minimum gap (60 minutes by
+default) paces sessions. If another wake for the same agent would overlap,
+the candidate is moved beyond it. The result is one explicit one-shot wake,
+not a recurrence; every closeout re-evaluates all gates from fresh state.
+
+Reports with status \code{blocked}, \code{failed}, or \code{no\_op} suppress
+automatic continuation. Pending wakes live in the agent's SQLite store and
+are reloaded at startup. The controller does not choose or override the
+runtime's timestamp: it reports the returned wake ID or the reason that no
+wake was scheduled.
+
+\section{Operator Surface}
+
+Autonomous controls use \code{AUTONOMOUS\_CONTROL} messages routed through
+the central router and independently revalidated by the enrolled agent. The
+TUI exposes:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lL{8cm}@{}}
+\toprule
+\textbf{Command} & \textbf{Effect} \\
+\midrule
+\code{/auto} & Fan out status for enrolled controllers: projects, budgets,
+  active flags, pending wakes, and current session. \\
+\code{/auto wake <agent> [<project>] [<time>]} & Schedule a bounded project
+  session; omitting time means immediate. \\
+\code{/auto budget <project> <n>} & Set the daily worker ceiling (1--50). \\
+\code{/auto budget <project> reset} & Clear today's spent-attempt count while
+  retaining the ceiling. \\
+\code{/auto active <project> on|off} & Arm or disarm paced automatic
+  continuation. \\
+\code{/auto cancel <agent> <wake-id>} & Cancel a pending wake. \\
+\code{/wake [project]} & Convenience form that resolves the project's owner
+  and starts a session immediately. \\
+\code{/report [project] [since YYYY-MM-DD]} & Request a report-oriented
+  autonomous writing session. \\
+\bottomrule
+\end{tabular}
+\caption{Autonomous controller operations in \code{run\_user\_tui.py}.}
+\label{tab:auto-commands}
+\end{table}
+
+
+%----------------------------------------------------------------------
 \chapter{Context Management}
 \label{ch:context}
 %----------------------------------------------------------------------
@@ -2135,10 +2345,15 @@ default: \code{"\textasciitilde/.local/bin/codex"}).
 \label{ch:memory}
 %----------------------------------------------------------------------
 
-The memory system gives agents persistent, project-organized episodic
-memory that survives across sessions. It operates at three layers:
-conversation history (short-term), episodic memory pool (medium-term),
-and project maps (structural).
+The v2 memory system gives agents persistent recall at several levels of
+abstraction. Its main text hierarchy is raw conversation history,
+three-tier episodic records, an always-on standing digest, and cited entity
+essays. An entity registry binds records to people, projects, events, and
+optionally groups. A bounded edit-based curation turn maintains the digest
+and essays after formation. Governed procedural memory is a separate layer:
+human-approved skill cards describe how to act, rather than what happened.
+Project maps remain an optional legacy subsystem and are not part of the
+self-curation hierarchy.
 
 \section{Architecture Overview}
 
@@ -2160,78 +2375,81 @@ and project maps (structural).
   \node[box, fill=blue!10] at (0, 0) (conv)
     {Conversation\\History};
   \node[smallbox, fill=blue!5] at (4.5, 0) (compact)
-    {Compaction\\(0.97 threshold)};
+    {Durable Raw\\History};
 
   % Row 1: Formation pipeline
   \node[box, fill=orange!10] at (0, -2.2) (timer)
-    {Formation\\Timer};
+    {Four Formation\\Triggers};
   \node[box, fill=orange!10] at (4.5, -2.2) (segmenter)
-    {V3 Segmenter\\(DeepSeek)};
+    {V3 Recall\\Formation};
 
   % Row 2: Storage
   \node[box, fill=green!10] at (0, -4.4) (pool)
-    {Memory Pool\\(SQLite)};
+    {Episodic Pool\\(SQLite)};
   \node[box, fill=green!10] at (4.5, -4.4) (maps)
-    {Project Maps\\(Markdown)};
+    {Edit-Based\\Curation Turn};
 
   % Row 3: Retrieval
   \node[box, fill=purple!10] at (0, -6.4) (toc)
-    {TOC Injection\\(system prompt)};
+    {Standing Digest\\(always-on)};
   \node[box, fill=purple!10] at (4.5, -6.4) (router)
-    {Router\\Injection};
+    {Entity Essays\\(on demand)};
   \node[smallbox, fill=purple!5] at (8, -6.4) (tools)
     {\code{memory\_get}\\
-     \code{memory\_search}};
+     \code{history\_search}};
 
   % Arrows
   \draw[arrow] (conv) -- (compact);
-  \draw[arrow, dashed] (compact.south) -- ++(0,-0.5) -| (conv.south);
+  \draw[arrow, dashed] (compact.south) -- ++(0,-0.5) -| (timer.north);
   \draw[arrow] (timer) -- node[above, font=\scriptsize]
     {un-formed turns} (segmenter);
   \draw[arrow] (segmenter.south) -- ++(0,-0.5) -|
     node[pos=0.25, below, font=\scriptsize] {entries} (pool.north);
   \draw[arrow] (segmenter.south) -- ++(0,-0.5) -|
-    node[pos=0.25, below, font=\scriptsize]
-    {integration} (maps.north);
+    node[pos=0.25, below, font=\scriptsize] {batch} (maps.north);
   \draw[arrow] (pool) -- node[left, font=\scriptsize]
-    {FLMI selection} (toc);
+    {cited arcs} (toc);
   \draw[arrow] (pool.south) -- ++(0,-0.5) -|
     node[pos=0.25, below, font=\scriptsize]
-    {top-2 relevant} (router.north);
+    {entity links} (router.north);
   \draw[dasharrow] (pool.south) -- ++(0,-0.8) -| (tools.north);
   \draw[arrow, blue!60!black] (maps.south) -- ++(0,-0.5) -|
     node[pos=0.25, below, font=\scriptsize, text=blue!60!black]
-    {top-2 by similarity} (router.north east);
+    {essay edits} (router.north east);
   \draw[dasharrow, blue!60!black] (maps.south west) -- ++(0,-1.5) -|
     (toc.north east);
 
 \end{tikzpicture}
-\caption{Memory system data flow. The formation timer drives the V3
-segmenter, which produces entries persisted to the memory pool and
-integrated into project maps. Retrieval surfaces memories via TOC
-injection (always-on), router injection (per-dispatch), relevance-based
-map injection (blue arrows, embedding similarity against recent turns),
-and on-demand tools (\code{memory\_get}, \code{memory\_search}).}
+\caption{Current memory data flow. Startup, periodic, token-pressure, and
+shutdown triggers feed V3 formation. Records commit to the episodic pool;
+each successful batch queues a scoped curation turn that edits the standing
+digest and active-entity essays. The raw log and episodic store remain
+searchable beneath the curated text hierarchy.}
 \label{fig:memory}
 \end{figure}
 
-\paragraph{Three layers.}
+\paragraph{Text hierarchy and governed procedure layer.}
 \begin{description}[nosep, leftmargin=1.5em]
-  \item[Conversation history] The raw message thread between user and
-    agent. The router compacts it as context grows, using a forced
-    synthesis threshold of 0.97 of the soft context limit. Recent
-    messages stay intact; older turns are summarized. This provides
-    short-term recall within a session.
+  \item[Conversation history] The durable raw message record and rolling
+    context window. Context compaction may summarize the active window, but
+    Formation~V3 consumes its own cursor over un-formed turns rather than
+    treating window drops as a formation trigger.
   \item[Memory pool] Episodic memories stored in a SQLite database
     (\code{\textasciitilde/.mesh/memory/\{agent\}.db}). Each entry has
     three tiers of detail (Table~\ref{tab:memory-tiers}). The pool
     persists across sessions and grows over the agent's lifetime.
-  \item[Project maps] Living Markdown summaries of each project's
-    state---goals, architecture, key files, decisions, current status,
-    and open issues. Stored centrally in
-    \code{\textasciitilde/.mesh/memory/maps/\{project\_name\}.md}
-    (constant \code{MAPS\_DIR} in \code{mesh/paths.py}) and indexed in
-    the \code{project\_maps} SQLite table.
+  \item[Standing digest] One per-agent Markdown briefing beneath
+    \code{\textasciitilde/.mesh/digests/}. It is injected in place of the
+    entry-level TOC and carries cross-project chronology, interpretation,
+    durable decisions, live threads, and an agent narrative.
+  \item[Entity essays] Cited narratives for active person, project, and
+    event entities, stored in the per-agent SQLite database. They merge many
+    linked episodes into a coherent, entity-specific account and are fetched
+    through \code{essay\_list}/\code{essay\_get}.
+  \item[Skill cards] Versioned YAML procedures under
+    \code{\textasciitilde/.mesh/skills/}. Cards are selected separately from
+    historical recall and are advisory until a human approves their lifecycle
+    state.
 \end{description}
 
 \begin{table}[h]
@@ -2258,146 +2476,234 @@ demand to avoid context bloat.}
 
 Memory formation converts un-formed conversation turns into structured
 episodic entries. The V3 pipeline uses a dedicated LLM
-(\code{memory\_llm\_backend}, typically \code{deepseek-direct}) that is
-decoupled from the agent's primary worker backend.
+(\code{memory\_llm\_backend}) that is decoupled from the agent's primary
+worker backend. \code{mesh/memory/formation\_contract.py} is the single
+prompt and parse authority shared by live formation and fold-compatibility
+tooling.
 
 \paragraph{Trigger and timing.}
-Formation fires on two triggers:
+Formation fires on four independent triggers (the defaults below are
+configuration values, not provider requirements):
 \begin{enumerate}[nosep]
-  \item \textbf{Timer}: a periodic timer (configurable interval, typically
-        10--15~minutes) calls \code{form\_un\_formed()}.
-  \item \textbf{Conversation boundary}: when the context window drops
-        old turns during compaction, the dropped turns are processed
-        via \code{on\_window\_drop()}.
+  \item \textbf{Startup}: after memory initialization and embedding migration.
+  \item \textbf{Timer}: every 1,800 seconds, deferring a tail younger than
+        300 seconds so an exchange can finish.
+  \item \textbf{Token pressure}: after roughly 30,000 newly appended,
+        uncommitted tokens.
+  \item \textbf{Shutdown}: one final blocking attempt with a 30-second cap.
 \end{enumerate}
+Under V3, \code{MemorySystemV2.on\_window\_drop()} explicitly does
+\emph{not} form memories; it only updates rolling conversation-summary state.
+This decoupling prevents context-compaction policy from controlling durable
+memory formation.
 
 \paragraph{Segmenter.}
-The V3 segmenter (\code{mesh/memory/formation\_v3.py}) sends un-formed
-turns to the DeepSeek LLM with a structured prompt. The LLM returns a
-JSON array of segments, each containing:
+The V3 segmenter (\code{mesh/memory/formation\_v3.py}) sends bounded,
+overlapping windows of un-formed turns to the configured memory LLM. Defaults
+are 60 turns per window with 20 turns of overlap and a 10-turn in-window defer
+tail. The LLM returns a JSON array of records under the shared recall-oriented
+contract. Each record contains:
 
 \begin{itemize}[nosep]
   \item \code{topic\_label} --- concise label for the segment.
-  \item \code{summary} --- 2--3 sentence retrieval key.
-  \item \code{reflection} --- detailed analysis and lessons learned.
+  \item \code{summary}, \code{reflection}, and \code{trace} --- the three
+        episodic detail tiers.
+  \item \code{retrieval\_key} --- compact search surface.
   \item \code{project} --- project assignment. The prompt encourages
-        creating new project labels when no existing project matches;
-        null is reserved only for trivial exchanges.
+        grounded labels but does not depend on a project map.
   \item \code{tags} --- categorization tags.
   \item \code{outcome} --- success, partial, or failure.
-  \item \code{score} --- worthiness score (1--10; entries below~4 are
-        filtered as ``not worth remembering'').
+  \item \code{event\_date} --- the event's best date, distinct from the
+        formation timestamp.
+  \item \code{digest\_candidate} --- the second-bar signal described below.
+  \item optional entity-resolution metadata when shadow or write mode is
+        enabled.
 \end{itemize}
+
+\paragraph{Two bars.}
+Formation is deliberately recall-oriented: it does not require or filter on a
+1--10 ``worthiness score.'' Broadly useful events enter the episodic pool.
+The higher precision bar is the boolean \code{digest\_candidate}; curation
+uses it to decide which records may change always-on narrative context. This
+separates ``worth remembering'' from ``worth occupying every future prompt.''
 
 \paragraph{Cursor mechanics.}
 A cursor index tracks which conversation turns have been processed.
 Entry persistence and cursor advancement are atomic---if persistence
 fails, the cursor stays put and the window is retried on the next
-trigger. A cursor clamp (commit \code{a6f597d9}) prevents the cursor
-from advancing past the actual history length after restarts.
+trigger. A cursor clamp prevents the cursor from advancing past the actual
+history length after restarts. Empty-but-valid extraction may advance the
+cursor, because it is a completed judgment rather than a parse failure.
 
 \paragraph{Failure tolerance.}
-A 3-strike system tracks per-window failures. After 3~consecutive
-failures on the same window (keyed by \code{(cursor\_idx, end\_idx)}),
-the window is skipped and the cursor advances past it.
+A configurable strike counter tracks parse failures for one window. At the
+default threshold of three, the system writes a visible placeholder entry
+tagged \code{formation-fallback}, then advances. The failure therefore does
+not wedge formation and is not silently erased as an ordinary ``skip.''
 
 \paragraph{Cold-start handling.}
-When no project maps exist, the segmenter is prompted to \emph{suggest}
-project labels rather than requiring exact matches. The first entry
-for a new project triggers \code{\_create\_new\_project\_map()}, which
-bootstraps a skeleton map via a separate LLM call.
+When project maps are disabled, formation continues normally: project
+assignment is a field on each episodic record, not a dependency on map
+creation. If the optional map subsystem is enabled, the retained compatibility
+path may bootstrap and integrate maps after entry persistence.
 
-\section{Entry-Driven Map Curation}
-\label{sec:map-curation}
+\section{Edit-Based Self-Curation}
+\label{sec:self-curation}
 
-After the V3 segmenter persists entries, a fire-and-forget
-\code{asyncio.create\_task} integrates the new entries into their
-respective project maps.
+After a successful formation commit, \code{RouterV2} enqueues one internal
+curation batch. A serialized drain loop processes those batches outside the
+normal message lock, so an LLM maintenance call cannot starve interactive
+traffic. The curation turn receives the new batch, the full active/pending
+entity registry, bounded artifact measurements, and any durable additions
+that a previous turn could not land.
 
-\paragraph{Flow.}
+\paragraph{Scoped update loop.}
+The internal turn uses the existing router tool loop with a deliberately
+narrow catalog. It may inspect memories, entities, essays, and the digest;
+create/link/merge/retire entities; correct entity links; and apply exact
+\code{digest\_edit} or \code{essay\_edit} replacements. Group mutations are
+present only when the group feature is enabled. Every mutation runs under a
+curation execution context (shadow or write mode), so normal interactive text
+cannot silently acquire internal curation authority.
+
+The turn has three responsibilities:
 \begin{enumerate}[nosep]
-  \item \code{form\_un\_formed()} persists entries and advances cursor.
-  \item New-project bootstrap creates skeleton maps for unknown projects.
-  \item \code{\_integrate\_entries\_into\_maps(entries)} is spawned as a
-        background task:
-  \begin{enumerate}[nosep]
-    \item Group entries by \code{entry.project}, filtering empty projects.
-    \item Per project: load current map, format entries with date,
-          topic, score, outcome, tags, and summary.
-    \item Send to DeepSeek LLM (\code{max\_tokens=32768}, 120s timeout)
-          with the integration prompt.
-    \item LLM produces \code{<section>} (full section replacement) and
-          \code{<append\_to>} (append to section end) edit operations.
-    \item \code{\_apply\_section\_updates()} parses and applies edits.
-  \end{enumerate}
+  \item link the new records to existing entities or create grounded pending
+        entity proposals;
+  \item maintain essays for active entities using all linked evidence, not
+        only the latest batch; and
+  \item update the standing digest only with high-bar, agent-wide material,
+        preserving exact memory citations.
 \end{enumerate}
 
-\paragraph{Design properties.}
-\begin{itemize}[nosep]
-  \item \textbf{Non-blocking}: integration failures are logged but do
-        not affect entry persistence or cursor advancement.
-  \item \textbf{Multi-project}: a single formation batch may span
-        multiple projects; each gets an independent integration call.
-  \item \textbf{Composable with bootstrap}: new-project skeleton maps
-        are created before integration runs, so the integrator always
-        has a map to patch.
-\end{itemize}
+\paragraph{Digest constitution.}
+\code{DIGEST\_CONSTITUTION} in \code{mesh/memory/curation.py} is the live
+write authority. The digest must retain seven non-empty sections: Timeline,
+Narrative, Projects, People, Standing decisions \& conventions, Open threads,
+and Agent narrative. Timeline is chronological; Narrative is causal and
+compressed by liveness; Standing decisions grow monotonically; Open threads
+are rewritten as live state. Every \code{[m\_<12hex>]} citation must resolve
+and support the particular claim it follows. The tracked companion source
+\code{mesh/fold\_driver/prompts/standing\_digest/constitution.txt} supplies
+the shared standing-digest rules used by formation/fold compatibility.
 
-\paragraph{Canonical section schema.}
-All three map prompts (curation, bootstrap, integration) reference the
-same canonical section list:
-\begin{enumerate}[nosep]
-  \item \textbf{Summary} --- 2--3 sentences: what the project is, current phase.
-  \item \textbf{Goals} --- what we are trying to accomplish, success criteria,
-        guiding constraints.
-  \item \textbf{Architecture} --- system structure, data flow, key abstractions.
-  \item \textbf{Key Files} --- navigational map with file paths, grouped by
-        subsystem.
-  \item \textbf{Key Decisions} --- decisions made, rationale, dates.
-  \item \textbf{Current State} --- what is active, completed, blocked, next.
-  \item \textbf{Open Issues} --- unresolved problems, open questions.
-  \item \textbf{Glossary} --- abbreviations, project-specific vocabulary.
-\end{enumerate}
+\paragraph{Essay constitution.}
+Entity essays are the substantive narrative layer, not registry metadata.
+Each entity type has a required structure; claims cite only records linked to
+that entity. Publication is restricted to active entities and validates
+citations, placeholders, evidence scope, concurrency version, and token
+budget. Initial essay generation uses the same publish path and gets one
+bounded repair attempt; ongoing changes use \code{essay\_edit}.
+
+\paragraph{Nightly fold status.}
+The old offline nightly fold is no longer the primary maintenance writer.
+Digest and essay changes now land during these edit-based curation turns.
+\code{mesh/fold\_driver/} and \code{mesh/memory/essay\_fold.py} remain as
+tracked compatibility, bootstrap, and audit tooling, but a deployment should
+not describe the retired chronological batch fold as the live digest path.
+
+\section{Entity Registry and Cited Essays}
+
+\code{mesh/memory/entities.py} owns a per-agent SQLite registry. Entity keys
+are typed as person, project, event, or group and move through
+pending/active/retired states. Aliases are Unicode-normalized; merges retain a
+replacement key; memory links and correction events are transactional.
+Activation is evidence-based: by default an entity must be observed across
+three distinct formation windows, rather than repeated several times in one
+window. The active-entity cap bounds registry growth.
+
+The entity service is also the publication gate for essays. Before a write
+commits it checks that the target is active, the evidence version is current,
+every canonical memory ID resolves, every cited memory is linked to the
+target, no loose or placeholder citation syntax remains, and the body fits
+its ceiling. \code{mesh/memory/ids.py} normalizes accepted memory-ID surfaces
+to the canonical 12-hex handle. These gates apply equally to generated and
+hand-edited essays; no alternate write path bypasses them.
+
+\section{Ceilings, Durable Carry-Forward, and Write Audit}
+
+Curated artifacts have hard token ceilings. \code{ceiling\_rules.py}
+implements a make-room-then-land contract: an over-ceiling write is refused,
+never truncated, and the refusal carries an artifact-specific compaction
+order plus an instruction to retry the same addition in the same turn. Digest
+compaction merges old quiet Timeline ranges first, compresses Narrative by
+liveness second, and tightens must-keep sections last without emptying them or
+discarding the only surviving judgment. Essay compaction similarly preserves
+cited conclusions over event-by-event detail.
+
+If the model cannot land the addition in that turn,
+\code{pending\_additions.py} writes the full, unclipped edit into the agent's
+SQLite database at turn end. Up to eight oldest pending additions are offered
+back on a later curation turn. A row resolves only when exact committed text
+proves it landed, or when citation-preserving markers prove a compressed
+replacement superseded it. The durable queue is bounded per artifact, rejects
+lossy previews, and survives restarts with the rest of the memory store.
+
+\code{write\_audit.py} records every curated-artifact write attempt in the
+existing entity-event trail. Outcomes distinguish landed, refused, retried,
+and queued attempts and include before/after hashes, token measurements, and
+retry attribution. The audit can therefore compute retry success, terminal
+drops, and carried-forward additions without changing the write decision.
 
 \section{Retrieval}
 
-Four retrieval paths surface memories and project context to the agent
-at different points in the processing pipeline.
+Several retrieval paths expose different abstraction levels instead of
+forcing every query through one index.
 
-\paragraph{TOC Injection (Always-On).}
-The top~30 memory entries, ranked by relevance to the current
-conversation, are injected as a \code{<memory\_toc>} block in the
-agent's system prompt. Each entry shows its retrieval key (summary) and
-ID. Entries already fetched this session are marked
-\code{[already in context]}; entries injected into the current worker
-dispatch are marked \code{[injected into worker]}.
+\paragraph{Always-on digest or TOC.}
+When \code{standing\_digest\_enabled} is true, the validated digest is
+injected in place of \code{<memory\_toc>}. If no standing digest is enabled,
+the fallback TOC contains up to 30 representative episodic records. The
+two-stage TOC algorithm remains implemented and is described in
+Chapter~\ref{ch:maps-toc}.
 
 \paragraph{On-Demand Tools.}
 \begin{itemize}[nosep]
   \item \code{memory\_get(id)} --- fetches the full reflection (Tier~2)
         of a specific entry. The result persists in conversation history
         for the rest of the session.
-  \item \code{memory\_search(query, project=...)} --- semantic search
-        over the memory pool using embedding similarity. Returns top-$k$
-        entries.
+  \item \code{memory\_search(query, project=...)} --- defaults to hybrid
+        search: embedding similarity and SQLite FTS5/BM25 lexical rankings
+        are merged by reciprocal-rank fusion. Explicit embedding-only and
+        lexical-only modes remain available.
+  \item \code{history\_search(query)} --- keyword search over durable raw
+        conversation logs for details that were never formed or were omitted
+        from a higher-level summary.
+  \item \code{digest\_get}, \code{essay\_list}, and \code{essay\_get} ---
+        retrieve curated context by agent or entity before opening granular
+        episodes.
 \end{itemize}
 
 \paragraph{Router-Level Injection.}
 Before dispatching work to a worker, the router runs
 \code{\_select\_memory\_context()} to curate and inject relevant
-memories into the worker's context. The top~2 entries with a relevance
-score above~0.3 are formatted as \code{<router\_injected\_context>} XML
-and prepended to the worker's prompt.
+memories into the worker's context. A small relevance-filtered set is
+formatted as \code{<router\_injected\_context>} XML and prepended to the
+worker prompt. Optional project-map context may be appended only when that
+legacy subsystem is enabled.
+
+\paragraph{Correction tools.}
+The memory layer is mutable under explicit, audited operations. An
+ID-stable \code{memory\_edit} re-embeds changed retrieval fields;
+\code{memory\_delete} removes an episode and updates selection state;
+\code{digest\_get}/\code{digest\_edit} maintain the standing briefing; and
+essay edits run through entity citation and ceiling validators. Corrections
+therefore change the agent-facing artifacts rather than merely appending a
+contradictory raw-history message.
 
 \section{Feature Flag Matrix}
 
 Memory features are deployed incrementally per agent via configuration
 flags in \code{mesh.yaml}. Formation V3 uses a dedicated LLM backend
-(\code{memory\_llm\_backend}, typically DeepSeek) decoupled from the
-agent's worker backend. All deployed agents use formation V3 with the
-retrieval redesign.
+(\code{memory\_llm\_backend}) decoupled from the agent's worker backend.
+The current code independently gates V3 formation, standing-digest injection,
+entity resolution (off/shadow/write), self-curation mode, essay generation,
+groups, and legacy project maps. Configuration validation refuses self-
+curation enrollment unless V3 formation and the standing digest are enabled
+and project maps are disabled; this prevents two narrative writers from
+competing for the same role.
 
-\section{Standing Digest (Fold System)}
+\section{Standing Digest (Curation-Maintained)}
 \label{sec:standing-digest}
 
 The standing digest extends the memory system with a dense, continuously
@@ -2408,32 +2714,36 @@ the agent's full operational history, key decisions, project context, and
 relationship knowledge in one document.
 
 \paragraph{Architecture.}
-The fold driver (\code{fold\_driver/}) runs as an offline batch process,
-separate from the live agent. It iterates over the agent's raw
-conversation history in chronological chunks (``rounds''), feeding each
-chunk plus the current digest into an LLM that produces an updated
-digest. The process is idempotent: a cursor tracks the last-processed
-history line, so the fold can be interrupted and resumed.
+The live writer is the curation turn in
+\code{mesh/memory/curation.py}. It proposes exact edits after successful
+formation batches; \code{AgentNode} validates section structure, citations,
+the measured token ceiling, and write authority before an atomic update.
+Over-ceiling refusals must compact and retry or enter the durable
+pending-additions ledger. The old cursor-driven offline fold remains
+available for compatibility and bootstrap work, not as the normal nightly
+maintenance path.
 
 \paragraph{Configuration.}
-Three fields on \code{NodeConfig} control the fold:
+The live surface is centered on:
 \begin{itemize}[nosep]
-  \item \code{fold\_backend} (str, default: \code{"deepseek-direct"}) ---
-        the LLM backend used for fold completions.
   \item \code{standing\_digest\_enabled} (bool) --- when true, the
         published digest replaces the \code{<memory\_toc>} block in the
         agent's system prompt.
   \item \code{standing\_digest\_path} (str) --- path to the published
         digest file (Markdown).
+  \item \code{entity\_self\_curation\_mode} --- off, shadow, or write mode
+        for internal mutations.
+  \item curation tool/iteration, essay, group, and failure-alert limits ---
+        bounded independently from normal message turns.
 \end{itemize}
 
 \paragraph{Quality gates.}
-Each fold round passes through validation before the cursor advances:
-citation provenance checks (every \code{[m\_...]} reference must resolve
-to a real memory entry), structural integrity (required sections
-present), coverage verification (the digest must not drop previously
-covered material), and placeholder rejection (no unresolved
-\code{[[...]]} tokens may survive handle expansion).
+Each write checks citation provenance (every \code{[m\_...]} handle resolves),
+the seven required non-empty sections, exact replacement semantics, and the
+measured ceiling. Curation instructions add claim-to-citation correspondence,
+chronological Timeline ordering, recent-coverage review, and graduation rules
+that forbid deletion of the only surviving judgment. Write auditing records
+both successful and refused attempts.
 
 \paragraph{Relationship to episodic memory.}
 The standing digest and the episodic memory pool are complementary, not
@@ -2442,6 +2752,29 @@ digest provides always-on holistic context. When \code{standing\_digest\_enabled
 is true, the digest replaces the TOC injection (which would otherwise
 list individual entry summaries), while the pool's search and retrieval
 tools remain available.
+
+\section{Governed Procedural Memory}
+
+\code{mesh/procedural\_memory.py} stores procedures as versioned YAML
+\emph{skill cards}, separate from episodic facts and entity narratives. A card
+records triggers, typed preconditions, authority, source files and SHA-256
+fingerprints, required invariants, verification, rollback, evidence, and an
+append-only outcome history.
+
+The lifecycle is \code{proposed} $\rightarrow$ \code{active}
+$\rightarrow$ \code{retired}, but the runtime deliberately exposes no
+activation API. \code{skill\_draft} can package a completed worker trace and
+source evidence into a proposal; a human must review the file and supply
+approval metadata before it becomes active. Source-fingerprint drift
+suppresses stale cards.
+
+Selection is deterministic and advisory. Required typed preconditions are
+checked for contradictions first; contradicted cards are excluded. Eligible
+cards are then ranked by BM25-like text relevance with stricter treatment of
+unknown required facts, and at most three are injected. The rendered block
+explicitly grants no additional authority and never auto-executes a procedure.
+Outcome receipts support later meta-review without converting observed success
+into automatic policy.
 
 \section{Key Files}
 
@@ -2453,25 +2786,45 @@ tools remain available.
 \textbf{File} & \textbf{Purpose} \\
 \midrule
 \code{mesh/memory/system\_v2.py}
-  & Core memory system: formation, curation, retrieval, FLMI selection,
-    map management, relevance-based injection (~4000 lines). \\
+  & Core formation orchestration, episodic retrieval, TOC/FL selection,
+    correction operations, and optional map compatibility. \\
 \code{mesh/memory/formation\_v3.py}
   & V3 segmenter: JSON-structured LLM segmentation with validation,
     clamping, and retry logic. \\
+\code{mesh/memory/formation\_contract.py}
+  & Shared low-bar prompt, canonical record fields, entity envelope, and
+    response parser. \\
 \code{mesh/memory/store.py}
   & SQLite persistence: \code{MemoryEntry} dataclass, CRUD operations,
-    embedding storage, project map storage. \\
+    FTS5 index, entities, essays, pending additions, wakes, and maps. \\
+\code{mesh/memory/entities.py}
+  & Per-agent entity registry, link correction, merge/retirement,
+    preflight validation, and cited-essay publication gates. \\
+\code{mesh/memory/entity\_essays.py}, \code{essay\_fold.py}
+  & Canonical essay generation/publication plus retained fold compatibility. \\
+\code{mesh/memory/curation.py}
+  & Scoped edit-based curation batches, digest/essay constitutions, shadow and
+    write execution contexts. \\
+\code{mesh/memory/ceiling\_rules.py}
+  & Artifact-specific make-room-then-retry refusals. \\
+\code{mesh/memory/pending\_additions.py}
+  & Durable queue and evidence-based resolution for un-landed additions. \\
+\code{mesh/memory/write\_audit.py}
+  & Per-attempt outcome, hash, token, retry, and drop-rate audit records. \\
+\code{mesh/memory/ids.py}
+  & Canonical 12-hex memory-handle normalization. \\
 \code{mesh/memory/selection.py}
   & FLMI active set selection using embedding vectors. \\
 \code{mesh/memory/embeddings.py}
   & Embedding client for memory entry vectorization. \\
+\code{mesh/procedural\_memory.py}
+  & Governed YAML skill-card schema, human lifecycle, selection, receipts,
+    source-drift suppression, and proposal drafting. \\
 \code{mesh/paths.py}
-  & Central path resolution: \code{MAPS\_DIR}
-    (\code{\textasciitilde/.mesh/memory/maps/}), \code{MEMORY\_DIR},
-    real-home bypass for CC agents. \\
+  & Central path resolution for memory, digests, maps, skills, and isolated
+    agent state. \\
 \code{mesh/prompts/memory.md}
-  & Shared prompt instructions for memory tools and TOC usage.
-    Auto-appended to all agent prompts via \code{load\_prompt\_file()}. \\
+  & Shared prompt instructions for memory, digest, essay, and history tools. \\
 \bottomrule
 \end{tabular}
 \caption{Memory system source files.}
@@ -2480,16 +2833,35 @@ tools remain available.
 
 
 %----------------------------------------------------------------------
-\chapter{Project Maps and TOC Pipeline}
+\chapter{TOC Selection and Optional Project Maps}
 \label{ch:maps-toc}
 %----------------------------------------------------------------------
+
+\section{Compatibility Status of Project Maps}
+
+Project maps remain implemented, but they are an optional legacy narrative
+subsystem rather than a tier in the v2 self-curation hierarchy. When enabled,
+maps are Markdown files beneath
+\code{\textasciitilde/.mesh/memory/maps/} with summary/embedding metadata in
+SQLite. Formation can asynchronously bootstrap an unknown project and
+integrate a multi-project entry batch through full-section replacement or
+section append operations. Integration failure is non-blocking with respect
+to episodic persistence and cursor advancement.
+
+The retained canonical map schema is Summary, Goals, Architecture, Key Files,
+Key Decisions, Current State, Open Issues, and Glossary. Self-curation
+enrollment validation requires \code{project\_maps\_enabled=false}, because
+the curation-maintained digest and project/entity essays now own the durable
+narrative role. Deployments that keep maps enabled may still use the routing
+and selection mechanics below.
 
 \section{Relevance-Based Map Injection}
 \label{sec:map-injection}
 
-Project maps are injected into both the router and worker prompts based
-on relevance to the current conversation, replacing the earlier approach
-of injecting only the statically-tracked \code{\_active\_project} map.
+When \code{project\_maps\_injection\_enabled} is true, project maps are
+injected into router and worker prompts based on relevance to the current
+conversation, replacing the earlier approach of injecting only the
+statically tracked \code{\_active\_project} map.
 
 \paragraph{Algorithm.}
 \begin{enumerate}[nosep]
@@ -2520,6 +2892,8 @@ of injecting only the statically-tracked \code{\_active\_project} map.
         down, or maps lack summaries), falls back to
         \code{render\_maps\_block()} (active project only).
 \end{itemize}
+Every path first checks the map-injection feature gate; disabled means an
+empty block, not an active-project fallback.
 
 \paragraph{Summary embeddings.}
 Each project map maintains a 1--2 sentence summary in the
@@ -2541,9 +2915,10 @@ used for memory entry retrieval.
 
 \section{TOC Selection and Weighting (FLMI)}
 
-The active set (top~30 entries shown in the prompt TOC) is selected from
-the full pool using a two-stage pipeline that balances breadth with
-diversity.
+When the standing digest is disabled, up to 30 entries shown in the prompt
+TOC are selected from the full pool using a two-stage pipeline that balances
+breadth with diversity. With a standing digest, this remains a fallback and
+diagnostic mechanism rather than the normal always-on prompt block.
 
 \paragraph{Stage 1: Cosine relevance.}
 The top~100 entries by cosine similarity to the last $N$ conversation
@@ -2557,15 +2932,17 @@ submodular Facility Location objective. This maximizes embedding
 diversity---ensuring broad coverage of the agent's topic history rather
 than clustering around a single recent topic.
 
-\paragraph{Known issue: weight starvation.}
-On agents with large pools, FLMI's diversity optimization means new
-entries may receive weight~0 and never enter the active set. The
-existing 30~entries already cover the topic space, so new entries (which
-often overlap with recent work) offer no diversity gain. This
-effectively fossilizes the active set.
+\paragraph{Representative-set distinction.}
+The older persistent active-set selector can starve a redundant new entry of
+facility-location gain. The query-conditioned TOC path does not treat that
+active set as a pool ceiling: it first restricts the full candidate pool by
+the current query, then runs \code{lazy\_greedy\_fl()} inside that top-100
+set. This preserves the useful diversity objective without describing the
+legacy active set as the whole memory hierarchy.
 
 \paragraph{Summary maintenance.}
-Each project map has a short summary (1--2 sentences) stored alongside
+When the optional subsystem is enabled, each project map has a short summary
+(1--2 sentences) stored alongside
 an embedding vector in the \code{project\_maps} table. Summaries are
 extracted deterministically after every map content change---via
 integration, tool edits, or manual curation---by parsing the canonical
@@ -2860,10 +3237,11 @@ system in production across multiple agents for 5+ months.
         unbounded ping-pong chains.
   \item \textbf{Standing digest vs.\ TOC}: The episodic memory TOC
         (always-on entry summaries) scales poorly past several hundred
-        entries. The standing digest fold system
+        entries. The curation-maintained standing digest
         (Section~\ref{sec:standing-digest}) resolved this by replacing
         the entry-level TOC with a single coherent narrative, trading
-        per-entry granularity for holistic context.
+        per-entry granularity for holistic context while retaining hybrid
+        search and exact memory handles underneath it.
   \item \textbf{Harness-backend router dispatch}: When the router itself
         runs on a harness backend (Claude Code, Codex), the native
         tool-call dispatch path is unavailable. The unified dispatch
